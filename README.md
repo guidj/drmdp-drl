@@ -3,7 +3,7 @@
 ## Env
 
 ```sh
-uv venv --python 3.11
+uv venv --python 3.12
 # will run uv sync
 make pip-sync
 ```

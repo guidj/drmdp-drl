@@ -978,7 +978,7 @@ wheels = [
 ]
 
 [[package]]
-name = "drmdp-fnapprox"
+name = "drmdp-drl"
 version = "0.16.8"
 source = { editable = "." }
 dependencies = [

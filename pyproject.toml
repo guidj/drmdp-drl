@@ -3,7 +3,7 @@ requires = ["setuptools>=61.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "drmdp-fnapprox"
+name = "drmdp-drl"
 version = "0.16.8"
 authors = [{name = "guilherme", email = "guilherme@dsv.su.se"}]
 maintainers = [{name = "guilherme", email = "guilherme@dsv.su.se"}]
@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-urls = {Homepage = "https://github.com/guidj/drmdp-fnapprox"}
+urls = {Homepage = "https://github.com/guidj/drmdp-drl"}
 requires-python = ">=3.11"
 dependencies = [
     "pillow>=10.4.0",
