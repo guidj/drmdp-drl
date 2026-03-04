@@ -31,9 +31,21 @@ POLICY_TYPES = {
 ORDERED_METHODS = ["BLADE-TD", "BLADE-TD[N-B]", "IMR", "OP-A", "OP-S", "DMR", "FR"]
 
 
-def collection_traj_data(env: gym.Env, steps: int, seed: Optional[int] = None):
+def collection_traj_data(
+    env: gym.Env, steps: int, seed: Optional[int] = None, include_term: bool = False
+):
     """
     Collects sample trajectory data.
+
+    Args:
+        env: Gymnasium environment
+        steps: Number of steps to collect
+        seed: Random seed for environment reset
+        include_term: If True, include term flag in buffer tuples
+
+    Returns:
+        List of tuples: (obs, action, next_obs, rew) if include_term=False,
+                       (obs, action, next_obs, rew, term) if include_term=True
     """
     obs, _ = env.reset(seed=seed)
     step = 0
@@ -48,9 +60,13 @@ def collection_traj_data(env: gym.Env, steps: int, seed: Optional[int] = None):
             _,
         ) = env.step(action)
         step += 1
-        buffer.append((obs, action, next_obs, rew))
+        done = term or trunc
+        if include_term:
+            buffer.append((obs, action, next_obs, rew, term))  # type: ignore
+        else:
+            buffer.append((obs, action, next_obs, rew))  # type: ignore
         obs = next_obs
-        if term or trunc:
+        if done:
             obs, _ = env.reset()
     return buffer
 

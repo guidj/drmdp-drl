@@ -80,7 +80,7 @@ testpaths = [
 [tool.mypy]
 warn_return_any = true
 warn_unused_configs = true
-plugins = [ "numpy.typing.mypy_plugin",]
+plugins = []
 ignore_missing_imports = true
 
 [tool.uv.sources]

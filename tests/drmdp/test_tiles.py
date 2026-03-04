@@ -66,14 +66,14 @@ def test_hashcoords():
 def test_tiles_basic():
     result = tiles.tiles(10, 2, [0.1, 0.2], [1])
     assert len(result) == 2
-    assert all(isinstance(x, int) for x in result)
+    assert all(isinstance(tile, int) for tile in result)
 
 
 def test_tileswrap_basic():
     result = tiles.tileswrap(10, 2, [0.1, 0.2], [5, 5], [1])
     assert len(result) == 2
-    assert all(isinstance(x, int) for x in result)
-    assert all(0 <= x < 10 for x in result)
+    assert all(isinstance(tile, int) for tile in result)
+    assert all(0 <= tile < 10 for tile in result)
 
 
 def test_pow2geq():
