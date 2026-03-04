@@ -92,8 +92,12 @@ python -m drmdp.dfdrl.est_o1 \
 
 #### O2 Training
 
+O2 uses **two-stage training** for better optimization:
+- **Stage 1**: Pre-train GNetwork (return predictor) + shared embedding
+- **Stage 2**: Train RNetwork (reward predictor) with frozen GNetwork
+
 ```bash
-# Train dual model with return grounding
+# Basic two-stage training
 python -m drmdp.dfdrl.est_o2 \
     --env MountainCarContinuous-v0 \
     --reward-model-type rnn \
@@ -105,16 +109,35 @@ python -m drmdp.dfdrl.est_o2 \
     --seed 42 \
     --output-dir outputs
 
+# Advanced: Custom epochs and learning rates per stage
+python -m drmdp.dfdrl.est_o2 \
+    --env MountainCarContinuous-v0 \
+    --reward-model-type rnn \
+    --delay 3 \
+    --num-steps 100000 \
+    --batch-size 64 \
+    --stage1-epochs 150 \
+    --stage2-epochs 100 \
+    --stage1-lr 0.01 \
+    --stage2-lr 0.005 \
+    --lam 1.0 \
+    --xi 0.5 \
+    --seed 42 \
+    --output-dir outputs
+
 # Parameters:
+# --stage1-epochs: Epochs for GNetwork training (default: 100)
+# --stage2-epochs: Epochs for RNetwork training (default: 100)
+# --stage1-lr: Learning rate for Stage 1 (default: 0.01)
+# --stage2-lr: Learning rate for Stage 2 (default: 0.01)
 # --lam: Weight for ρ₁ regularizer (grounds predictions on aggregate feedback)
 # --xi: Weight for ρ₂ regularizer (grounds predictions on actual returns)
 # --seed: Random seed for reproducibility
 
-# Outputs:
-# - outputs/o2/{timestamp}/model_{reward_model_type}_return.pt
-# - outputs/o2/{timestamp}/predictions_{reward_model_type}_return.json
-# - outputs/o2/{timestamp}/metrics_{reward_model_type}_return.json
-# - outputs/o2/{timestamp}/config.json
+# Outputs (two-stage structure):
+# - outputs/stage1/gnetwork_stage1.pt
+# - outputs/stage2/rnetwork_{reward_model_type}_stage2.pt
+# - outputs/stage2/model_{reward_model_type}_return.pt (for evaluation)
 ```
 
 ### Evaluation
@@ -178,17 +201,19 @@ python -m drmdp.dfdrl.eval_est_o1 \
 
 #### O2 Evaluation
 
+**Note:** Evaluation auto-detects two-stage checkpoint structure. Point `--model-dir` to the parent directory containing `stage2/`.
+
 ```bash
-# Evaluate from saved predictions
+# Evaluate from saved predictions (two-stage checkpoint)
 python -m drmdp.dfdrl.eval_est_o2 \
-    --model-dir outputs/o2/1709564435 \
+    --model-dir outputs \
     --reward-model-type rnn \
     --mode predictions \
     --num-examples 10
 
 # Interactive evaluation with dual predictions
 python -m drmdp.dfdrl.eval_est_o2 \
-    --model-dir outputs/o2/1709564435 \
+    --model-dir outputs \
     --reward-model-type rnn \
     --mode interactive \
     --env MountainCarContinuous-v0 \
@@ -196,6 +221,13 @@ python -m drmdp.dfdrl.eval_est_o2 \
     --lam 0.5 \
     --xi 0.5 \
     --num-episodes 5
+
+# Legacy checkpoint structure (single-stage, deprecated)
+python -m drmdp.dfdrl.eval_est_o2 \
+    --model-dir outputs/o2/1709564435 \
+    --reward-model-type rnn \
+    --mode predictions \
+    --num-examples 10
 
 # Output format (includes regularizers ρ₁ and ρ₂):
 # ================================================================...
@@ -226,13 +258,12 @@ outputs/
 │   │   ├── predictions_rnn.json
 │   │   └── metrics_rnn.json
 │   └── ...
-└── o2/                          # Return-grounded dual prediction
-    ├── 1709564435/
-    │   ├── config.json
-    │   ├── model_rnn_return.pt  # Dual model checkpoint
-    │   ├── predictions_rnn_return.json
-    │   └── metrics_rnn_return.json
-    └── ...
+└── o2/                          # Return-grounded dual prediction (two-stage)
+    ├── stage1/                  # Stage 1: GNetwork pre-training
+    │   └── gnetwork_stage1.pt   # GNetwork + shared embedding
+    └── stage2/                  # Stage 2: RNetwork training
+        ├── rnetwork_rnn_stage2.pt         # RNetwork only
+        └── model_rnn_return.pt            # Dual model (for evaluation)
 ```
 
 ## Bumpversion
