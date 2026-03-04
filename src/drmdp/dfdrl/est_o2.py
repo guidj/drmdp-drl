@@ -1069,7 +1069,11 @@ def train(
                 unique_params.append(param)
 
     optimizer = optim.Adam(unique_params, lr=0.01)
-    criterion = nn.MSELoss()
+    main_criterion = nn.MSELoss()
+    lam1_criterion = nn.MSELoss()
+    lam2_criterion = nn.MSELoss()
+    prev_return_criterion = nn.MSELoss()
+    curr_return_criterion = nn.MSELoss()
 
     # Training Loop
     epochs = 100
@@ -1129,27 +1133,37 @@ def train(
                 g_outputs_curr
             )  # (batch,) - predicted return for curr window (INDEPENDENT prediction)
 
-            R_obs_curr = labels["curr_aggregate_reward"]  # Observed aggregate reward
-            G_actual_prev = labels["prev_return"]  # Actual return at end of prev window
-            G_actual_curr = labels["curr_return"]  # Actual return at end of curr window
+            ro_obs_curr = labels["curr_aggregate_reward"]  # Observed aggregate reward
+            g_actual_prev = labels["prev_return"]  # Actual return at end of prev window
+            g_actual_curr = labels["curr_return"]  # Actual return at end of curr window
 
             # Main loss: Match observed aggregate reward with summed predicted rewards
-            R_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))  # Predicted aggregate
-            loss_main = criterion(R_hat_curr, R_obs_curr)
+            r_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))  # Predicted aggregate
+            loss_main = main_criterion(r_hat_curr, ro_obs_curr)
 
             # ρ₁: [(Ĝ_{t_w_i} - R^o_t) - Ĝ_{t_w_{i-1}}]²
             # Difference in predicted returns should match observed aggregate
             # Ĝ_curr - Ĝ_prev should equal R_obs_curr
-            rho_1 = torch.mean((g_hat_curr - R_obs_curr - g_hat_prev) ** 2)
+            rho_1 = lam1_criterion(g_hat_curr - ro_obs_curr, g_hat_prev)
 
             # ρ₂: [(G_{t_w_i} - R̂^o_t) - G_{t_w_{i-1}}]²
             # Difference in actual returns should match predicted aggregate
             # G_curr - G_prev should equal R_hat_curr
-            rho_2 = torch.mean((G_actual_curr - R_hat_curr - G_actual_prev) ** 2)
+            rho_2 = lam2_criterion(g_actual_curr - r_hat_curr, g_actual_prev)
+
+            # Predicted returns should also match the true returns
+            loss_curr_return = curr_return_criterion(g_hat_curr, g_actual_curr)
+            loss_prev_return = prev_return_criterion(g_hat_prev, g_actual_prev)
 
             # Combined loss with two regularization weights
             # Total: L(φ) = main_loss + λ ρ₁ + ξ ρ₂
-            loss = loss_main + lam * rho_1 + xi * rho_2
+            loss = (
+                loss_main
+                + lam * rho_1
+                + xi * rho_2
+                + loss_curr_return
+                + loss_prev_return
+            )
 
             # Backward and optimize
             optimizer.zero_grad()
