@@ -32,7 +32,7 @@ ORDERED_METHODS = ["BLADE-TD", "BLADE-TD[N-B]", "IMR", "OP-A", "OP-S", "DMR", "F
 
 
 def collection_traj_data(
-    env: gym.Env, steps: int, seed: Optional[int] = None, include_done: bool = False
+    env: gym.Env, steps: int, seed: Optional[int] = None, include_term: bool = False
 ):
     """
     Collects sample trajectory data.
@@ -41,11 +41,11 @@ def collection_traj_data(
         env: Gymnasium environment
         steps: Number of steps to collect
         seed: Random seed for environment reset
-        include_done: If True, include done flag in buffer tuples
+        include_term: If True, include term flag in buffer tuples
 
     Returns:
-        List of tuples: (obs, action, next_obs, rew) if include_done=False,
-                       (obs, action, next_obs, rew, done) if include_done=True
+        List of tuples: (obs, action, next_obs, rew) if include_term=False,
+                       (obs, action, next_obs, rew, term) if include_term=True
     """
     obs, _ = env.reset(seed=seed)
     step = 0
@@ -61,8 +61,8 @@ def collection_traj_data(
         ) = env.step(action)
         step += 1
         done = term or trunc
-        if include_done:
-            buffer.append((obs, action, next_obs, rew, done))
+        if include_term:
+            buffer.append((obs, action, next_obs, rew, term))
         else:
             buffer.append((obs, action, next_obs, rew))
         obs = next_obs
