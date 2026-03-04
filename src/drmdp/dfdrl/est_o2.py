@@ -1080,6 +1080,8 @@ def train(
     train_main_losses = []
     train_rho1_losses = []
     train_rho2_losses = []
+    train_prev_return_losses = []
+    train_curr_return_losses = []
     train_combined_losses = []
     eval_metrics_history = []
 
@@ -1095,6 +1097,8 @@ def train(
         epoch_main_losses = []
         epoch_rho1_losses = []
         epoch_rho2_losses = []
+        epoch_curr_return_losses = []
+        epoch_prev_return_losses = []
         epoch_combined_losses = []
 
         for inputs, labels in train_dataloader:
@@ -1173,16 +1177,22 @@ def train(
             epoch_main_losses.append(loss_main.item())
             epoch_rho1_losses.append(rho_1.item())
             epoch_rho2_losses.append(rho_2.item())
+            epoch_prev_return_losses.append(loss_prev_return.item())
+            epoch_curr_return_losses.append(loss_curr_return.item())
             epoch_combined_losses.append(loss.item())
 
         avg_main_loss = np.mean(epoch_main_losses)
         avg_rho1_loss = np.mean(epoch_rho1_losses)
         avg_rho2_loss = np.mean(epoch_rho2_losses)
+        avg_prev_return_loss = np.mean(epoch_prev_return_losses)
+        avg_curr_return_loss = np.mean(epoch_curr_return_losses)
         avg_combined_loss = np.mean(epoch_combined_losses)
 
         train_main_losses.append(avg_main_loss)
         train_rho1_losses.append(avg_rho1_loss)
         train_rho2_losses.append(avg_rho2_loss)
+        train_prev_return_losses.append(avg_prev_return_loss)
+        train_curr_return_losses.append(avg_curr_return_loss)
         train_combined_losses.append(avg_combined_loss)
 
         # Evaluation
@@ -1201,7 +1211,7 @@ def train(
             print(
                 f"Epoch [{epoch + 1}/{epochs}] | "
                 f"Train Loss: {avg_combined_loss:.4f} "
-                f"(Main: {avg_main_loss:.4f}, ρ₁: {avg_rho1_loss:.4f}, ρ₂: {avg_rho2_loss:.4f}) | "
+                f"(Main: {avg_main_loss:.4f}, ρ₁: {avg_rho1_loss:.4f}, ρ₂: {avg_rho2_loss:.4f}, return(prev): {avg_prev_return_loss:.4f}, return(curr): {avg_curr_return_loss:.4f}) | "
                 f"Eval MSE - Reward: {eval_metrics['reward_mse']:.4f}, "
                 f"Return: {eval_metrics['return_mse']:.4f}, "
                 f"ρ₁: {eval_metrics['rho_1']:.4f}, "
@@ -1274,6 +1284,8 @@ def train(
                 "train_main_losses": train_main_losses,
                 "train_rho1_losses": train_rho1_losses,
                 "train_rho2_losses": train_rho2_losses,
+                "train_prev_return_losses": train_prev_return_losses,
+                "train_curr_return_losses": train_curr_return_losses,
                 "train_combined_losses": train_combined_losses,
                 "eval_metrics_history": eval_metrics_history,
                 "final_reward_mse": final_metrics["reward_mse"],
