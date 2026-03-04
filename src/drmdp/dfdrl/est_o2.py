@@ -1209,7 +1209,7 @@ def train(
 
     # Save predictions
     predictions_file = output_path / f"predictions_{reward_model_type}_return.json"
-    with open(predictions_file, "w") as writable:
+    with open(predictions_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
                 "reward_model_type": reward_model_type,
@@ -1252,7 +1252,7 @@ def train(
 
     # Save training metrics
     metrics_file = output_path / f"metrics_{reward_model_type}_return.json"
-    with open(metrics_file, "w") as writable:
+    with open(metrics_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
                 "reward_model_type": reward_model_type,
