@@ -32,7 +32,7 @@ Usage Example:
 
 import argparse
 import json
-from pathlib import Path
+import pathlib
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
@@ -480,7 +480,9 @@ class GNetwork(nn.Module):
 
         # Process through transformer encoder with masking
         # output shape: (batch_size, sequence_length, hidden_dim)
-        output = self.transformer_encoder(hidden, src_key_padding_mask=src_key_padding_mask)
+        output = self.transformer_encoder(
+            hidden, src_key_padding_mask=src_key_padding_mask
+        )
 
         # Masked mean pooling across sequence dimension
         # Shape: (batch_size, hidden_dim)
@@ -833,8 +835,12 @@ def evaluate_dual_model(
             per_step_predictions = []
             for step_idx in range(curr_seq_len):
                 # Extract (state, action, term) at timestep step_idx for all sequences in batch
-                state_t = inputs["curr_state"][:, step_idx, :]  # (batch_size, state_dim)
-                action_t = inputs["curr_action"][:, step_idx, :]  # (batch_size, action_dim)
+                state_t = inputs["curr_state"][
+                    :, step_idx, :
+                ]  # (batch_size, state_dim)
+                action_t = inputs["curr_action"][
+                    :, step_idx, :
+                ]  # (batch_size, action_dim)
                 term_t = inputs["curr_term"][:, step_idx, :]  # (batch_size, 1)
 
                 # Add sequence dimension for RNN/Transformer models
@@ -884,7 +890,6 @@ def evaluate_dual_model(
 
             # ===== Compute regularizer terms =====
             # Following O2 specification with independent predictions
-            r_hat = reward_predictions
             g_hat_prev = pred_prev_return
             g_hat_curr = pred_curr_return  # Independent prediction, not compositional
 
@@ -1199,7 +1204,7 @@ def train(
     print(f"Final Test Combined RMSE: {np.sqrt(final_metrics['combined_mse']):.8f}")
 
     # Save results
-    output_path = Path(output_dir)
+    output_path = pathlib.Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Save predictions

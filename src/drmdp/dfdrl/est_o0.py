@@ -18,7 +18,7 @@ Usage Example:
 
 import argparse
 import json
-from pathlib import Path
+import pathlib
 from typing import Any, List, Optional, Tuple
 
 import gymnasium as gym
@@ -33,27 +33,27 @@ from drmdp import dataproc
 class RNetwork(nn.Module):
     """
     Feedforward MLP for immediate reward prediction.
-    Maps (state, action, done) -> reward.
+    Maps (state, action, term) -> reward.
     """
 
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        # +1 for done flag
+        # +1 for term flag
         self.fc1 = nn.Linear(state_dim + action_dim + 1, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, state, action, done):
+    def forward(self, state, action, term):
         """
         Args:
             state: Tensor of shape (batch_size, state_dim)
             action: Tensor of shape (batch_size, action_dim)
-            done: Tensor of shape (batch_size, 1)
+            term: Tensor of shape (batch_size, 1)
 
         Returns:
             reward: Tensor of shape (batch_size, 1)
         """
-        features = torch.concat([state, action, done], dim=-1)
+        features = torch.concat([state, action, term], dim=-1)
         features = nn.functional.relu(self.fc1(features))
         features = nn.functional.relu(self.fc2(features))
         reward = self.fc3(features)
@@ -86,7 +86,7 @@ def create_training_buffer(env, num_steps: int):
 
     Returns:
         List of tuples (inputs_dict, reward) where inputs_dict contains
-        "state", "action", and "done" tensors
+        "state", "action", and "term" tensors
     """
     buffer = dataproc.collection_traj_data(env, steps=num_steps, include_term=True)
     return immediate_reward_data(buffer)
@@ -94,10 +94,10 @@ def create_training_buffer(env, num_steps: int):
 
 def immediate_reward_data(buffer):
     """
-    Creates a dataset of individual (state, action, done) -> reward mappings.
+    Creates a dataset of individual (state, action, term) -> reward mappings.
 
     Args:
-        buffer: List of (state, action, next_state, reward, done) tuples
+        buffer: List of (state, action, next_state, reward, term) tuples
 
     Returns:
         List of (inputs_dict, reward) tuples
@@ -108,12 +108,12 @@ def immediate_reward_data(buffer):
         state = example[0]
         action = example[1]
         reward = example[3]
-        done = example[4]
+        term = example[4]
 
         inputs = {
             "state": torch.tensor(state, dtype=torch.float32),
             "action": torch.tensor(action, dtype=torch.float32),
-            "done": torch.tensor([float(done)], dtype=torch.float32),
+            "term": torch.tensor([float(term)], dtype=torch.float32),
         }
         label = torch.tensor(reward, dtype=torch.float32)
         examples.append((inputs, label))
@@ -138,10 +138,10 @@ def evaluate_model(
         batch_size: Batch size for evaluation
         collect_predictions: Whether to collect detailed predictions for analysis.
             If False, only MSE is computed (faster, less memory).
-            When True, ensures at least one example with done=True is collected.
+            When True, ensures at least one example with term=True is collected.
         max_batches: Maximum number of batches to evaluate. If None, evaluates
             entire dataset. Useful for quick checks during training.
-            Ignored when collect_predictions=True to ensure done=True examples.
+            Ignored when collect_predictions=True to ensure term=True examples.
         shuffle: Whether to shuffle the test dataloader
 
     Returns:
@@ -153,7 +153,7 @@ def evaluate_model(
     errors = []
     predictions_list = []
 
-    # When collecting predictions, evaluate entire dataset to ensure done=True examples
+    # When collecting predictions, evaluate entire dataset to ensure term=True examples
     effective_max_batches = None if collect_predictions else max_batches
 
     with torch.no_grad():
@@ -173,7 +173,7 @@ def evaluate_model(
                         {
                             "state": inputs["state"][idx].cpu().numpy(),
                             "action": inputs["action"][idx].cpu().numpy(),
-                            "done": inputs["done"][idx].cpu().numpy(),
+                            "term": inputs["term"][idx].cpu().numpy(),
                             "actual_reward": labels[idx].item(),
                             "predicted_reward": predictions[idx].item(),
                         }
@@ -183,15 +183,15 @@ def evaluate_model(
             if effective_max_batches is not None and idx + 1 >= effective_max_batches:
                 break
 
-    # When collecting predictions, verify we have at least one done=True example
+    # When collecting predictions, verify we have at least one term=True example
     if collect_predictions and predictions_list:
-        has_done_true = any(pred["done"][0] > 0.5 for pred in predictions_list)
-        done_count = sum(1 for pred in predictions_list if pred["done"][0] > 0.5)
+        has_term_true = any(pred["term"][0] > 0.5 for pred in predictions_list)
+        term_count = sum(1 for pred in predictions_list if pred["term"][0] > 0.5)
         print(
-            f"Collected {len(predictions_list)} predictions ({done_count} with done=True)"
+            f"Collected {len(predictions_list)} predictions ({term_count} with term=True)"
         )
-        if not has_done_true:
-            print("Warning: No examples with done=True found in evaluation set")
+        if not has_term_true:
+            print("Warning: No examples with term=True found in evaluation set")
 
     mse = torch.mean(torch.stack(errors)).item()
     return mse, predictions_list
@@ -279,12 +279,12 @@ def train(
     print(f"Final Test RMSE: {final_rmse:.8f}")
 
     # Save results
-    output_path = Path(output_dir)
+    output_path = pathlib.Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Save predictions
     predictions_file = output_path / "predictions_o0.json"
-    with open(predictions_file, "w") as writable:
+    with open(predictions_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
                 "model_type": "mlp_immediate",
@@ -294,7 +294,7 @@ def train(
                     {
                         "state": pred["state"].tolist(),
                         "action": pred["action"].tolist(),
-                        "done": pred["done"].tolist(),
+                        "term": pred["term"].tolist(),
                         "actual_reward": pred["actual_reward"],
                         "predicted_reward": pred["predicted_reward"],
                     }
@@ -308,7 +308,7 @@ def train(
 
     # Save training metrics
     metrics_file = output_path / "metrics_o0.json"
-    with open(metrics_file, "w") as writable:
+    with open(metrics_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
                 "model_type": "mlp_immediate",

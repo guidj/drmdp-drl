@@ -297,7 +297,9 @@ def test_cumulative_returns_reset_per_episode():
     assert labels1["curr_return"].item() == 6.0  # NOT 9!
     assert inputs1["prev_state"].shape == (1, 2)
     assert inputs1["curr_state"].shape == (3, 2)
-    assert torch.allclose(inputs1["prev_state"], torch.zeros(1, 2))  # Reset for new episode
+    assert torch.allclose(
+        inputs1["prev_state"], torch.zeros(1, 2)
+    )  # Reset for new episode
     assert torch.allclose(inputs1["prev_action"], torch.zeros(1, 1))
     assert torch.allclose(inputs1["prev_term"], torch.zeros(1, 1))
     assert inputs1["prev_timestep"].item() == 0  # Reset for new episode
@@ -365,26 +367,46 @@ def test_all_windows_satisfy_regularizer_assumption():
         # ===== Verify consecutive window chaining =====
         if labels["prev_return"].item() == 0.0:
             # First window of episode - prev should be zero-filled
-            if not torch.allclose(inputs["prev_state"], torch.zeros_like(inputs["prev_state"])):
-                input_violations.append(f"Window {idx}: prev_state not zero-filled for first window")
-            if not torch.allclose(inputs["prev_action"], torch.zeros_like(inputs["prev_action"])):
-                input_violations.append(f"Window {idx}: prev_action not zero-filled for first window")
-            if not torch.allclose(inputs["prev_term"], torch.zeros_like(inputs["prev_term"])):
-                input_violations.append(f"Window {idx}: prev_term not zero-filled for first window")
+            if not torch.allclose(
+                inputs["prev_state"], torch.zeros_like(inputs["prev_state"])
+            ):
+                input_violations.append(
+                    f"Window {idx}: prev_state not zero-filled for first window"
+                )
+            if not torch.allclose(
+                inputs["prev_action"], torch.zeros_like(inputs["prev_action"])
+            ):
+                input_violations.append(
+                    f"Window {idx}: prev_action not zero-filled for first window"
+                )
+            if not torch.allclose(
+                inputs["prev_term"], torch.zeros_like(inputs["prev_term"])
+            ):
+                input_violations.append(
+                    f"Window {idx}: prev_term not zero-filled for first window"
+                )
             if inputs["prev_timestep"].item() != 0:
-                input_violations.append(f"Window {idx}: prev_timestep not 0 for first window")
+                input_violations.append(
+                    f"Window {idx}: prev_timestep not 0 for first window"
+                )
         else:
             # Consecutive window - prev should match previous curr
             if prev_window_inputs is not None:
-                if not torch.allclose(inputs["prev_state"], prev_window_inputs["curr_state"]):
+                if not torch.allclose(
+                    inputs["prev_state"], prev_window_inputs["curr_state"]
+                ):
                     input_violations.append(
                         f"Window {idx}: prev_state doesn't match previous curr_state"
                     )
-                if not torch.allclose(inputs["prev_action"], prev_window_inputs["curr_action"]):
+                if not torch.allclose(
+                    inputs["prev_action"], prev_window_inputs["curr_action"]
+                ):
                     input_violations.append(
                         f"Window {idx}: prev_action doesn't match previous curr_action"
                     )
-                if not torch.allclose(inputs["prev_term"], prev_window_inputs["curr_term"]):
+                if not torch.allclose(
+                    inputs["prev_term"], prev_window_inputs["curr_term"]
+                ):
                     input_violations.append(
                         f"Window {idx}: prev_term doesn't match previous curr_term"
                     )

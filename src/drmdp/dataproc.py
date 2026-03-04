@@ -62,9 +62,9 @@ def collection_traj_data(
         step += 1
         done = term or trunc
         if include_term:
-            buffer.append((obs, action, next_obs, rew, term))
+            buffer.append((obs, action, next_obs, rew, term))  # type: ignore
         else:
-            buffer.append((obs, action, next_obs, rew))
+            buffer.append((obs, action, next_obs, rew))  # type: ignore
         obs = next_obs
         if done:
             obs, _ = env.reset()

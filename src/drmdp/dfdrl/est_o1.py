@@ -40,7 +40,7 @@ initialization, ensuring predictions depend only on the current context.
 
 import argparse
 import json
-from pathlib import Path
+import pathlib
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
@@ -55,18 +55,18 @@ from drmdp import dataproc, rewdelay
 class RNetwork(nn.Module):
     """
     Feedforward MLP for reward prediction.
-    Processes (state, action, done) tuples independently.
+    Processes (state, action, term) tuples independently.
     """
 
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        # +1 for done flag
+        # +1 for term flag
         self.fc1 = nn.Linear(state_dim + action_dim + 1, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, state, action, done):
-        features = torch.concat([state, action, done], dim=-1)
+    def forward(self, state, action, term):
+        features = torch.concat([state, action, term], dim=-1)
         features = nn.functional.relu(self.fc1(features))
         features = nn.functional.relu(self.fc2(features))
         reward = self.fc3(features)
@@ -77,7 +77,7 @@ class RNetwork(nn.Module):
 class RNetworkRNN(nn.Module):
     """
     RNN-based reward prediction network.
-    Processes sequential (state, action, done) tuples and outputs one reward value per step.
+    Processes sequential (state, action, term) tuples and outputs one reward value per step.
 
     Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
     Output shape: (batch_size, sequence_length, 1)
@@ -99,7 +99,7 @@ class RNetworkRNN(nn.Module):
         self.num_layers = num_layers
         self.rnn_type = rnn_type.lower()
 
-        # Input projection: (state, action, done) -> hidden_dim
+        # Input projection: (state, action, term) -> hidden_dim
         self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # RNN layer
@@ -125,12 +125,12 @@ class RNetworkRNN(nn.Module):
         # Output projection: hidden_dim -> 1 (reward per step)
         self.output_proj = nn.Linear(hidden_dim, 1)
 
-    def forward(self, state, action, done):
+    def forward(self, state, action, term):
         """
         Args:
             state: Tensor of shape (batch_size, sequence_length, state_dim)
             action: Tensor of shape (batch_size, sequence_length, action_dim)
-            done: Tensor of shape (batch_size, sequence_length, 1)
+            term: Tensor of shape (batch_size, sequence_length, 1)
 
         Returns:
             rewards: Tensor of shape (batch_size, sequence_length, 1)
@@ -142,16 +142,18 @@ class RNetworkRNN(nn.Module):
         # Prepend zero stub for position 0 to ensure consistent RNN initialization
         zero_state = torch.zeros(batch_size, 1, self.state_dim, device=device)
         zero_action = torch.zeros(batch_size, 1, self.action_dim, device=device)
-        zero_done = torch.zeros(batch_size, 1, 1, device=device)
+        zero_term = torch.zeros(batch_size, 1, 1, device=device)
 
         # Create sequence with stub: [zero_stub, actual_sequence]
         state_with_stub = torch.cat([zero_state, state], dim=1)
         action_with_stub = torch.cat([zero_action, action], dim=1)
-        done_with_stub = torch.cat([zero_done, done], dim=1)
+        term_with_stub = torch.cat([zero_term, term], dim=1)
 
-        # Concatenate state, action, and done along feature dimension
+        # Concatenate state, action, and term along feature dimension
         # Shape: (batch_size, sequence_length+1, state_dim + action_dim + 1)
-        features = torch.concat([state_with_stub, action_with_stub, done_with_stub], dim=-1)
+        features = torch.concat(
+            [state_with_stub, action_with_stub, term_with_stub], dim=-1
+        )
 
         # Project to hidden dimension and apply activation
         # Shape: (batch_size, sequence_length+1, hidden_dim)
@@ -172,7 +174,7 @@ class RNetworkRNN(nn.Module):
 class RNetworkTransformer(nn.Module):
     """
     Transformer Decoder-based reward prediction network.
-    Processes sequential (state, action, done) tuples and outputs one reward value per step.
+    Processes sequential (state, action, term) tuples and outputs one reward value per step.
 
     Uses causal masking to ensure predictions at timestep t only depend on steps <= t.
 
@@ -195,7 +197,7 @@ class RNetworkTransformer(nn.Module):
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
-        # Input embedding: (state, action, done) -> hidden_dim
+        # Input embedding: (state, action, term) -> hidden_dim
         self.input_embedding = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # Positional encoding
@@ -246,12 +248,12 @@ class RNetworkTransformer(nn.Module):
         mask = torch.triu(torch.ones(sz, sz), diagonal=1).bool()
         return mask
 
-    def forward(self, state, action, done):
+    def forward(self, state, action, term):
         """
         Args:
             state: Tensor of shape (batch_size, sequence_length, state_dim)
             action: Tensor of shape (batch_size, sequence_length, action_dim)
-            done: Tensor of shape (batch_size, sequence_length, 1)
+            term: Tensor of shape (batch_size, sequence_length, 1)
 
         Returns:
             rewards: Tensor of shape (batch_size, sequence_length, 1)
@@ -263,16 +265,18 @@ class RNetworkTransformer(nn.Module):
         # Prepend zero stub for position 0 to ensure consistent initialization
         zero_state = torch.zeros(batch_size, 1, self.state_dim, device=device)
         zero_action = torch.zeros(batch_size, 1, self.action_dim, device=device)
-        zero_done = torch.zeros(batch_size, 1, 1, device=device)
+        zero_term = torch.zeros(batch_size, 1, 1, device=device)
 
         # Create sequence with stub: [zero_stub, actual_sequence]
         state_with_stub = torch.cat([zero_state, state], dim=1)
         action_with_stub = torch.cat([zero_action, action], dim=1)
-        done_with_stub = torch.cat([zero_done, done], dim=1)
+        term_with_stub = torch.cat([zero_term, term], dim=1)
 
-        # Concatenate state, action, and done along feature dimension
+        # Concatenate state, action, and term along feature dimension
         # Shape: (batch_size, sequence_length+1, state_dim + action_dim + 1)
-        features = torch.concat([state_with_stub, action_with_stub, done_with_stub], dim=-1)
+        features = torch.concat(
+            [state_with_stub, action_with_stub, term_with_stub], dim=-1
+        )
 
         seq_len = features.shape[1]
 
@@ -335,11 +339,11 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     Assumes actions are continuous or intended to be used as is.
     """
 
-    def create_traj_step(state, action, reward, done):
+    def create_traj_step(state, action, reward, term):
         return {
             "state": torch.tensor(state),
             "action": torch.tensor(action),
-            "done": torch.tensor([float(done)]),
+            "term": torch.tensor([float(term)]),
         }, torch.tensor(reward, dtype=torch.float32)
 
     def create_example(traj_steps: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
@@ -357,7 +361,7 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     )
     action = np.stack([example[1] for example in buffer])
     reward = np.stack([example[3] for example in buffer])
-    done = np.stack([example[4] for example in buffer])
+    term = np.stack([example[4] for example in buffer])
     obs_dim = states.shape[1] // 2
     n_steps = states.shape[0]
     examples = []
@@ -368,7 +372,7 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
         reward_delay = delay.sample()
         while True:
             traj_step = create_traj_step(
-                states[idx][:obs_dim], action[idx], reward[idx], done[idx]
+                states[idx][:obs_dim], action[idx], reward[idx], term[idx]
             )
             example_steps.append(traj_step)
             idx += 1
@@ -394,7 +398,7 @@ def evaluate_model(
     """
     Evaluate model using Markovian predictions.
 
-    For each sequence, predicts reward for each (state, action, done) tuple independently,
+    For each sequence, predicts reward for each (state, action, term) tuple independently,
     then sums predictions to compare with aggregate reward.
 
     Args:
@@ -421,21 +425,21 @@ def evaluate_model(
             batch_size_actual = inputs["state"].shape[0]
             seq_len = inputs["state"].shape[1]
 
-            # Predict reward for each (state, action, done) tuple independently
+            # Predict reward for each (state, action, term) tuple independently
             per_step_predictions = []
             for step_idx in range(seq_len):
-                # Extract (state, action, done) at timestep step_idx for all sequences in batch
+                # Extract (state, action, term) at timestep step_idx for all sequences in batch
                 state_t = inputs["state"][:, step_idx, :]  # (batch_size, state_dim)
                 action_t = inputs["action"][:, step_idx, :]  # (batch_size, action_dim)
-                done_t = inputs["done"][:, step_idx, :]  # (batch_size, 1)
+                term_t = inputs["term"][:, step_idx, :]  # (batch_size, 1)
 
                 # Add sequence dimension for RNN/Transformer models
                 state_seq = state_t.unsqueeze(1)  # (batch_size, 1, state_dim)
                 action_seq = action_t.unsqueeze(1)  # (batch_size, 1, action_dim)
-                done_seq = done_t.unsqueeze(1)  # (batch_size, 1, 1)
+                term_seq = term_t.unsqueeze(1)  # (batch_size, 1, 1)
 
                 # Forward pass - returns (batch_size, 1, 1) for RNN/Transformer, (batch_size, 1) for MLP
-                reward_t = model(state_seq, action_seq, done_seq)
+                reward_t = model(state_seq, action_seq, term_seq)
                 if reward_t.dim() == 3:
                     reward_t = reward_t.squeeze(1)  # (batch_size, 1)
                 per_step_predictions.append(reward_t)
@@ -455,7 +459,7 @@ def evaluate_model(
                         {
                             "state": inputs["state"][idx].cpu().numpy(),
                             "action": inputs["action"][idx].cpu().numpy(),
-                            "done": inputs["done"][idx].cpu().numpy(),
+                            "term": inputs["term"][idx].cpu().numpy(),
                             "actual_reward": labels[idx].item(),
                             "predicted_reward": pred_window_reward[idx].item(),
                             "per_step_predictions": predictions[idx]
@@ -579,12 +583,12 @@ def train(
     print(f"Final Test RMSE: {final_rmse:.8f}")
 
     # Save results
-    output_path = Path(output_dir)
+    output_path = pathlib.Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Save predictions
     predictions_file = output_path / f"predictions_{model_type}.json"
-    with open(predictions_file, "w") as writable:
+    with open(predictions_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
                 "model_type": model_type,
@@ -594,7 +598,7 @@ def train(
                     {
                         "state": pred["state"].tolist(),
                         "action": pred["action"].tolist(),
-                        "done": pred["done"].tolist(),
+                        "term": pred["term"].tolist(),
                         "actual_reward": pred["actual_reward"],
                         "predicted_reward": pred["predicted_reward"],
                         "per_step_predictions": pred["per_step_predictions"].tolist(),
@@ -609,7 +613,7 @@ def train(
 
     # Save training metrics
     metrics_file = output_path / f"metrics_{model_type}.json"
-    with open(metrics_file, "w") as writable:
+    with open(metrics_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
                 "model_type": model_type,
