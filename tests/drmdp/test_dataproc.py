@@ -187,9 +187,9 @@ def test_collection_traj_data_observation_action_consistency():
 
     # For each transition, next_obs should match the obs of the next transition
     # (unless there's a reset)
-    for i in range(len(buffer) - 1):
-        current_next_obs = buffer[i][2]
-        next_obs = buffer[i + 1][0]
+    for idx in range(len(buffer) - 1):
+        current_next_obs = buffer[idx][2]
+        next_obs = buffer[idx + 1][0]
 
         # If step count didn't reset, they should match
         current_step = int(current_next_obs[0])
