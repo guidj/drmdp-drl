@@ -1057,6 +1057,7 @@ def train_stage1_return_model(
     batch_size: int = 64,
     num_epochs: int = 100,
     learning_rate: float = 0.01,
+    hidden_dim: int = 64,
     eval_steps: int = 20,
     output_dir: str = "outputs",
 ) -> Tuple[nn.Module, nn.Module]:
@@ -1085,7 +1086,7 @@ def train_stage1_return_model(
 
     # Create shared embedding
     shared_embedding = SharedStateActionEmbedding(
-        state_dim=obs_dim, action_dim=act_dim, hidden_dim=256
+        state_dim=obs_dim, action_dim=act_dim, hidden_dim=hidden_dim
     )
 
     # Create GNetwork only
@@ -1098,9 +1099,10 @@ def train_stage1_return_model(
     g_model = GNetwork(
         state_dim=obs_dim,
         action_dim=act_dim,
-        hidden_dim=256,
+        hidden_dim=hidden_dim,
         num_heads=2,
         num_layers=2,
+        feedforward_dim=512,
         shared_embedding=shared_embedding,
         max_episode_steps=max_episode_steps,
     )
@@ -1236,6 +1238,7 @@ def train_stage2_reward_model(
     learning_rate: float = 0.01,
     lam: float = 1.0,
     xi: float = 1.0,
+    hidden_dim: int = 64,
     eval_steps: int = 20,
     output_dir: str = "outputs",
 ) -> nn.Module:
@@ -1282,14 +1285,14 @@ def train_stage2_reward_model(
         r_model = RNetwork(
             state_dim=obs_dim,
             action_dim=act_dim,
-            hidden_dim=256,
+            hidden_dim=hidden_dim,
             shared_embedding=shared_embedding_frozen,
         )
     elif reward_model_type == "rnn":
         r_model = RNetworkRNN(
             state_dim=obs_dim,
             action_dim=act_dim,
-            hidden_dim=256,
+            hidden_dim=hidden_dim,
             num_layers=2,
             rnn_type="lstm",
             shared_embedding=shared_embedding_frozen,
@@ -1298,7 +1301,7 @@ def train_stage2_reward_model(
         r_model = RNetworkTransformer(
             state_dim=obs_dim,
             action_dim=act_dim,
-            hidden_dim=256,
+            hidden_dim=hidden_dim,
             num_heads=2,
             num_layers=2,
             shared_embedding=shared_embedding_frozen,
@@ -1503,6 +1506,7 @@ def train(
     stage2_lr: float = 0.01,
     lam: float = 1.0,
     xi: float = 1.0,
+    hidden_dim: int = 256,
     output_dir: str = "outputs",
     seed: Optional[int] = None,
 ) -> Tuple[Dict[str, float], List[Any]]:
@@ -1553,6 +1557,7 @@ def train(
         batch_size=batch_size,
         num_epochs=stage1_epochs,
         learning_rate=stage1_lr,
+        hidden_dim=hidden_dim,
         eval_steps=eval_steps,
         output_dir=output_dir,
     )
@@ -1570,6 +1575,7 @@ def train(
         batch_size=batch_size,
         num_epochs=stage2_epochs,
         learning_rate=stage2_lr,
+        hidden_dim=hidden_dim,
         lam=lam,
         xi=xi,
         eval_steps=eval_steps,
