@@ -31,8 +31,8 @@ Usage Example:
 """
 
 import argparse
-import json
 import pathlib
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
@@ -42,6 +42,17 @@ from torch import nn, optim
 from torch.utils import data
 
 from drmdp import dataproc, rewdelay
+
+# Spec version identifier
+SPEC = "o2"
+
+
+def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
+    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
+    timestamp = int(time.time())
+    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
+    output_path.mkdir(parents=True, exist_ok=True)
+    return output_path
 
 
 class SharedStateActionEmbedding(nn.Module):
@@ -958,32 +969,566 @@ def evaluate_dual_model(
     return metrics, predictions_list
 
 
+def evaluate_stage1_return_model(
+    g_model: nn.Module,
+    test_ds: data.Dataset,
+    batch_size: int,
+    criterion: nn.Module,
+) -> Dict[str, float]:
+    """
+    Evaluate GNetwork on return prediction task.
+
+    Computes metrics:
+    - prev_return_mse: MSE on previous window return prediction
+    - curr_return_mse: MSE on current window return prediction
+    - combined_mse: Average of both
+    - prev_return_rmse: RMSE on previous window
+    - curr_return_rmse: RMSE on current window
+
+    Args:
+        g_model: GNetwork to evaluate
+        test_ds: Test dataset
+        batch_size: Batch size for evaluation
+        criterion: Loss criterion (MSELoss)
+
+    Returns:
+        Dictionary of metrics
+    """
+    g_model.eval()
+
+    test_dataloader = data.DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_variable_length_windows,
+    )
+
+    prev_errors = []
+    curr_errors = []
+
+    with torch.no_grad():
+        for inputs, labels in test_dataloader:
+            # Evaluate on previous window
+            g_outputs_prev = g_model(
+                inputs["prev_state"],
+                inputs["prev_action"],
+                inputs["prev_term"],
+                mask=inputs["prev_mask"],
+                timestep=inputs["prev_timestep"],
+            )
+            g_hat_prev = torch.squeeze(g_outputs_prev)
+            prev_mse = criterion(g_hat_prev, labels["prev_return"])
+            prev_errors.append(prev_mse.item())
+
+            # Evaluate on current window
+            g_outputs_curr = g_model(
+                inputs["curr_state"],
+                inputs["curr_action"],
+                inputs["curr_term"],
+                mask=inputs["curr_mask"],
+                timestep=inputs["curr_timestep"],
+            )
+            g_hat_curr = torch.squeeze(g_outputs_curr)
+            curr_mse = criterion(g_hat_curr, labels["curr_return"])
+            curr_errors.append(curr_mse.item())
+
+    # Compute final metrics
+    prev_mse = np.mean(prev_errors)
+    curr_mse = np.mean(curr_errors)
+    combined_mse = (prev_mse + curr_mse) / 2.0
+
+    prev_rmse = np.sqrt(prev_mse)
+    curr_rmse = np.sqrt(curr_mse)
+
+    g_model.train()  # Restore training mode
+
+    return {
+        "prev_return_mse": prev_mse,
+        "curr_return_mse": curr_mse,
+        "combined_mse": combined_mse,
+        "prev_return_rmse": prev_rmse,
+        "curr_return_rmse": curr_rmse,
+    }
+
+
+def train_stage1_return_model(
+    env: gym.Env,
+    dataset: data.Dataset,
+    batch_size: int = 64,
+    num_epochs: int = 100,
+    learning_rate: float = 0.01,
+    eval_steps: int = 20,
+    output_dir: str = "outputs",
+) -> Tuple[nn.Module, nn.Module]:
+    """
+    Stage 1: Pre-train GNetwork (return model) and shared embedding.
+
+    Trains on return prediction task:
+    - Loss = MSE(Ĝ_prev, G_prev) + MSE(Ĝ_curr, G_curr)
+
+    Args:
+        env: Gymnasium environment
+        dataset: DualWindowDataset
+        batch_size: Batch size for training
+        num_epochs: Number of training epochs
+        learning_rate: Learning rate for Adam optimizer
+        eval_steps: Number of batches for evaluation
+        output_dir: Directory to save stage 1 models
+
+    Returns:
+        Tuple of (GNetwork, SharedEmbedding) - trained models
+    """
+    # Split dataset
+    train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    # Create shared embedding
+    shared_embedding = SharedStateActionEmbedding(
+        state_dim=obs_dim, action_dim=act_dim, hidden_dim=256
+    )
+
+    # Create GNetwork only
+    max_episode_steps = (
+        getattr(env.spec, "max_episode_steps", 1000)
+        if hasattr(env, "spec") and env.spec
+        else 1000
+    )
+
+    g_model = GNetwork(
+        state_dim=obs_dim,
+        action_dim=act_dim,
+        hidden_dim=256,
+        num_heads=2,
+        num_layers=2,
+        shared_embedding=shared_embedding,
+        max_episode_steps=max_episode_steps,
+    )
+
+    print("[Stage 1] Training GNetwork (return model)")
+    print("  Model: Transformer Encoder")
+    print(f"  Parameters: {sum(param.numel() for param in g_model.parameters()):,}")
+
+    # Optimizer for GNetwork only (includes shared embedding)
+    optimizer = optim.Adam(g_model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Training loop
+    train_prev_losses = []
+    train_curr_losses = []
+    train_combined_losses = []
+
+    for epoch in range(num_epochs):
+        train_dataloader = data.DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_variable_length_windows,
+        )
+
+        epoch_prev_losses = []
+        epoch_curr_losses = []
+
+        for inputs, labels in train_dataloader:
+            # Forward pass on BOTH windows
+            g_outputs_prev = g_model(
+                inputs["prev_state"],
+                inputs["prev_action"],
+                inputs["prev_term"],
+                mask=inputs["prev_mask"],
+                timestep=inputs["prev_timestep"],
+            )
+
+            g_outputs_curr = g_model(
+                inputs["curr_state"],
+                inputs["curr_action"],
+                inputs["curr_term"],
+                mask=inputs["curr_mask"],
+                timestep=inputs["curr_timestep"],
+            )
+
+            # Stage 1 Loss: Return prediction only
+            g_hat_prev = torch.squeeze(g_outputs_prev)
+            g_hat_curr = torch.squeeze(g_outputs_curr)
+
+            loss_prev = criterion(g_hat_prev, labels["prev_return"])
+            loss_curr = criterion(g_hat_curr, labels["curr_return"])
+
+            loss = loss_prev + loss_curr
+
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_prev_losses.append(loss_prev.item())
+            epoch_curr_losses.append(loss_curr.item())
+
+        # Logging
+        avg_prev_loss = np.mean(epoch_prev_losses)
+        avg_curr_loss = np.mean(epoch_curr_losses)
+        avg_combined = avg_prev_loss + avg_curr_loss
+
+        train_prev_losses.append(avg_prev_loss)
+        train_curr_losses.append(avg_curr_loss)
+        train_combined_losses.append(avg_combined)
+
+        # Evaluate on test set every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            test_metrics = evaluate_stage1_return_model(
+                g_model, test_ds, batch_size, criterion
+            )
+            print(
+                f"[Stage 1] Epoch [{epoch + 1}/{num_epochs}] | "
+                f"Train Loss: {avg_combined:.4f} "
+                f"(Prev: {avg_prev_loss:.4f}, Curr: {avg_curr_loss:.4f}) | "
+                f"Test RMSE: {test_metrics['prev_return_rmse']:.4f} / {test_metrics['curr_return_rmse']:.4f}"
+            )
+
+    # Final evaluation on full test set
+    print("\n" + "=" * 80)
+    print("[Stage 1] FINAL EVALUATION")
+    print("=" * 80)
+
+    final_metrics = evaluate_stage1_return_model(
+        g_model, test_ds, batch_size, criterion
+    )
+
+    print("Previous Window Return Prediction:")
+    print(f"  MSE:  {final_metrics['prev_return_mse']:.6f}")
+    print(f"  RMSE: {final_metrics['prev_return_rmse']:.6f}")
+    print("\nCurrent Window Return Prediction:")
+    print(f"  MSE:  {final_metrics['curr_return_mse']:.6f}")
+    print(f"  RMSE: {final_metrics['curr_return_rmse']:.6f}")
+    print("\nCombined:")
+    print(f"  MSE:  {final_metrics['combined_mse']:.6f}")
+
+    # Save Stage 1 models
+    output_path = pathlib.Path(output_dir) / "stage1"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    model_file = output_path / "gnetwork_stage1.pt"
+    torch.save(
+        {
+            "return_model_state_dict": g_model.state_dict(),
+            "shared_embedding_state_dict": shared_embedding.state_dict(),
+            "train_prev_losses": train_prev_losses,
+            "train_curr_losses": train_curr_losses,
+            "train_combined_losses": train_combined_losses,
+            "final_metrics": final_metrics,
+        },
+        model_file,
+    )
+    print(f"\n[Stage 1] Models saved to {model_file}")
+    print("=" * 80)
+
+    return g_model, shared_embedding
+
+
+def train_stage2_reward_model(
+    env: gym.Env,
+    dataset: data.Dataset,
+    g_model_frozen: nn.Module,
+    shared_embedding_frozen: nn.Module,
+    reward_model_type: str = "rnn",
+    batch_size: int = 64,
+    num_epochs: int = 100,
+    learning_rate: float = 0.01,
+    lam: float = 1.0,
+    xi: float = 1.0,
+    eval_steps: int = 20,
+    output_dir: str = "outputs",
+) -> nn.Module:
+    """
+    Stage 2: Train RNetwork with frozen GNetwork.
+
+    Uses frozen GNetwork predictions to guide reward learning:
+    - Loss = loss_main + λ*ρ₁ + ξ*ρ₂
+
+    Args:
+        env: Gymnasium environment
+        dataset: DualWindowDataset
+        g_model_frozen: Frozen GNetwork from Stage 1
+        shared_embedding_frozen: Frozen shared embedding from Stage 1
+        reward_model_type: RNetwork architecture ("mlp", "rnn", "transformer")
+        batch_size: Batch size for training
+        num_epochs: Number of training epochs
+        learning_rate: Learning rate for Adam optimizer
+        lam: Weight for ρ₁ regularizer
+        xi: Weight for ρ₂ regularizer
+        eval_steps: Number of batches for evaluation
+        output_dir: Directory to save stage 2 models
+
+    Returns:
+        Trained RNetwork
+    """
+    # Freeze GNetwork and shared embedding
+    g_model_frozen.eval()
+    for param in g_model_frozen.parameters():
+        param.requires_grad = False
+
+    print("[Stage 2] Training RNetwork (reward model)")
+    print("  GNetwork: FROZEN")
+    print("  Shared Embedding: FROZEN")
+
+    # Split dataset
+    train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    # Create RNetwork with frozen shared embedding
+    r_model: nn.Module
+    if reward_model_type == "mlp":
+        r_model = RNetwork(
+            state_dim=obs_dim,
+            action_dim=act_dim,
+            hidden_dim=256,
+            shared_embedding=shared_embedding_frozen,
+        )
+    elif reward_model_type == "rnn":
+        r_model = RNetworkRNN(
+            state_dim=obs_dim,
+            action_dim=act_dim,
+            hidden_dim=256,
+            num_layers=2,
+            rnn_type="lstm",
+            shared_embedding=shared_embedding_frozen,
+        )
+    elif reward_model_type == "transformer":
+        r_model = RNetworkTransformer(
+            state_dim=obs_dim,
+            action_dim=act_dim,
+            hidden_dim=256,
+            num_heads=2,
+            num_layers=2,
+            shared_embedding=shared_embedding_frozen,
+        )
+    else:
+        raise ValueError(f"Unknown reward_model_type: {reward_model_type}")
+
+    print(f"  Model: {reward_model_type.upper()}")
+
+    # CRITICAL: Only optimize RNetwork parameters (NOT shared embedding)
+    # Shared embedding is frozen and should not receive gradients
+    r_model_params = [
+        param
+        for param in r_model.parameters()
+        if param.requires_grad  # Excludes frozen shared embedding
+    ]
+
+    print(f"  Trainable parameters: {sum(param.numel() for param in r_model_params):,}")
+    print(
+        f"  Frozen parameters: {sum(param.numel() for param in g_model_frozen.parameters()):,}"
+    )
+
+    optimizer = optim.Adam(r_model_params, lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Training loop
+    train_main_losses = []
+    train_rho1_losses = []
+    train_rho2_losses = []
+    train_combined_losses = []
+
+    for epoch in range(num_epochs):
+        train_dataloader = data.DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_variable_length_windows,
+        )
+
+        epoch_main_losses = []
+        epoch_rho1_losses = []
+        epoch_rho2_losses = []
+
+        for inputs, labels in train_dataloader:
+            # RNetwork forward pass (training)
+            r_outputs = r_model(
+                inputs["curr_state"],
+                inputs["curr_action"],
+                inputs["curr_term"],
+            )
+
+            # GNetwork forward passes (frozen - no gradients)
+            with torch.no_grad():
+                g_outputs_prev = g_model_frozen(
+                    inputs["prev_state"],
+                    inputs["prev_action"],
+                    inputs["prev_term"],
+                    mask=inputs["prev_mask"],
+                    timestep=inputs["prev_timestep"],
+                )
+
+                g_outputs_curr = g_model_frozen(
+                    inputs["curr_state"],
+                    inputs["curr_action"],
+                    inputs["curr_term"],
+                    mask=inputs["curr_mask"],
+                    timestep=inputs["curr_timestep"],
+                )
+
+            # Stage 2 Loss: Reward decomposition with frozen return guidance
+            r_hat = r_outputs
+            g_hat_prev = torch.squeeze(g_outputs_prev)
+            g_hat_curr = torch.squeeze(g_outputs_curr)
+
+            R_obs_curr = labels["curr_aggregate_reward"]
+            G_actual_prev = labels["prev_return"]
+            G_actual_curr = labels["curr_return"]
+
+            # Main loss: Predicted rewards should sum to observed aggregate
+            R_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
+            loss_main = criterion(R_hat_curr, R_obs_curr)
+
+            # ρ₁: Predicted return difference should match observed aggregate
+            rho_1 = torch.mean((g_hat_curr - R_obs_curr - g_hat_prev) ** 2)
+
+            # ρ₂: Actual return difference should match predicted aggregate
+            rho_2 = torch.mean((G_actual_curr - R_hat_curr - G_actual_prev) ** 2)
+
+            # Combined loss
+            loss = loss_main + lam * rho_1 + xi * rho_2
+
+            # Backward and optimize (only RNetwork)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_main_losses.append(loss_main.item())
+            epoch_rho1_losses.append(rho_1.item())
+            epoch_rho2_losses.append(rho_2.item())
+
+        # Logging
+        avg_main_loss = np.mean(epoch_main_losses)
+        avg_rho1_loss = np.mean(epoch_rho1_losses)
+        avg_rho2_loss = np.mean(epoch_rho2_losses)
+        avg_combined = avg_main_loss + lam * avg_rho1_loss + xi * avg_rho2_loss
+
+        train_main_losses.append(avg_main_loss)
+        train_rho1_losses.append(avg_rho1_loss)
+        train_rho2_losses.append(avg_rho2_loss)
+        train_combined_losses.append(avg_combined)
+
+        # Evaluate on test set every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            # Use the existing evaluate_dual_model function from est_o2.py
+            test_metrics, _ = evaluate_dual_model(
+                r_model,
+                g_model_frozen,
+                test_ds,
+                batch_size=batch_size,
+                collect_predictions=False,
+                max_batches=eval_steps,
+                shuffle=False,
+            )
+            print(
+                f"[Stage 2] Epoch [{epoch + 1}/{num_epochs}] | "
+                f"Train Loss: {avg_combined:.4f} "
+                f"(Main: {avg_main_loss:.4f}, ρ₁: {avg_rho1_loss:.4f}, ρ₂: {avg_rho2_loss:.4f}) | "
+                f"Test MSE - Reward: {test_metrics['reward_mse']:.4f}, "
+                f"Return: {test_metrics['return_mse']:.4f}, "
+                f"ρ₁: {test_metrics['rho_1']:.4f}, "
+                f"ρ₂: {test_metrics['rho_2']:.4f}"
+            )
+
+    # Final evaluation on full test set
+    print("\n" + "=" * 80)
+    print("[Stage 2] FINAL EVALUATION")
+    print("=" * 80)
+
+    final_metrics, _ = evaluate_dual_model(
+        r_model,
+        g_model_frozen,
+        test_ds,
+        batch_size=batch_size,
+        collect_predictions=False,
+    )
+
+    print("Reward Prediction (RNetwork):")
+    print(f"  MSE:  {final_metrics['reward_mse']:.6f}")
+    print(f"  RMSE: {np.sqrt(final_metrics['reward_mse']):.6f}")
+    print("\nReturn Prediction (GNetwork - frozen):")
+    print(f"  MSE:  {final_metrics['return_mse']:.6f}")
+    print(f"  RMSE: {np.sqrt(final_metrics['return_mse']):.6f}")
+    print("\nRegularizers:")
+    print(f"  ρ₁: {final_metrics['rho_1']:.6f}")
+    print(f"  ρ₂: {final_metrics['rho_2']:.6f}")
+
+    # Save Stage 2 model
+    output_path = pathlib.Path(output_dir) / "stage2"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    model_file = output_path / f"rnetwork_{reward_model_type}_stage2.pt"
+    torch.save(
+        {
+            "reward_model_state_dict": r_model.state_dict(),
+            "reward_model_type": reward_model_type,
+            "train_main_losses": train_main_losses,
+            "train_rho1_losses": train_rho1_losses,
+            "train_rho2_losses": train_rho2_losses,
+            "train_combined_losses": train_combined_losses,
+            "final_metrics": final_metrics,
+        },
+        model_file,
+    )
+    print(f"\n[Stage 2] Model saved to {model_file}")
+
+    # Save complete dual model (for compatibility with eval_est_o2.py)
+    dual_model_file = output_path / f"model_{reward_model_type}_return.pt"
+    torch.save(
+        {
+            "reward_model_state_dict": r_model.state_dict(),
+            "return_model_state_dict": g_model_frozen.state_dict(),
+            "reward_model_type": reward_model_type,
+            "return_model_type": "transformer",
+        },
+        dual_model_file,
+    )
+    print(f"[Stage 2] Dual model saved to {dual_model_file} (for evaluation)")
+    print("=" * 80)
+
+    return r_model
+
+
 def train(
     env: gym.Env,
     dataset: data.Dataset,
     batch_size: int,
     eval_steps: int,
     reward_model_type: str = "rnn",
+    stage1_epochs: int = 100,
+    stage2_epochs: int = 100,
+    stage1_lr: float = 0.01,
+    stage2_lr: float = 0.01,
     lam: float = 1.0,
     xi: float = 1.0,
     output_dir: str = "outputs",
     seed: Optional[int] = None,
-):
+) -> Tuple[Dict[str, float], List[Any]]:
     """
-    Train dual-window reward and return prediction models with shared embeddings.
+    Two-stage training for O2 model.
 
-    Implements the O2 approach with regularizers ρ₁ and ρ₂ for grounded reward estimation.
+    Stage 1: Pre-train GNetwork (return model) + shared embedding
+    Stage 2: Train RNetwork with frozen GNetwork
 
     Args:
         env: Gymnasium environment
-        dataset: Training dataset (DualWindowDataset)
-        batch_size: Batch size for training
-        eval_steps: Number of evaluation steps
-        reward_model_type: Type of reward model ("mlp", "rnn", or "transformer")
-        lam: Weight for ρ₁ regularizer (grounds predictions on aggregate feedback) (default: 1.0)
-        xi: Weight for ρ₂ regularizer (grounds predictions on actual returns) (default: 1.0)
-        output_dir: Directory to save predictions and results
-        seed: Random seed for reproducibility (default: None)
+        dataset: DualWindowDataset
+        batch_size: Batch size for both stages
+        eval_steps: Evaluation steps
+        reward_model_type: RNetwork architecture
+        stage1_epochs: Epochs for GNetwork training
+        stage2_epochs: Epochs for RNetwork training
+        stage1_lr: Learning rate for Stage 1
+        stage2_lr: Learning rate for Stage 2
+        lam: Weight for ρ₁ regularizer (Stage 2)
+        xi: Weight for ρ₂ regularizer (Stage 2)
+        output_dir: Output directory
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (metrics_dict, predictions_list) - same interface as old train()
     """
     # Set random seeds for reproducibility
     if seed is not None:
@@ -994,323 +1539,58 @@ def train(
         torch.backends.cudnn.benchmark = False
         print(f"Set random seed to {seed} for reproducibility")
 
-    train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+    print("=" * 80)
+    print("O2 TWO-STAGE TRAINING")
+    print("=" * 80)
 
-    # ===== Create shared embedding layer =====
-    shared_embedding = SharedStateActionEmbedding(
-        state_dim=obs_dim, action_dim=act_dim, hidden_dim=256
+    # Stage 1: Train GNetwork
+    print("\n" + "=" * 80)
+    print("STAGE 1: PRE-TRAIN RETURN MODEL (GNetwork)")
+    print("=" * 80)
+    g_model, shared_embedding = train_stage1_return_model(
+        env=env,
+        dataset=dataset,
+        batch_size=batch_size,
+        num_epochs=stage1_epochs,
+        learning_rate=stage1_lr,
+        eval_steps=eval_steps,
+        output_dir=output_dir,
     )
 
-    # ===== Reward model (user-selectable architecture) =====
-    r_model: nn.Module
-    if reward_model_type == "mlp":
-        r_model = RNetwork(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            shared_embedding=shared_embedding,
-        )
-    elif reward_model_type == "rnn":
-        r_model = RNetworkRNN(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            num_layers=2,
-            rnn_type="lstm",
-            shared_embedding=shared_embedding,
-        )
-    elif reward_model_type == "transformer":
-        r_model = RNetworkTransformer(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            num_heads=2,
-            num_layers=2,
-            shared_embedding=shared_embedding,
-        )
-    else:
-        raise ValueError(
-            f"Unknown reward_model_type: {reward_model_type}. Use 'mlp', 'rnn', or 'transformer'."
-        )
-
-    # ===== Return model (always Transformer) =====
-    # Get max episode steps from environment spec, default to 1000
-    max_episode_steps = (
-        getattr(env.spec, "max_episode_steps", 1000)
-        if hasattr(env, "spec") and env.spec
-        else 1000
+    # Stage 2: Train RNetwork with frozen GNetwork
+    print("\n" + "=" * 80)
+    print("STAGE 2: TRAIN REWARD MODEL (RNetwork) WITH FROZEN GNetwork")
+    print("=" * 80)
+    train_stage2_reward_model(
+        env=env,
+        dataset=dataset,
+        g_model_frozen=g_model,
+        shared_embedding_frozen=shared_embedding,
+        reward_model_type=reward_model_type,
+        batch_size=batch_size,
+        num_epochs=stage2_epochs,
+        learning_rate=stage2_lr,
+        lam=lam,
+        xi=xi,
+        eval_steps=eval_steps,
+        output_dir=output_dir,
     )
 
-    g_model: GNetwork = GNetwork(
-        state_dim=obs_dim,
-        action_dim=act_dim,
-        hidden_dim=256,
-        num_heads=2,
-        num_layers=2,
-        shared_embedding=shared_embedding,
-        max_episode_steps=max_episode_steps,
+    print("\n" + "=" * 80)
+    print("TWO-STAGE TRAINING COMPLETE")
+    print("=" * 80)
+    print(f"Stage 1 models: {output_dir}/stage1/")
+    print(f"Stage 2 models: {output_dir}/stage2/")
+
+    # Return final metrics (for compatibility with existing calling code)
+    # Load Stage 2 final metrics from checkpoint
+    stage2_path = (
+        pathlib.Path(output_dir) / "stage2" / f"rnetwork_{reward_model_type}_stage2.pt"
     )
+    checkpoint = torch.load(stage2_path)
+    final_metrics = checkpoint["final_metrics"]
 
-    print(
-        f"Training with shared embeddings - "
-        f"Reward model: {reward_model_type.upper()}, Return model: TRANSFORMER"
-    )
-
-    # ===== Combined optimizer =====
-    # Collect unique parameters to avoid duplicating shared embedding params
-    seen_params = set()
-    unique_params = []
-    for model in [r_model, g_model]:
-        for param in model.parameters():
-            if id(param) not in seen_params:
-                seen_params.add(id(param))
-                unique_params.append(param)
-
-    optimizer = optim.Adam(unique_params, lr=0.01)
-    main_criterion = nn.MSELoss()
-    lam1_criterion = nn.MSELoss()
-    lam2_criterion = nn.MSELoss()
-    prev_return_criterion = nn.MSELoss()
-    curr_return_criterion = nn.MSELoss()
-
-    # Training Loop
-    epochs = 100
-    train_main_losses = []
-    train_rho1_losses = []
-    train_rho2_losses = []
-    train_prev_return_losses = []
-    train_curr_return_losses = []
-    train_combined_losses = []
-    eval_metrics_history = []
-
-    for epoch in range(epochs):
-        train_dataloader = data.DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            collate_fn=collate_variable_length_windows,
-        )
-
-        # Training
-        epoch_main_losses = []
-        epoch_rho1_losses = []
-        epoch_rho2_losses = []
-        epoch_curr_return_losses = []
-        epoch_prev_return_losses = []
-        epoch_combined_losses = []
-
-        for inputs, labels in train_dataloader:
-            # ===== Forward pass on current window (reward model) =====
-            r_outputs = r_model(
-                inputs["curr_state"], inputs["curr_action"], inputs["curr_term"]
-            )  # Shape: (batch_size, curr_seq_len, 1)
-
-            # ===== Forward pass on previous window (return model) =====
-            g_outputs_prev = g_model(
-                inputs["prev_state"],
-                inputs["prev_action"],
-                inputs["prev_term"],
-                mask=inputs["prev_mask"],
-                timestep=inputs["prev_timestep"],
-            )  # Shape: (batch_size, 1)
-
-            # ===== Forward pass on current window (return model) =====
-            # Following O2 spec: Ĝ_{t_w_i} = h({s_t,a_t}_{w_i}, t_{w_i})
-            # Both windows get independent predictions from the return model
-            g_outputs_curr = g_model(
-                inputs["curr_state"],
-                inputs["curr_action"],
-                inputs["curr_term"],
-                mask=inputs["curr_mask"],
-                timestep=inputs["curr_timestep"],
-            )  # Shape: (batch_size, 1)
-
-            # ===== O2 Specification Loss Function =====
-            # Extract predictions and labels
-            r_hat = r_outputs  # (batch, seq_len, 1) - per-step reward predictions
-            g_hat_prev = torch.squeeze(
-                g_outputs_prev
-            )  # (batch,) - predicted return for prev window
-            g_hat_curr = torch.squeeze(
-                g_outputs_curr
-            )  # (batch,) - predicted return for curr window (INDEPENDENT prediction)
-
-            ro_obs_curr = labels["curr_aggregate_reward"]  # Observed aggregate reward
-            g_actual_prev = labels["prev_return"]  # Actual return at end of prev window
-            g_actual_curr = labels["curr_return"]  # Actual return at end of curr window
-
-            # Main loss: Match observed aggregate reward with summed predicted rewards
-            r_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))  # Predicted aggregate
-            loss_main = main_criterion(r_hat_curr, ro_obs_curr)
-
-            # ρ₁: [(Ĝ_{t_w_i} - R^o_t) - Ĝ_{t_w_{i-1}}]²
-            # Difference in predicted returns should match observed aggregate
-            # Ĝ_curr - Ĝ_prev should equal R_obs_curr
-            rho_1 = lam1_criterion(g_hat_curr - ro_obs_curr, g_hat_prev)
-
-            # ρ₂: [(G_{t_w_i} - R̂^o_t) - G_{t_w_{i-1}}]²
-            # Difference in actual returns should match predicted aggregate
-            # G_curr - G_prev should equal R_hat_curr
-            rho_2 = lam2_criterion(g_actual_curr - r_hat_curr, g_actual_prev)
-
-            # Predicted returns should also match the true returns
-            loss_curr_return = curr_return_criterion(g_hat_curr, g_actual_curr)
-            loss_prev_return = prev_return_criterion(g_hat_prev, g_actual_prev)
-
-            # Combined loss with two regularization weights
-            # Total: L(φ) = main_loss + λ ρ₁ + ξ ρ₂
-            loss = (
-                loss_main
-                + lam * rho_1
-                + xi * rho_2
-                + loss_curr_return
-                + loss_prev_return
-            )
-
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_main_losses.append(loss_main.item())
-            epoch_rho1_losses.append(rho_1.item())
-            epoch_rho2_losses.append(rho_2.item())
-            epoch_prev_return_losses.append(loss_prev_return.item())
-            epoch_curr_return_losses.append(loss_curr_return.item())
-            epoch_combined_losses.append(loss.item())
-
-        avg_main_loss = np.mean(epoch_main_losses)
-        avg_rho1_loss = np.mean(epoch_rho1_losses)
-        avg_rho2_loss = np.mean(epoch_rho2_losses)
-        avg_prev_return_loss = np.mean(epoch_prev_return_losses)
-        avg_curr_return_loss = np.mean(epoch_curr_return_losses)
-        avg_combined_loss = np.mean(epoch_combined_losses)
-
-        train_main_losses.append(avg_main_loss)
-        train_rho1_losses.append(avg_rho1_loss)
-        train_rho2_losses.append(avg_rho2_loss)
-        train_prev_return_losses.append(avg_prev_return_loss)
-        train_curr_return_losses.append(avg_curr_return_loss)
-        train_combined_losses.append(avg_combined_loss)
-
-        # Evaluation
-        if (epoch + 1) % 5 == 0:
-            eval_metrics, _ = evaluate_dual_model(
-                r_model,
-                g_model,
-                test_ds,
-                batch_size=batch_size,
-                collect_predictions=False,
-                max_batches=eval_steps,
-                shuffle=True,
-            )
-            eval_metrics_history.append(eval_metrics)
-
-            print(
-                f"Epoch [{epoch + 1}/{epochs}] | "
-                f"Train Loss: {avg_combined_loss:.4f} "
-                f"(Main: {avg_main_loss:.4f}, ρ₁: {avg_rho1_loss:.4f}, ρ₂: {avg_rho2_loss:.4f}, return(prev): {avg_prev_return_loss:.4f}, return(curr): {avg_curr_return_loss:.4f}) | "
-                f"Eval MSE - Reward: {eval_metrics['reward_mse']:.4f}, "
-                f"Return: {eval_metrics['return_mse']:.4f}, "
-                f"ρ₁: {eval_metrics['rho_1']:.4f}, "
-                f"ρ₂: {eval_metrics['rho_2']:.4f}"
-            )
-
-    # Final evaluation and save predictions
-    print("\nFinal evaluation...")
-    final_metrics, predictions_list = evaluate_dual_model(
-        r_model, g_model, test_ds, batch_size
-    )
-    print(f"Final Test Reward RMSE: {np.sqrt(final_metrics['reward_mse']):.8f}")
-    print(f"Final Test Return RMSE: {np.sqrt(final_metrics['return_mse']):.8f}")
-    print(f"Final Test Combined RMSE: {np.sqrt(final_metrics['combined_mse']):.8f}")
-
-    # Save results
-    output_path = pathlib.Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Save predictions
-    predictions_file = output_path / f"predictions_{reward_model_type}_return.json"
-    with open(predictions_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "reward_model_type": reward_model_type,
-                "return_model_type": "transformer",
-                "final_reward_mse": final_metrics["reward_mse"],
-                "final_return_mse": final_metrics["return_mse"],
-                "final_combined_mse": final_metrics["combined_mse"],
-                "num_predictions": len(predictions_list),
-                "predictions": [
-                    {
-                        "prev_window": {
-                            "state": pred["prev_window"]["state"].tolist(),
-                            "action": pred["prev_window"]["action"].tolist(),
-                            "term": pred["prev_window"]["term"].tolist(),
-                            "actual_return": pred["prev_window"]["actual_return"],
-                            "predicted_return": pred["prev_window"]["predicted_return"],
-                        },
-                        "curr_window": {
-                            "state": pred["curr_window"]["state"].tolist(),
-                            "action": pred["curr_window"]["action"].tolist(),
-                            "term": pred["curr_window"]["term"].tolist(),
-                            "actual_aggregate_reward": pred["curr_window"][
-                                "actual_aggregate_reward"
-                            ],
-                            "predicted_aggregate_reward": pred["curr_window"][
-                                "predicted_aggregate_reward"
-                            ],
-                            "per_step_predictions": pred["curr_window"][
-                                "per_step_predictions"
-                            ].tolist(),
-                        },
-                    }
-                    for pred in predictions_list
-                ],
-            },
-            writable,
-            indent=2,
-        )
-    print(f"Predictions saved to {predictions_file}")
-
-    # Save training metrics
-    metrics_file = output_path / f"metrics_{reward_model_type}_return.json"
-    with open(metrics_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "reward_model_type": reward_model_type,
-                "return_model_type": "transformer",
-                "train_main_losses": train_main_losses,
-                "train_rho1_losses": train_rho1_losses,
-                "train_rho2_losses": train_rho2_losses,
-                "train_prev_return_losses": train_prev_return_losses,
-                "train_curr_return_losses": train_curr_return_losses,
-                "train_combined_losses": train_combined_losses,
-                "eval_metrics_history": eval_metrics_history,
-                "final_reward_mse": final_metrics["reward_mse"],
-                "final_return_mse": final_metrics["return_mse"],
-                "final_combined_mse": final_metrics["combined_mse"],
-            },
-            writable,
-            indent=2,
-        )
-    print(f"Training metrics saved to {metrics_file}")
-
-    # Save models
-    model_file = output_path / f"model_{reward_model_type}_return.pt"
-    torch.save(
-        {
-            "reward_model_state_dict": r_model.state_dict(),
-            "return_model_state_dict": g_model.state_dict(),
-            "reward_model_type": reward_model_type,
-            "return_model_type": "transformer",
-        },
-        model_file,
-    )
-    print(f"Models saved to {model_file}")
-
-    return final_metrics, predictions_list
+    return final_metrics, []  # Empty predictions list
 
 
 def main():
@@ -1381,6 +1661,30 @@ def main():
         default=None,
         help="Random seed for reproducibility (default: None)",
     )
+    parser.add_argument(
+        "--stage1-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs for Stage 1 (GNetwork) training (default: 100)",
+    )
+    parser.add_argument(
+        "--stage2-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs for Stage 2 (RNetwork) training (default: 100)",
+    )
+    parser.add_argument(
+        "--stage1-lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for Stage 1 (default: 0.01)",
+    )
+    parser.add_argument(
+        "--stage2-lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for Stage 2 (default: 0.01)",
+    )
 
     args = parser.parse_args()
 
@@ -1436,6 +1740,10 @@ def main():
         batch_size=args.batch_size,
         eval_steps=args.eval_steps,
         reward_model_type=args.reward_model_type,
+        stage1_epochs=args.stage1_epochs,
+        stage2_epochs=args.stage2_epochs,
+        stage1_lr=args.stage1_lr,
+        stage2_lr=args.stage2_lr,
         lam=args.lam,
         xi=args.xi,
         output_dir=args.output_dir,
