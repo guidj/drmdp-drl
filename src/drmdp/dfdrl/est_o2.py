@@ -553,11 +553,12 @@ class DualWindowDataset(data.Dataset):
         Args:
             inputs: Dict with keys: prev_state, prev_action, prev_term,
                     curr_state, curr_action, curr_term
-            labels: Dict with keys: prev_return, curr_aggregate_reward, curr_return
+            labels: Dict with keys: prev_start_return, prev_end_return, prev_aggregate_reward,
+                    curr_start_return, curr_end_return, curr_aggregate_reward
         """
         self.inputs = inputs
         self.labels = labels
-        self.length = len(labels["prev_return"])
+        self.length = len(labels["prev_end_return"])
 
     def __len__(self):
         return self.length
@@ -661,8 +662,8 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
     Creates dataset with consecutive window pairs.
 
     For each pair of consecutive windows, creates an example with:
-    - Previous window: state, action, term, cumulative_return_at_last_step
-    - Current window: state, action, term, aggregate_reward, cumulative_return_at_last_step
+    - Previous window: state, action, term, start_return, end_return, aggregate_reward
+    - Current window: state, action, term, start_return, end_return, aggregate_reward
 
     Cumulative return = sum of all rewards from beginning up to that step.
 
@@ -675,7 +676,8 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
     Returns:
         List of (inputs_dict, labels_dict) tuples where:
         - inputs_dict: prev_state, prev_action, prev_term, curr_state, curr_action, curr_term
-        - labels_dict: prev_return, curr_aggregate_reward, curr_return
+        - labels_dict: prev_start_return, prev_end_return, prev_aggregate_reward,
+                       curr_start_return, curr_end_return, curr_aggregate_reward
     """
 
     def create_traj_step(state, action, reward, term):
@@ -755,7 +757,17 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
         if steps == reward_delay and not episode_boundary_in_window:
             curr_window_inputs, curr_aggregate_reward = create_window(curr_steps)
             curr_window_last_idx = idx - 1
+            curr_window_first_idx = idx - steps
             curr_window_timestep = episode_timesteps[curr_window_last_idx]
+
+            # Compute current window start and end returns
+            if curr_window_first_idx == 0:
+                curr_start_return = 0.0  # Episode start
+            elif curr_window_first_idx > 0 and term[curr_window_first_idx - 1]:
+                curr_start_return = 0.0  # New episode start (after terminal state)
+            else:
+                curr_start_return = cumulative_returns[curr_window_first_idx - 1]
+            curr_end_return = cumulative_returns[curr_window_last_idx]
 
             # For first window, create zero-filled previous window
             if prev_window is None:
@@ -765,11 +777,15 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
                     "action": torch.zeros(1, action.shape[1]),
                     "term": torch.zeros(1, 1),
                 }
-                zero_prev_return = torch.tensor(0.0, dtype=torch.float32)
-                prev_window = (zero_prev_inputs, zero_prev_return)
+                prev_window = (zero_prev_inputs, 0.0, 0.0, 0.0)
                 prev_window_timestep = 0
 
-            prev_window_inputs, prev_return = prev_window
+            (
+                prev_window_inputs,
+                prev_start_return,
+                prev_end_return,
+                prev_aggregate_reward,
+            ) = prev_window
 
             # Create dual-window example
             example_inputs = {
@@ -786,15 +802,19 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
                     [[curr_window_timestep]], dtype=torch.long
                 ),
             }
-            # Get cumulative return at the LAST step of current window
-            curr_window_return = torch.tensor(
-                cumulative_returns[curr_window_last_idx], dtype=torch.float32
-            )
-
             example_labels = {
-                "prev_return": prev_return,
+                "prev_start_return": torch.tensor(
+                    prev_start_return, dtype=torch.float32
+                ),
+                "prev_end_return": torch.tensor(prev_end_return, dtype=torch.float32),
+                "prev_aggregate_reward": torch.tensor(
+                    prev_aggregate_reward, dtype=torch.float32
+                ),
+                "curr_start_return": torch.tensor(
+                    curr_start_return, dtype=torch.float32
+                ),
+                "curr_end_return": torch.tensor(curr_end_return, dtype=torch.float32),
                 "curr_aggregate_reward": curr_aggregate_reward,
-                "curr_return": curr_window_return,
             }
 
             examples.append((example_inputs, example_labels))
@@ -808,7 +828,12 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
                 prev_window_timestep = 0
             else:
                 # Normal case: consecutive windows within same episode
-                prev_window = (curr_window_inputs, curr_window_return)
+                prev_window = (
+                    curr_window_inputs,
+                    curr_start_return,
+                    curr_end_return,
+                    curr_aggregate_reward.item(),
+                )
                 prev_window_timestep = curr_window_timestep
         elif episode_boundary_in_window:
             # Reset previous window after episode boundary
@@ -910,22 +935,22 @@ def evaluate_dual_model(
                 inputs["prev_action"],
                 inputs["prev_term"],
                 mask=inputs["prev_mask"],
-                start_return=None,
+                start_return=labels["prev_start_return"].unsqueeze(1),
             )  # Shape: (batch_size, 1)
 
             # Forward pass on current window (independent prediction)
-            # Current window: start_return = prev_return (from labels)
+            # Current window: start_return = prev_end_return (from labels)
             return_predictions_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["prev_return"].unsqueeze(1),
+                start_return=labels["curr_start_return"].unsqueeze(1),
             )  # Shape: (batch_size, 1)
 
             pred_prev_return = torch.squeeze(return_predictions_prev)
             pred_curr_return = torch.squeeze(return_predictions_curr)
-            return_mse = eval_criterion(pred_prev_return, labels["prev_return"])
+            return_mse = eval_criterion(pred_prev_return, labels["prev_end_return"])
             return_errors.append(return_mse)
 
             # ===== Compute regularizer terms =====
@@ -934,8 +959,8 @@ def evaluate_dual_model(
             g_hat_curr = pred_curr_return  # Independent prediction, not compositional
 
             R_obs_curr = labels["curr_aggregate_reward"]
-            G_actual_prev = labels["prev_return"]
-            G_actual_curr = labels["curr_return"]
+            G_actual_prev = labels["prev_end_return"]
+            G_actual_curr = labels["curr_end_return"]
             R_hat_curr = pred_curr_reward
 
             # ρ₁: [(Ĝ_curr - R_obs) - Ĝ_prev]²
@@ -955,7 +980,7 @@ def evaluate_dual_model(
                                 "state": inputs["prev_state"][idx].cpu().numpy(),
                                 "action": inputs["prev_action"][idx].cpu().numpy(),
                                 "term": inputs["prev_term"][idx].cpu().numpy(),
-                                "actual_return": labels["prev_return"][idx].item(),
+                                "actual_return": labels["prev_end_return"][idx].item(),
                                 "predicted_return": pred_prev_return[idx].item(),
                             },
                             "curr_window": {
@@ -1033,16 +1058,16 @@ def evaluate_stage1_return_model(
     with torch.no_grad():
         for inputs, labels in test_dataloader:
             # Evaluate on current window
-            # Current window: start_return = prev_return (from labels)
+            # Current window: start_return = prev_end_return (from labels)
             g_outputs_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["prev_return"].unsqueeze(1),
+                start_return=labels["prev_end_return"].unsqueeze(1),
             )
             g_hat_curr = torch.squeeze(g_outputs_curr)
-            curr_mse = criterion(g_hat_curr, labels["curr_return"])
+            curr_mse = criterion(g_hat_curr, labels["curr_end_return"])
             errors.append(curr_mse.item())
 
     # Compute final metrics
@@ -1135,18 +1160,18 @@ def train_stage1_return_model(
         epoch_losses = []
 
         for inputs, labels in train_dataloader:
-            # Current window: start_return = prev_return (from labels)
+            # Current window: start_return = prev_end_return (from labels)
             g_outputs_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["prev_return"].unsqueeze(1),
+                start_return=labels["prev_end_return"].unsqueeze(1),
             )
 
             # Stage 1 Loss: Return prediction only
             g_hat_curr = torch.squeeze(g_outputs_curr)
-            loss = criterion(g_hat_curr, labels["curr_return"])
+            loss = criterion(g_hat_curr, labels["curr_end_return"])
 
             # Backward and optimize
             optimizer.zero_grad()
@@ -1335,18 +1360,18 @@ def train_stage2_reward_model(
                 g_outputs_prev = g_model_frozen(
                     inputs["prev_state"],
                     inputs["prev_action"],
-                     ["prev_term"],
+                    inputs["prev_term"],
                     mask=inputs["prev_mask"],
                     start_return=None,
                 )
 
-                # Current window: start_return = prev_return (from labels)
+                # Current window: start_return = prev_end_return (from labels)
                 g_outputs_curr = g_model_frozen(
                     inputs["curr_state"],
                     inputs["curr_action"],
                     inputs["curr_term"],
                     mask=inputs["curr_mask"],
-                    start_return=labels["prev_return"].unsqueeze(1),
+                    start_return=labels["prev_end_return"].unsqueeze(1),
                 )
 
             # Stage 2 Loss: Reward decomposition with frozen return guidance
@@ -1355,8 +1380,8 @@ def train_stage2_reward_model(
             g_hat_curr = torch.squeeze(g_outputs_curr)
 
             R_obs_curr = labels["curr_aggregate_reward"]
-            G_actual_prev = labels["prev_return"]
-            G_actual_curr = labels["curr_return"]
+            G_actual_prev = labels["prev_end_return"]
+            G_actual_curr = labels["curr_end_return"]
 
             # Main loss: Predicted rewards should sum to observed aggregate
             R_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
@@ -1708,11 +1733,20 @@ def main():
         "curr_timestep": [inp["curr_timestep"] for inp in inputs_list],
     }
     labels_dict = {
-        "prev_return": torch.stack([lab["prev_return"] for lab in labels_list]),
+        "prev_start_return": torch.stack(
+            [lab["prev_start_return"] for lab in labels_list]
+        ),
+        "prev_end_return": torch.stack([lab["prev_end_return"] for lab in labels_list]),
+        "prev_aggregate_reward": torch.stack(
+            [lab["prev_aggregate_reward"] for lab in labels_list]
+        ),
+        "curr_start_return": torch.stack(
+            [lab["curr_start_return"] for lab in labels_list]
+        ),
+        "curr_end_return": torch.stack([lab["curr_end_return"] for lab in labels_list]),
         "curr_aggregate_reward": torch.stack(
             [lab["curr_aggregate_reward"] for lab in labels_list]
         ),
-        "curr_return": torch.stack([lab["curr_return"] for lab in labels_list]),
     }
 
     dataset = DualWindowDataset(inputs=inputs_dict, labels=labels_dict)
