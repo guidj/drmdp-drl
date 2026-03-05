@@ -95,6 +95,7 @@ class SharedStateActionEmbedding(nn.Module):
 
         # Concatenate and project
         features = torch.concat([state, action, term], dim=-1)
+        # TODO: Remove relu after noting result from removing projection of return
         return nn.functional.relu(self.input_proj(features))
 
 
@@ -365,13 +366,22 @@ class RNetworkTransformer(nn.Module):
 
 class GNetwork(nn.Module):
     """
-    Transformer Encoder-based return prediction network.
+    Transformer Encoder-based return prediction network with delta prediction.
     Processes entire previous window sequence and outputs single return value.
     Uses shared embedding for state-action representation.
 
+    Architecture: Predicts DELTA (change in return) and adds to start_return via
+    residual connection. This enforces delta prediction structure and simplifies
+    the learning task.
+
     Unlike RNetworkTransformer, this uses an Encoder (not Decoder) and does not
     require causal masking since it needs to attend to the entire sequence.
-    It outputs a single scalar value representing the aggregate return for the window.
+
+    Key features:
+    - Non-linear start_return encoder for expressive conditioning
+    - LayerNorm applied BEFORE adding start_return (preserves magnitude)
+    - Delta prediction: internally predicts change in return
+    - Residual connection: output = start_return + delta
 
     Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
     Output shape: (batch_size, 1)
@@ -408,8 +418,16 @@ class GNetwork(nn.Module):
             torch.zeros(1, 1000, hidden_dim)
         )  # Max sequence length 1000
 
-        # Timestep embedding: scalar timestep -> hidden_dim
-        self.timestep_proj = nn.Linear(1, hidden_dim)
+        # Start return encoder: non-linear projection for better conditioning
+        # Using MLP instead of single linear layer for more expressive conditioning
+        self.start_return_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Layer normalization (applied before adding start_return)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
 
         # Transformer encoder layers (no causal masking needed)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -423,11 +441,9 @@ class GNetwork(nn.Module):
             encoder_layer, num_layers=num_layers
         )
 
-        # Output projection: hidden_dim -> 1 (single return value)
-        self.output_proj = nn.Linear(hidden_dim, 1)
-
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        # Delta projection: predicts change in return (not absolute)
+        # Output will be: start_return + delta (residual connection)
+        self.delta_proj = nn.Linear(hidden_dim, 1)
 
         # Initialize positional encoding with sinusoidal pattern
         self._init_positional_encoding()
@@ -446,7 +462,7 @@ class GNetwork(nn.Module):
         pe[0, :, 1::2] = torch.cos(position * div_term)
         self.pos_encoding.data.copy_(pe)
 
-    def forward(self, state, action, term, mask=None, timestep=None):
+    def forward(self, state, action, term, mask=None, start_return=None):
         """
         Args:
             state: Tensor of shape (batch_size, sequence_length, state_dim)
@@ -454,13 +470,20 @@ class GNetwork(nn.Module):
             term: Tensor of shape (batch_size, sequence_length, 1)
             mask: Optional bool tensor of shape (batch_size, sequence_length)
                   True for valid positions, False for padding
-            timestep: Optional tensor of shape (batch_size, 1) - absolute episode timestep t_{w_i}
+            start_return: Optional tensor of shape (batch_size, 1)
+                         Cumulative return at the START of the window.
+                         If None, defaults to 0.0 (episode start).
 
         Returns:
             returns: Tensor of shape (batch_size, 1)
                 Single return value per sequence
         """
+        batch_size = state.shape[0]
         seq_len = state.shape[1]
+
+        # Default start_return to zeros if not provided (episode start)
+        if start_return is None:
+            start_return = torch.zeros(batch_size, 1, device=state.device)
 
         # Apply shared embedding to get hidden representation
         # Shape: (batch_size, sequence_length, hidden_dim)
@@ -469,17 +492,16 @@ class GNetwork(nn.Module):
         # Add positional encoding
         hidden = hidden + self.pos_encoding[:, :seq_len, :]
 
-        # Add timestep information if provided
-        if timestep is not None:
-            # Normalize timestep to [0, 1] range
-            norm_timestep = timestep.float() / self.max_episode_steps
-            # Project to hidden dimension and add to sequence representation
-            timestep_emb = self.timestep_proj(norm_timestep)  # (batch, hidden_dim)
-            # Add timestep embedding to all positions in sequence
-            hidden = hidden + timestep_emb.unsqueeze(1)  # Broadcast across sequence
-
-        # Apply layer normalization
+        # Apply layer normalization FIRST (before adding start_return)
+        # This prevents LayerNorm from diluting the start_return signal
         hidden = self.layer_norm(hidden)
+
+        # # Add start_return embedding AFTER normalization (broadcast to all positions)
+        # # Using non-linear encoder for more expressive conditioning
+        # start_return_emb = self.start_return_encoder(
+        #     start_return
+        # )  # (batch, hidden_dim)
+        # hidden = hidden + start_return_emb.unsqueeze(1)  # Broadcast across sequence
 
         # Create attention mask for transformer (inverted: True = mask out)
         # Transformer expects: False = attend, True = ignore
@@ -508,9 +530,14 @@ class GNetwork(nn.Module):
         else:
             pooled = torch.mean(output, dim=1)
 
-        # Project to single return value
+        # Predict DELTA (change in return), not absolute return
         # Shape: (batch_size, 1)
-        return_value = self.output_proj(pooled)
+        delta = self.delta_proj(pooled)
+
+        # RESIDUAL CONNECTION: output = start_return + predicted_delta
+        # This enforces the delta prediction structure and provides a direct
+        # gradient path from output to start_return
+        return_value = start_return + delta
 
         return return_value
 
@@ -877,21 +904,23 @@ def evaluate_dual_model(
 
             # ===== Return model evaluation =====
             # Forward pass on entire previous window sequence
+            # Previous window: start_return defaults to 0 (None)
             return_predictions_prev = g_model(
                 inputs["prev_state"],
                 inputs["prev_action"],
                 inputs["prev_term"],
                 mask=inputs["prev_mask"],
-                timestep=inputs["prev_timestep"],
+                start_return=None,
             )  # Shape: (batch_size, 1)
 
             # Forward pass on current window (independent prediction)
+            # Current window: start_return = prev_return (from labels)
             return_predictions_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                timestep=inputs["curr_timestep"],
+                start_return=labels["prev_return"].unsqueeze(1),
             )  # Shape: (batch_size, 1)
 
             pred_prev_return = torch.squeeze(return_predictions_prev)
@@ -979,11 +1008,8 @@ def evaluate_stage1_return_model(
     Evaluate GNetwork on return prediction task.
 
     Computes metrics:
-    - prev_return_mse: MSE on previous window return prediction
-    - curr_return_mse: MSE on current window return prediction
-    - combined_mse: Average of both
-    - prev_return_rmse: RMSE on previous window
-    - curr_return_rmse: RMSE on current window
+    - return_mse: MSE on current window return prediction
+    - return_rmse: RMSE on previous window
 
     Args:
         g_model: GNetwork to evaluate
@@ -1003,51 +1029,31 @@ def evaluate_stage1_return_model(
         collate_fn=collate_variable_length_windows,
     )
 
-    prev_errors = []
-    curr_errors = []
-
+    errors = []
     with torch.no_grad():
         for inputs, labels in test_dataloader:
-            # Evaluate on previous window
-            g_outputs_prev = g_model(
-                inputs["prev_state"],
-                inputs["prev_action"],
-                inputs["prev_term"],
-                mask=inputs["prev_mask"],
-                timestep=inputs["prev_timestep"],
-            )
-            g_hat_prev = torch.squeeze(g_outputs_prev)
-            prev_mse = criterion(g_hat_prev, labels["prev_return"])
-            prev_errors.append(prev_mse.item())
-
             # Evaluate on current window
+            # Current window: start_return = prev_return (from labels)
             g_outputs_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                timestep=inputs["curr_timestep"],
+                start_return=labels["prev_return"].unsqueeze(1),
             )
             g_hat_curr = torch.squeeze(g_outputs_curr)
             curr_mse = criterion(g_hat_curr, labels["curr_return"])
-            curr_errors.append(curr_mse.item())
+            errors.append(curr_mse.item())
 
     # Compute final metrics
-    prev_mse = np.mean(prev_errors)
-    curr_mse = np.mean(curr_errors)
-    combined_mse = (prev_mse + curr_mse) / 2.0
-
-    prev_rmse = np.sqrt(prev_mse)
-    curr_rmse = np.sqrt(curr_mse)
+    eval_mse = np.mean(errors)
+    eval_rmse = np.sqrt(eval_mse)
 
     g_model.train()  # Restore training mode
 
     return {
-        "prev_return_mse": prev_mse,
-        "curr_return_mse": curr_mse,
-        "combined_mse": combined_mse,
-        "prev_return_rmse": prev_rmse,
-        "curr_return_rmse": curr_rmse,
+        "return_mse": eval_mse,
+        "return_rmse": eval_rmse,
     }
 
 
@@ -1116,9 +1122,7 @@ def train_stage1_return_model(
     criterion = nn.MSELoss()
 
     # Training loop
-    train_prev_losses = []
-    train_curr_losses = []
-    train_combined_losses = []
+    train_losses = []
 
     for epoch in range(num_epochs):
         train_dataloader = data.DataLoader(
@@ -1128,52 +1132,32 @@ def train_stage1_return_model(
             collate_fn=collate_variable_length_windows,
         )
 
-        epoch_prev_losses = []
-        epoch_curr_losses = []
+        epoch_losses = []
 
         for inputs, labels in train_dataloader:
-            # Forward pass on BOTH windows
-            g_outputs_prev = g_model(
-                inputs["prev_state"],
-                inputs["prev_action"],
-                inputs["prev_term"],
-                mask=inputs["prev_mask"],
-                timestep=inputs["prev_timestep"],
-            )
-
+            # Current window: start_return = prev_return (from labels)
             g_outputs_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                timestep=inputs["curr_timestep"],
+                start_return=labels["prev_return"].unsqueeze(1),
             )
 
             # Stage 1 Loss: Return prediction only
-            g_hat_prev = torch.squeeze(g_outputs_prev)
             g_hat_curr = torch.squeeze(g_outputs_curr)
-
-            loss_prev = criterion(g_hat_prev, labels["prev_return"])
-            loss_curr = criterion(g_hat_curr, labels["curr_return"])
-
-            loss = loss_prev + loss_curr
+            loss = criterion(g_hat_curr, labels["curr_return"])
 
             # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            epoch_prev_losses.append(loss_prev.item())
-            epoch_curr_losses.append(loss_curr.item())
+            epoch_losses.append(loss.item())
 
         # Logging
-        avg_prev_loss = np.mean(epoch_prev_losses)
-        avg_curr_loss = np.mean(epoch_curr_losses)
-        avg_combined = avg_prev_loss + avg_curr_loss
-
-        train_prev_losses.append(avg_prev_loss)
-        train_curr_losses.append(avg_curr_loss)
-        train_combined_losses.append(avg_combined)
+        avg_loss = np.mean(epoch_losses)
+        train_losses.append(avg_loss)
 
         # Evaluate on test set every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -1182,9 +1166,8 @@ def train_stage1_return_model(
             )
             print(
                 f"[Stage 1] Epoch [{epoch + 1}/{num_epochs}] | "
-                f"Train Loss: {avg_combined:.4f} "
-                f"(Prev: {avg_prev_loss:.4f}, Curr: {avg_curr_loss:.4f}) | "
-                f"Test RMSE: {test_metrics['prev_return_rmse']:.4f} / {test_metrics['curr_return_rmse']:.4f}"
+                f"Train Loss: {avg_loss:.4f} "
+                f"Test RMSE: {test_metrics['return_rmse']:.4f}"
             )
 
     # Final evaluation on full test set
@@ -1196,14 +1179,9 @@ def train_stage1_return_model(
         g_model, test_ds, batch_size, criterion
     )
 
-    print("Previous Window Return Prediction:")
-    print(f"  MSE:  {final_metrics['prev_return_mse']:.6f}")
-    print(f"  RMSE: {final_metrics['prev_return_rmse']:.6f}")
-    print("\nCurrent Window Return Prediction:")
-    print(f"  MSE:  {final_metrics['curr_return_mse']:.6f}")
-    print(f"  RMSE: {final_metrics['curr_return_rmse']:.6f}")
-    print("\nCombined:")
-    print(f"  MSE:  {final_metrics['combined_mse']:.6f}")
+    print("Window Return Prediction:")
+    print(f"  MSE:  {final_metrics['return_mse']:.6f}")
+    print(f"  RMSE: {final_metrics['return_rmse']:.6f}")
 
     # Save Stage 1 models
     output_path = pathlib.Path(output_dir) / "stage1"
@@ -1214,9 +1192,7 @@ def train_stage1_return_model(
         {
             "return_model_state_dict": g_model.state_dict(),
             "shared_embedding_state_dict": shared_embedding.state_dict(),
-            "train_prev_losses": train_prev_losses,
-            "train_curr_losses": train_curr_losses,
-            "train_combined_losses": train_combined_losses,
+            "train_losses": train_losses,
             "final_metrics": final_metrics,
         },
         model_file,
@@ -1355,20 +1331,22 @@ def train_stage2_reward_model(
 
             # GNetwork forward passes (frozen - no gradients)
             with torch.no_grad():
+                # Previous window: start_return defaults to 0 (None)
                 g_outputs_prev = g_model_frozen(
                     inputs["prev_state"],
                     inputs["prev_action"],
-                    inputs["prev_term"],
+                     ["prev_term"],
                     mask=inputs["prev_mask"],
-                    timestep=inputs["prev_timestep"],
+                    start_return=None,
                 )
 
+                # Current window: start_return = prev_return (from labels)
                 g_outputs_curr = g_model_frozen(
                     inputs["curr_state"],
                     inputs["curr_action"],
                     inputs["curr_term"],
                     mask=inputs["curr_mask"],
-                    timestep=inputs["curr_timestep"],
+                    start_return=labels["prev_return"].unsqueeze(1),
                 )
 
             # Stage 2 Loss: Reward decomposition with frozen return guidance
@@ -1593,7 +1571,7 @@ def train(
     stage2_path = (
         pathlib.Path(output_dir) / "stage2" / f"rnetwork_{reward_model_type}_stage2.pt"
     )
-    checkpoint = torch.load(stage2_path)
+    checkpoint = torch.load(stage2_path, weights_only=False)
     final_metrics = checkpoint["final_metrics"]
 
     return final_metrics, []  # Empty predictions list
