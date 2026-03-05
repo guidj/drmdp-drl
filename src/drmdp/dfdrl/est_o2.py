@@ -958,17 +958,17 @@ def evaluate_dual_model(
             g_hat_prev = pred_prev_return
             g_hat_curr = pred_curr_return  # Independent prediction, not compositional
 
-            R_obs_curr = labels["curr_aggregate_reward"]
-            G_actual_prev = labels["prev_end_return"]
-            G_actual_curr = labels["curr_end_return"]
-            R_hat_curr = pred_curr_reward
+            r_obs_curr = labels["curr_aggregate_reward"]
+            g_actual_prev = labels["prev_end_return"]
+            g_actual_curr = labels["curr_end_return"]
+            r_hat_curr = pred_curr_reward
 
             # ρ₁: [(Ĝ_curr - R_obs) - Ĝ_prev]²
-            rho_1_val = torch.mean((g_hat_curr - R_obs_curr - g_hat_prev) ** 2)
+            rho_1_val = torch.mean((g_hat_curr - r_obs_curr - g_hat_prev) ** 2)
             rho1_errors.append(rho_1_val)
 
             # ρ₂: [(G_curr - R̂_obs) - G_prev]²
-            rho_2_val = torch.mean((G_actual_curr - R_hat_curr - G_actual_prev) ** 2)
+            rho_2_val = torch.mean((g_actual_curr - r_hat_curr - g_actual_prev) ** 2)
             rho2_errors.append(rho_2_val)
 
             # Optionally collect predictions for analysis
@@ -1379,19 +1379,19 @@ def train_stage2_reward_model(
             g_hat_prev = torch.squeeze(g_outputs_prev)
             g_hat_curr = torch.squeeze(g_outputs_curr)
 
-            R_obs_curr = labels["curr_aggregate_reward"]
-            G_actual_prev = labels["prev_end_return"]
-            G_actual_curr = labels["curr_end_return"]
+            r_obs_curr = labels["curr_aggregate_reward"]
+            g_actual_prev = labels["prev_end_return"]
+            g_actual_curr = labels["curr_end_return"]
 
             # Main loss: Predicted rewards should sum to observed aggregate
-            R_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
-            loss_main = criterion(R_hat_curr, R_obs_curr)
+            r_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
+            loss_main = criterion(r_hat_curr, r_obs_curr)
 
             # ρ₁: Predicted return difference should match observed aggregate
-            rho_1 = torch.mean((g_hat_curr - R_obs_curr - g_hat_prev) ** 2)
+            rho_1 = torch.mean((g_hat_curr - r_obs_curr - g_hat_prev) ** 2)
 
             # ρ₂: Actual return difference should match predicted aggregate
-            rho_2 = torch.mean((G_actual_curr - R_hat_curr - G_actual_prev) ** 2)
+            rho_2 = torch.mean((g_actual_curr - r_hat_curr - g_actual_prev) ** 2)
 
             # Combined loss
             loss = loss_main + lam * rho_1 + xi * rho_2
