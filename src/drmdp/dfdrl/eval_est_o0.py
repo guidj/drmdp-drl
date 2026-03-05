@@ -81,7 +81,7 @@ def load_model(
     if not model_path_obj.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    checkpoint = torch.load(model_path_obj, map_location=device)
+    checkpoint = torch.load(model_path_obj, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()

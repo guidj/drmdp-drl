@@ -175,13 +175,13 @@ def load_dual_models(
             raise FileNotFoundError(
                 f"Two-stage checkpoint not found: {dual_model_file}"
             )
-        checkpoint = torch.load(dual_model_file, map_location=device)
+        checkpoint = torch.load(dual_model_file, map_location=device, weights_only=False)
         print(f"Loaded two-stage checkpoint from: {dual_model_file}")
     else:
         # Legacy single-file checkpoint
         if not model_path_obj.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
-        checkpoint = torch.load(model_path_obj, map_location=device)
+        checkpoint = torch.load(model_path_obj, map_location=device, weights_only=False)
         print(f"Loaded legacy checkpoint from: {model_path_obj}")
 
     r_model.load_state_dict(checkpoint["reward_model_state_dict"])
