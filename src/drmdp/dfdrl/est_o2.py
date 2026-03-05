@@ -961,14 +961,14 @@ def evaluate_dual_model(
             r_obs_curr = labels["curr_aggregate_reward"]
             g_actual_prev = labels["prev_end_return"]
             g_actual_curr = labels["curr_end_return"]
-            r_hat_curr = pred_curr_reward
+            ro_hat_curr = pred_curr_reward
 
             # ρ₁: [(Ĝ_curr - R_obs) - Ĝ_prev]²
             rho_1_val = torch.mean((g_hat_curr - r_obs_curr - g_hat_prev) ** 2)
             rho1_errors.append(rho_1_val)
 
             # ρ₂: [(G_curr - R̂_obs) - G_prev]²
-            rho_2_val = torch.mean((g_actual_curr - r_hat_curr - g_actual_prev) ** 2)
+            rho_2_val = torch.mean((g_actual_curr - ro_hat_curr - g_actual_prev) ** 2)
             rho2_errors.append(rho_2_val)
 
             # Optionally collect predictions for analysis
@@ -1326,7 +1326,9 @@ def train_stage2_reward_model(
     )
 
     optimizer = optim.Adam(r_model_params, lr=learning_rate)
-    criterion = nn.MSELoss()
+    main_criterion = nn.MSELoss()
+    rho1_criterion = nn.MSELoss()
+    rho2_criterion = nn.MSELoss()
 
     # Training loop
     train_main_losses = []
@@ -1362,7 +1364,7 @@ def train_stage2_reward_model(
                     inputs["prev_action"],
                     inputs["prev_term"],
                     mask=inputs["prev_mask"],
-                    start_return=None,
+                    start_return=labels["prev_start_return"].unsqueeze(1),
                 )
 
                 # Current window: start_return = prev_end_return (from labels)
@@ -1371,7 +1373,7 @@ def train_stage2_reward_model(
                     inputs["curr_action"],
                     inputs["curr_term"],
                     mask=inputs["curr_mask"],
-                    start_return=labels["prev_end_return"].unsqueeze(1),
+                    start_return=labels["curr_start_return"].unsqueeze(1),
                 )
 
             # Stage 2 Loss: Reward decomposition with frozen return guidance
@@ -1384,14 +1386,14 @@ def train_stage2_reward_model(
             g_actual_curr = labels["curr_end_return"]
 
             # Main loss: Predicted rewards should sum to observed aggregate
-            r_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
-            loss_main = criterion(r_hat_curr, r_obs_curr)
+            ro_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
+            loss_main = main_criterion(ro_hat_curr, r_obs_curr)
 
             # ρ₁: Predicted return difference should match observed aggregate
-            rho_1 = torch.mean((g_hat_curr - r_obs_curr - g_hat_prev) ** 2)
+            rho_1 = rho1_criterion(g_hat_curr - r_obs_curr, g_hat_prev)
 
             # ρ₂: Actual return difference should match predicted aggregate
-            rho_2 = torch.mean((g_actual_curr - r_hat_curr - g_actual_prev) ** 2)
+            rho_2 = rho2_criterion(g_actual_curr - ro_hat_curr, g_actual_prev)
 
             # Combined loss
             loss = loss_main + lam * rho_1 + xi * rho_2
