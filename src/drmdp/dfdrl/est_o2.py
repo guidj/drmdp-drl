@@ -516,18 +516,18 @@ class GNetwork(nn.Module):
             hidden, src_key_padding_mask=src_key_padding_mask
         )
 
-        # Masked mean pooling across sequence dimension
+        # Sum embeddings across all steps
         # Shape: (batch_size, hidden_dim)
         if mask is not None:
             # Expand mask to match hidden dimension
             # mask: (batch_size, seq_len) -> (batch_size, seq_len, 1)
             mask_expanded = mask.unsqueeze(-1).float()
-            # Zero out padding positions
+            # Zero out padding positions and sum
             masked_output = output * mask_expanded
-            # Sum and divide by actual sequence length
-            pooled = masked_output.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            pooled = masked_output.sum(dim=1)
         else:
-            pooled = torch.mean(output, dim=1)
+            # Sum across sequence dimension
+            pooled = output.sum(dim=1)
 
         # Predict DELTA (change in return), not absolute return
         # Shape: (batch_size, 1)
@@ -1063,7 +1063,7 @@ def evaluate_stage1_return_model(
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["prev_end_return"].unsqueeze(1),
+                start_return=labels["curr_start_return"].unsqueeze(1),
             )
             g_hat_curr = torch.squeeze(g_outputs_curr)
             curr_mse = criterion(g_hat_curr, labels["curr_end_return"])
@@ -1165,7 +1165,7 @@ def train_stage1_return_model(
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["prev_end_return"].unsqueeze(1),
+                start_return=labels["curr_start_return"].unsqueeze(1),
             )
 
             # Stage 1 Loss: Return prediction only
