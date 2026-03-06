@@ -41,6 +41,7 @@ initialization, ensuring predictions depend only on the current context.
 import argparse
 import json
 import pathlib
+import time
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
@@ -50,6 +51,17 @@ from torch import nn, optim
 from torch.utils import data
 
 from drmdp import dataproc, rewdelay
+
+# Spec version identifier
+SPEC = "o1"
+
+
+def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
+    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
+    timestamp = int(time.time())
+    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
+    output_path.mkdir(parents=True, exist_ok=True)
+    return output_path
 
 
 class RNetwork(nn.Module):
@@ -583,8 +595,7 @@ def train(
     print(f"Final Test RMSE: {final_rmse:.8f}")
 
     # Save results
-    output_path = pathlib.Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    output_path = create_timestamped_output_dir(output_dir)
 
     # Save predictions
     predictions_file = output_path / f"predictions_{model_type}.json"
@@ -630,6 +641,30 @@ def train(
     model_file = output_path / f"model_{model_type}.pt"
     torch.save(model.state_dict(), model_file)
     print(f"Model saved to {model_file}")
+
+    # Save config
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    config_file = output_path / "config.json"
+    with open(config_file, "w", encoding="UTF-8") as writable:
+        json.dump(
+            {
+                "spec": SPEC,
+                "model_type": model_type,
+                "env_name": env.spec.id
+                if hasattr(env, "spec") and env.spec
+                else "unknown",
+                "state_dim": obs_dim,
+                "action_dim": act_dim,
+                "batch_size": batch_size,
+                "eval_steps": eval_steps,
+                "hidden_dim": 256,
+                "timestamp": int(output_path.name),
+            },
+            writable,
+            indent=2,
+        )
+    print(f"Config saved to {config_file}")
 
     return final_mse, predictions_list
 

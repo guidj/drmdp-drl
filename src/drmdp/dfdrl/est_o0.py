@@ -19,6 +19,7 @@ Usage Example:
 import argparse
 import json
 import pathlib
+import time
 from typing import Any, List, Optional, Tuple
 
 import gymnasium as gym
@@ -29,6 +30,17 @@ from torch.utils import data
 
 from drmdp import dataproc
 
+# Spec version identifier
+SPEC = "o0"
+
+
+def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
+    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
+    timestamp = int(time.time())
+    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
+    output_path.mkdir(parents=True, exist_ok=True)
+    return output_path
+
 
 class RNetwork(nn.Module):
     """
@@ -36,12 +48,20 @@ class RNetwork(nn.Module):
     Maps (state, action, term) -> reward.
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(
+        self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
+    ):
         super().__init__()
         # +1 for term flag
-        self.fc1 = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.layers = []
+        self.powers = torch.tensor(range(powers)) + 1
+        self.num_hidden_layers = num_hidden_layers
+        input_dim = (state_dim + action_dim + 1) * powers
+        output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
+        for _ in range(self.num_hidden_layers):
+            self.layers.append(nn.Linear(input_dim, output_dim))
+            input_dim = output_dim
+        self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
         """
@@ -53,11 +73,12 @@ class RNetwork(nn.Module):
         Returns:
             reward: Tensor of shape (batch_size, 1)
         """
-        features = torch.concat([state, action, term], dim=-1)
-        features = nn.functional.relu(self.fc1(features))
-        features = nn.functional.relu(self.fc2(features))
-        reward = self.fc3(features)
-        return reward
+        out = torch.concat([state, action, term], dim=-1)
+        out = torch.pow(torch.unsqueeze(out, -1), self.powers)
+        out = torch.flatten(out, start_dim=1)
+        for layer in self.layers:
+            out = layer(out)
+        return self.final_layer(out)
 
 
 class DictDataset(data.Dataset):
@@ -225,7 +246,7 @@ def train(
     model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
     print("Training immediate reward prediction model (MLP)")
 
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
 
     # Training Loop
@@ -279,8 +300,7 @@ def train(
     print(f"Final Test RMSE: {final_rmse:.8f}")
 
     # Save results
-    output_path = pathlib.Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    output_path = create_timestamped_output_dir(output_dir)
 
     # Save predictions
     predictions_file = output_path / "predictions_o0.json"
@@ -325,6 +345,30 @@ def train(
     model_file = output_path / "model_o0.pt"
     torch.save(model.state_dict(), model_file)
     print(f"Model saved to {model_file}")
+
+    # Save config
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    config_file = output_path / "config.json"
+    with open(config_file, "w", encoding="UTF-8") as writable:
+        json.dump(
+            {
+                "spec": SPEC,
+                "model_type": "mlp",
+                "env_name": env.spec.id
+                if hasattr(env, "spec") and env.spec
+                else "unknown",
+                "state_dim": obs_dim,
+                "action_dim": act_dim,
+                "batch_size": batch_size,
+                "eval_steps": eval_steps,
+                "hidden_dim": 256,
+                "timestamp": int(output_path.name),
+            },
+            writable,
+            indent=2,
+        )
+    print(f"Config saved to {config_file}")
 
     return final_mse, predictions_list
 

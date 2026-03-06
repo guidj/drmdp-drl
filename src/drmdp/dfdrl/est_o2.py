@@ -31,8 +31,8 @@ Usage Example:
 """
 
 import argparse
-import json
 import pathlib
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
@@ -43,71 +43,43 @@ from torch.utils import data
 
 from drmdp import dataproc, rewdelay
 
+# Spec version identifier
+SPEC = "o2"
 
-class SharedStateActionEmbedding(nn.Module):
-    """
-    Shared embedding module for (state, action, term) tuples.
-    Used by both reward and return prediction networks.
 
-    Applies LayerNorm to state and action inputs to handle different scales
-    (e.g., position vs velocity in MountainCar, or different sensor ranges).
-    """
+def concatenate_state_action_term(
+    state: torch.Tensor,
+    action: torch.Tensor,
+    term: torch.Tensor,
+) -> torch.Tensor:
+    """Concatenate state, action, and term flag along the last dimension."""
+    return torch.concat([state, action, term], dim=-1)
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256, normalize=True):
-        super().__init__()
-        self.normalize = normalize
-        self.state_dim = state_dim
-        self.action_dim = action_dim
 
-        # Normalization layers for state and action (not term, which is binary)
-        if normalize:
-            self.state_norm = nn.LayerNorm(state_dim)
-            self.action_norm = nn.LayerNorm(action_dim)
-
-        # +1 for term flag
-        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-
-    def forward(self, state, action, term):
-        """
-        Args:
-            state: Tensor of shape (..., state_dim)
-            action: Tensor of shape (..., action_dim)
-            term: Tensor of shape (..., 1)
-
-        Returns:
-            embeddings: Tensor of shape (..., hidden_dim)
-        """
-        # Apply normalization to state and action
-        if self.normalize:
-            state = self.state_norm(state)
-            action = self.action_norm(action)
-
-        # Concatenate and project
-        features = torch.concat([state, action, term], dim=-1)
-        return nn.functional.relu(self.input_proj(features))
+def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
+    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
+    timestamp = int(time.time())
+    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
+    output_path.mkdir(parents=True, exist_ok=True)
+    return output_path
 
 
 class RNetwork(nn.Module):
     """
     Feedforward MLP for reward prediction.
     Processes (state, action, term) tuples independently.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256, shared_embedding=None):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
 
     def forward(self, state, action, term):
-        features = self.embedding(state, action, term)
+        concatenated = concatenate_state_action_term(state, action, term)
+        features = self.input_proj(concatenated)
         features = nn.functional.relu(self.fc2(features))
         reward = self.fc3(features)
         return reward
@@ -117,7 +89,7 @@ class RNetworkRNN(nn.Module):
     """
     RNN-based reward prediction network.
     Processes sequential (state, action, term) tuples and outputs one reward value per step.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
 
     Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
     Output shape: (batch_size, sequence_length, 1)
@@ -131,7 +103,6 @@ class RNetworkRNN(nn.Module):
         num_layers=2,
         rnn_type="lstm",
         dropout=0.1,
-        shared_embedding=None,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -140,13 +111,7 @@ class RNetworkRNN(nn.Module):
         self.num_layers = num_layers
         self.rnn_type = rnn_type.lower()
 
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # RNN layer
         if self.rnn_type == "lstm":
@@ -195,9 +160,12 @@ class RNetworkRNN(nn.Module):
         action_with_stub = torch.cat([zero_action, action], dim=1)
         term_with_stub = torch.cat([zero_term, term], dim=1)
 
-        # Apply shared embedding to get hidden representation
+        # Apply independent embedding to get hidden representation
         # Shape: (batch_size, sequence_length+1, hidden_dim)
-        hidden = self.embedding(state_with_stub, action_with_stub, term_with_stub)
+        concatenated = concatenate_state_action_term(
+            state_with_stub, action_with_stub, term_with_stub
+        )
+        hidden = self.input_proj(concatenated)
 
         # Process through RNN
         # rnn_out shape: (batch_size, sequence_length+1, hidden_dim)
@@ -215,7 +183,7 @@ class RNetworkTransformer(nn.Module):
     """
     Transformer Decoder-based reward prediction network.
     Processes sequential (state, action, term) tuples and outputs one reward value per step.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
 
     Uses causal masking to ensure predictions at timestep t only depend on steps <= t.
 
@@ -232,20 +200,13 @@ class RNetworkTransformer(nn.Module):
         num_layers=4,
         feedforward_dim=1024,
         dropout=0.1,
-        shared_embedding=None,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # Positional encoding
         self.pos_encoding = nn.Parameter(
@@ -321,9 +282,12 @@ class RNetworkTransformer(nn.Module):
 
         seq_len = state_with_stub.shape[1]
 
-        # Apply shared embedding to get hidden representation
+        # Apply independent embedding to get hidden representation
         # Shape: (batch_size, sequence_length+1, hidden_dim)
-        hidden = self.embedding(state_with_stub, action_with_stub, term_with_stub)
+        concatenated = concatenate_state_action_term(
+            state_with_stub, action_with_stub, term_with_stub
+        )
+        hidden = self.input_proj(concatenated)
 
         # Add positional encoding
         hidden = hidden + self.pos_encoding[:, :seq_len, :]
@@ -354,13 +318,22 @@ class RNetworkTransformer(nn.Module):
 
 class GNetwork(nn.Module):
     """
-    Transformer Encoder-based return prediction network.
+    Transformer Encoder-based return prediction network with delta prediction.
     Processes entire previous window sequence and outputs single return value.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
+
+    Architecture: Predicts DELTA (change in return) and adds to start_return via
+    residual connection. This enforces delta prediction structure and simplifies
+    the learning task.
 
     Unlike RNetworkTransformer, this uses an Encoder (not Decoder) and does not
     require causal masking since it needs to attend to the entire sequence.
-    It outputs a single scalar value representing the aggregate return for the window.
+
+    Key features:
+    - Non-linear start_return encoder for expressive conditioning
+    - LayerNorm applied BEFORE adding start_return (preserves magnitude)
+    - Delta prediction: internally predicts change in return
+    - Residual connection: output = start_return + delta
 
     Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
     Output shape: (batch_size, 1)
@@ -375,7 +348,6 @@ class GNetwork(nn.Module):
         num_layers=4,
         feedforward_dim=1024,
         dropout=0.1,
-        shared_embedding=None,
         max_episode_steps=1000,
     ):
         super().__init__()
@@ -384,21 +356,23 @@ class GNetwork(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_episode_steps = max_episode_steps
 
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # Positional encoding
         self.pos_encoding = nn.Parameter(
             torch.zeros(1, 1000, hidden_dim)
         )  # Max sequence length 1000
 
-        # Timestep embedding: scalar timestep -> hidden_dim
-        self.timestep_proj = nn.Linear(1, hidden_dim)
+        # Start return encoder: non-linear projection for better conditioning
+        # Using MLP instead of single linear layer for more expressive conditioning
+        self.start_return_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Layer normalization (applied before adding start_return)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
 
         # Transformer encoder layers (no causal masking needed)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -412,11 +386,9 @@ class GNetwork(nn.Module):
             encoder_layer, num_layers=num_layers
         )
 
-        # Output projection: hidden_dim -> 1 (single return value)
-        self.output_proj = nn.Linear(hidden_dim, 1)
-
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        # Delta projection: predicts change in return (not absolute)
+        # Output will be: start_return + delta (residual connection)
+        self.delta_proj = nn.Linear(hidden_dim, 1)
 
         # Initialize positional encoding with sinusoidal pattern
         self._init_positional_encoding()
@@ -435,7 +407,7 @@ class GNetwork(nn.Module):
         pe[0, :, 1::2] = torch.cos(position * div_term)
         self.pos_encoding.data.copy_(pe)
 
-    def forward(self, state, action, term, mask=None, timestep=None):
+    def forward(self, state, action, term, mask=None, start_return=None):
         """
         Args:
             state: Tensor of shape (batch_size, sequence_length, state_dim)
@@ -443,32 +415,39 @@ class GNetwork(nn.Module):
             term: Tensor of shape (batch_size, sequence_length, 1)
             mask: Optional bool tensor of shape (batch_size, sequence_length)
                   True for valid positions, False for padding
-            timestep: Optional tensor of shape (batch_size, 1) - absolute episode timestep t_{w_i}
+            start_return: Optional tensor of shape (batch_size, 1)
+                         Cumulative return at the START of the window.
+                         If None, defaults to 0.0 (episode start).
 
         Returns:
             returns: Tensor of shape (batch_size, 1)
                 Single return value per sequence
         """
+        batch_size = state.shape[0]
         seq_len = state.shape[1]
 
-        # Apply shared embedding to get hidden representation
+        # Default start_return to zeros if not provided (episode start)
+        if start_return is None:
+            start_return = torch.zeros(batch_size, 1, device=state.device)
+
+        # Apply independent embedding to get hidden representation
         # Shape: (batch_size, sequence_length, hidden_dim)
-        hidden = self.embedding(state, action, term)
+        concatenated = concatenate_state_action_term(state, action, term)
+        hidden = self.input_proj(concatenated)
 
         # Add positional encoding
         hidden = hidden + self.pos_encoding[:, :seq_len, :]
 
-        # Add timestep information if provided
-        if timestep is not None:
-            # Normalize timestep to [0, 1] range
-            norm_timestep = timestep.float() / self.max_episode_steps
-            # Project to hidden dimension and add to sequence representation
-            timestep_emb = self.timestep_proj(norm_timestep)  # (batch, hidden_dim)
-            # Add timestep embedding to all positions in sequence
-            hidden = hidden + timestep_emb.unsqueeze(1)  # Broadcast across sequence
-
-        # Apply layer normalization
+        # Apply layer normalization FIRST (before adding start_return)
+        # This prevents LayerNorm from diluting the start_return signal
         hidden = self.layer_norm(hidden)
+
+        # # Add start_return embedding AFTER normalization (broadcast to all positions)
+        # # Using non-linear encoder for more expressive conditioning
+        # start_return_emb = self.start_return_encoder(
+        #     start_return
+        # )  # (batch, hidden_dim)
+        # hidden = hidden + start_return_emb.unsqueeze(1)  # Broadcast across sequence
 
         # Create attention mask for transformer (inverted: True = mask out)
         # Transformer expects: False = attend, True = ignore
@@ -497,11 +476,17 @@ class GNetwork(nn.Module):
         else:
             pooled = torch.mean(output, dim=1)
 
-        # Project to single return value
+        # Predict DELTA (change in return), not absolute return
         # Shape: (batch_size, 1)
-        return_value = self.output_proj(pooled)
+        delta = self.delta_proj(pooled)
 
-        return return_value
+        # RESIDUAL CONNECTION: output = start_return + predicted_delta
+        # This enforces the delta prediction structure and provides a direct
+        # gradient path from output to start_return
+        # return_value = start_return + delta
+
+        # return return_value
+        return delta
 
 
 class DualWindowDataset(data.Dataset):
@@ -515,11 +500,12 @@ class DualWindowDataset(data.Dataset):
         Args:
             inputs: Dict with keys: prev_state, prev_action, prev_term,
                     curr_state, curr_action, curr_term
-            labels: Dict with keys: prev_return, curr_aggregate_reward, curr_return
+            labels: Dict with keys: prev_start_return, prev_end_return, prev_aggregate_reward,
+                    curr_start_return, curr_end_return, curr_aggregate_reward
         """
         self.inputs = inputs
         self.labels = labels
-        self.length = len(labels["prev_return"])
+        self.length = len(labels["prev_end_return"])
 
     def __len__(self):
         return self.length
@@ -623,8 +609,8 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
     Creates dataset with consecutive window pairs.
 
     For each pair of consecutive windows, creates an example with:
-    - Previous window: state, action, term, cumulative_return_at_last_step
-    - Current window: state, action, term, aggregate_reward, cumulative_return_at_last_step
+    - Previous window: state, action, term, start_return, end_return, aggregate_reward
+    - Current window: state, action, term, start_return, end_return, aggregate_reward
 
     Cumulative return = sum of all rewards from beginning up to that step.
 
@@ -637,7 +623,8 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
     Returns:
         List of (inputs_dict, labels_dict) tuples where:
         - inputs_dict: prev_state, prev_action, prev_term, curr_state, curr_action, curr_term
-        - labels_dict: prev_return, curr_aggregate_reward, curr_return
+        - labels_dict: prev_start_return, prev_end_return, prev_aggregate_reward,
+                       curr_start_return, curr_end_return, curr_aggregate_reward
     """
 
     def create_traj_step(state, action, reward, term):
@@ -717,7 +704,17 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
         if steps == reward_delay and not episode_boundary_in_window:
             curr_window_inputs, curr_aggregate_reward = create_window(curr_steps)
             curr_window_last_idx = idx - 1
+            curr_window_first_idx = idx - steps
             curr_window_timestep = episode_timesteps[curr_window_last_idx]
+
+            # Compute current window start and end returns
+            if curr_window_first_idx == 0:
+                curr_start_return = 0.0  # Episode start
+            elif curr_window_first_idx > 0 and term[curr_window_first_idx - 1]:
+                curr_start_return = 0.0  # New episode start (after terminal state)
+            else:
+                curr_start_return = cumulative_returns[curr_window_first_idx - 1]
+            curr_end_return = cumulative_returns[curr_window_last_idx]
 
             # For first window, create zero-filled previous window
             if prev_window is None:
@@ -727,11 +724,15 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
                     "action": torch.zeros(1, action.shape[1]),
                     "term": torch.zeros(1, 1),
                 }
-                zero_prev_return = torch.tensor(0.0, dtype=torch.float32)
-                prev_window = (zero_prev_inputs, zero_prev_return)
+                prev_window = (zero_prev_inputs, 0.0, 0.0, 0.0)
                 prev_window_timestep = 0
 
-            prev_window_inputs, prev_return = prev_window
+            (
+                prev_window_inputs,
+                prev_start_return,
+                prev_end_return,
+                prev_aggregate_reward,
+            ) = prev_window
 
             # Create dual-window example
             example_inputs = {
@@ -748,15 +749,19 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
                     [[curr_window_timestep]], dtype=torch.long
                 ),
             }
-            # Get cumulative return at the LAST step of current window
-            curr_window_return = torch.tensor(
-                cumulative_returns[curr_window_last_idx], dtype=torch.float32
-            )
-
             example_labels = {
-                "prev_return": prev_return,
+                "prev_start_return": torch.tensor(
+                    prev_start_return, dtype=torch.float32
+                ),
+                "prev_end_return": torch.tensor(prev_end_return, dtype=torch.float32),
+                "prev_aggregate_reward": torch.tensor(
+                    prev_aggregate_reward, dtype=torch.float32
+                ),
+                "curr_start_return": torch.tensor(
+                    curr_start_return, dtype=torch.float32
+                ),
+                "curr_end_return": torch.tensor(curr_end_return, dtype=torch.float32),
                 "curr_aggregate_reward": curr_aggregate_reward,
-                "curr_return": curr_window_return,
             }
 
             examples.append((example_inputs, example_labels))
@@ -770,7 +775,12 @@ def delayed_reward_data_consecutive_windows(buffer, delay: rewdelay.RewardDelay)
                 prev_window_timestep = 0
             else:
                 # Normal case: consecutive windows within same episode
-                prev_window = (curr_window_inputs, curr_window_return)
+                prev_window = (
+                    curr_window_inputs,
+                    curr_start_return,
+                    curr_end_return,
+                    curr_aggregate_reward.item(),
+                )
                 prev_window_timestep = curr_window_timestep
         elif episode_boundary_in_window:
             # Reset previous window after episode boundary
@@ -866,26 +876,28 @@ def evaluate_dual_model(
 
             # ===== Return model evaluation =====
             # Forward pass on entire previous window sequence
+            # Previous window: start_return defaults to 0 (None)
             return_predictions_prev = g_model(
                 inputs["prev_state"],
                 inputs["prev_action"],
                 inputs["prev_term"],
                 mask=inputs["prev_mask"],
-                timestep=inputs["prev_timestep"],
+                start_return=labels["prev_start_return"].unsqueeze(1),
             )  # Shape: (batch_size, 1)
 
             # Forward pass on current window (independent prediction)
+            # Current window: start_return = prev_end_return (from labels)
             return_predictions_curr = g_model(
                 inputs["curr_state"],
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                timestep=inputs["curr_timestep"],
+                start_return=labels["curr_start_return"].unsqueeze(1),
             )  # Shape: (batch_size, 1)
 
             pred_prev_return = torch.squeeze(return_predictions_prev)
             pred_curr_return = torch.squeeze(return_predictions_curr)
-            return_mse = eval_criterion(pred_prev_return, labels["prev_return"])
+            return_mse = eval_criterion(pred_prev_return, labels["prev_end_return"])
             return_errors.append(return_mse)
 
             # ===== Compute regularizer terms =====
@@ -893,17 +905,17 @@ def evaluate_dual_model(
             g_hat_prev = pred_prev_return
             g_hat_curr = pred_curr_return  # Independent prediction, not compositional
 
-            R_obs_curr = labels["curr_aggregate_reward"]
-            G_actual_prev = labels["prev_return"]
-            G_actual_curr = labels["curr_return"]
-            R_hat_curr = pred_curr_reward
+            r_obs_curr = labels["curr_aggregate_reward"]
+            g_actual_prev = labels["prev_end_return"]
+            g_actual_curr = labels["curr_end_return"]
+            ro_hat_curr = pred_curr_reward
 
             # ρ₁: [(Ĝ_curr - R_obs) - Ĝ_prev]²
-            rho_1_val = torch.mean((g_hat_curr - R_obs_curr - g_hat_prev) ** 2)
+            rho_1_val = torch.mean((g_hat_curr - r_obs_curr - g_hat_prev) ** 2)
             rho1_errors.append(rho_1_val)
 
             # ρ₂: [(G_curr - R̂_obs) - G_prev]²
-            rho_2_val = torch.mean((G_actual_curr - R_hat_curr - G_actual_prev) ** 2)
+            rho_2_val = torch.mean((g_actual_curr - ro_hat_curr - g_actual_prev) ** 2)
             rho2_errors.append(rho_2_val)
 
             # Optionally collect predictions for analysis
@@ -915,7 +927,7 @@ def evaluate_dual_model(
                                 "state": inputs["prev_state"][idx].cpu().numpy(),
                                 "action": inputs["prev_action"][idx].cpu().numpy(),
                                 "term": inputs["prev_term"][idx].cpu().numpy(),
-                                "actual_return": labels["prev_return"][idx].item(),
+                                "actual_return": labels["prev_end_return"][idx].item(),
                                 "predicted_return": pred_prev_return[idx].item(),
                             },
                             "curr_window": {
@@ -958,32 +970,503 @@ def evaluate_dual_model(
     return metrics, predictions_list
 
 
+def evaluate_stage1_return_model(
+    g_model: nn.Module,
+    test_ds: data.Dataset,
+    batch_size: int,
+    criterion: nn.Module,
+) -> Dict[str, float]:
+    """
+    Evaluate GNetwork on return prediction task.
+
+    Computes metrics:
+    - return_mse: MSE on current window return prediction
+    - return_rmse: RMSE on previous window
+
+    Args:
+        g_model: GNetwork to evaluate
+        test_ds: Test dataset
+        batch_size: Batch size for evaluation
+        criterion: Loss criterion (MSELoss)
+
+    Returns:
+        Dictionary of metrics
+    """
+    g_model.eval()
+
+    test_dataloader = data.DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_variable_length_windows,
+    )
+
+    errors = []
+    with torch.no_grad():
+        for inputs, labels in test_dataloader:
+            # Evaluate on current window
+            # Current window: start_return = prev_end_return (from labels)
+            g_outputs_curr = g_model(
+                inputs["curr_state"],
+                inputs["curr_action"],
+                inputs["curr_term"],
+                mask=inputs["curr_mask"],
+                # start_return=labels["curr_start_return"].unsqueeze(1),
+            )
+            g_hat_curr = torch.squeeze(g_outputs_curr)
+            curr_mse = criterion(g_hat_curr, labels["curr_aggregate_reward"])
+            errors.append(curr_mse.item())
+
+    # Compute final metrics
+    eval_mse = np.mean(errors)
+    eval_rmse = np.sqrt(eval_mse)
+
+    g_model.train()  # Restore training mode
+
+    return {
+        "return_mse": eval_mse,
+        "return_rmse": eval_rmse,
+    }
+
+
+def train_stage1_return_model(
+    env: gym.Env,
+    dataset: data.Dataset,
+    batch_size: int = 64,
+    num_epochs: int = 100,
+    learning_rate: float = 0.01,
+    hidden_dim: int = 64,
+    eval_steps: int = 20,
+    output_dir: str = "outputs",
+) -> nn.Module:
+    """
+    Stage 1: Pre-train GNetwork (return model).
+
+    Trains on return prediction task:
+    - Loss = MSE(Ĝ_prev, G_prev) + MSE(Ĝ_curr, G_curr)
+
+    Args:
+        env: Gymnasium environment
+        dataset: DualWindowDataset
+        batch_size: Batch size for training
+        num_epochs: Number of training epochs
+        learning_rate: Learning rate for Adam optimizer
+        eval_steps: Number of batches for evaluation
+        output_dir: Directory to save stage 1 models
+
+    Returns:
+        GNetwork - trained model
+    """
+    # Split dataset
+    train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    # Create GNetwork
+    max_episode_steps = (
+        getattr(env.spec, "max_episode_steps", 1000)
+        if hasattr(env, "spec") and env.spec
+        else 1000
+    )
+
+    g_model = GNetwork(
+        state_dim=obs_dim,
+        action_dim=act_dim,
+        hidden_dim=hidden_dim,
+        num_heads=2,
+        num_layers=2,
+        feedforward_dim=512,
+        max_episode_steps=max_episode_steps,
+    )
+
+    print("[Stage 1] Training GNetwork (return model)")
+    print("  Model: Transformer Encoder")
+    print(f"  Parameters: {sum(param.numel() for param in g_model.parameters()):,}")
+
+    # Optimizer for GNetwork
+    optimizer = optim.Adam(g_model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Training loop
+    train_losses = []
+
+    for epoch in range(num_epochs):
+        train_dataloader = data.DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_variable_length_windows,
+        )
+
+        epoch_losses = []
+
+        for inputs, labels in train_dataloader:
+            # Current window: start_return = prev_end_return (from labels)
+            g_outputs_curr = g_model(
+                inputs["curr_state"],
+                inputs["curr_action"],
+                inputs["curr_term"],
+                mask=inputs["curr_mask"],
+                # start_return=labels["curr_start_return"].unsqueeze(1),
+            )
+
+            # Stage 1 Loss: Return prediction only
+            g_hat_curr = torch.squeeze(g_outputs_curr)
+            loss = criterion(g_hat_curr, labels["curr_aggregate_reward"])
+
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_losses.append(loss.item())
+
+        # Logging
+        avg_loss = np.mean(epoch_losses)
+        train_losses.append(avg_loss)
+
+        # Evaluate on test set every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            test_metrics = evaluate_stage1_return_model(
+                g_model, test_ds, batch_size, criterion
+            )
+            print(
+                f"[Stage 1] Epoch [{epoch + 1}/{num_epochs}] | "
+                f"Train Loss: {avg_loss:.4f} "
+                f"Test RMSE: {test_metrics['return_rmse']:.4f}"
+            )
+
+    # Final evaluation on full test set
+    print("\n" + "=" * 80)
+    print("[Stage 1] FINAL EVALUATION")
+    print("=" * 80)
+
+    final_metrics = evaluate_stage1_return_model(
+        g_model, test_ds, batch_size, criterion
+    )
+
+    print("Window Return Prediction:")
+    print(f"  MSE:  {final_metrics['return_mse']:.6f}")
+    print(f"  RMSE: {final_metrics['return_rmse']:.6f}")
+
+    # Save Stage 1 model
+    output_path = pathlib.Path(output_dir) / "stage1"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    model_file = output_path / "gnetwork_stage1.pt"
+    torch.save(
+        {
+            "return_model_state_dict": g_model.state_dict(),
+            "train_losses": train_losses,
+            "final_metrics": final_metrics,
+        },
+        model_file,
+    )
+    print(f"\n[Stage 1] Model saved to {model_file}")
+    print("=" * 80)
+
+    return g_model
+
+
+def train_stage2_reward_model(
+    env: gym.Env,
+    dataset: data.Dataset,
+    g_model_frozen: nn.Module,
+    reward_model_type: str = "rnn",
+    batch_size: int = 64,
+    num_epochs: int = 100,
+    learning_rate: float = 0.01,
+    lam: float = 1.0,
+    xi: float = 1.0,
+    hidden_dim: int = 64,
+    eval_steps: int = 20,
+    output_dir: str = "outputs",
+) -> nn.Module:
+    """
+    Stage 2: Train RNetwork with frozen GNetwork.
+
+    Uses frozen GNetwork predictions to guide reward learning:
+    - Loss = loss_main + λ*ρ₁ + ξ*ρ₂
+
+    Args:
+        env: Gymnasium environment
+        dataset: DualWindowDataset
+        g_model_frozen: Frozen GNetwork from Stage 1
+        reward_model_type: RNetwork architecture ("mlp", "rnn", "transformer")
+        batch_size: Batch size for training
+        num_epochs: Number of training epochs
+        learning_rate: Learning rate for Adam optimizer
+        lam: Weight for ρ₁ regularizer
+        xi: Weight for ρ₂ regularizer
+        eval_steps: Number of batches for evaluation
+        output_dir: Directory to save stage 2 models
+
+    Returns:
+        Trained RNetwork
+    """
+    # Freeze GNetwork
+    g_model_frozen.eval()
+    for param in g_model_frozen.parameters():
+        param.requires_grad = False
+
+    print("[Stage 2] Training RNetwork (reward model)")
+    print("  GNetwork: FROZEN")
+
+    # Split dataset
+    train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    # Create RNetwork
+    r_model: nn.Module
+    if reward_model_type == "mlp":
+        r_model = RNetwork(
+            state_dim=obs_dim,
+            action_dim=act_dim,
+            hidden_dim=hidden_dim,
+        )
+    elif reward_model_type == "rnn":
+        r_model = RNetworkRNN(
+            state_dim=obs_dim,
+            action_dim=act_dim,
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            rnn_type="lstm",
+        )
+    elif reward_model_type == "transformer":
+        r_model = RNetworkTransformer(
+            state_dim=obs_dim,
+            action_dim=act_dim,
+            hidden_dim=hidden_dim,
+            num_heads=2,
+            num_layers=2,
+        )
+    else:
+        raise ValueError(f"Unknown reward_model_type: {reward_model_type}")
+
+    print(f"  Model: {reward_model_type.upper()}")
+
+    # Optimize all RNetwork parameters
+    r_model_params = list(r_model.parameters())
+
+    print(f"  Trainable parameters: {sum(param.numel() for param in r_model_params):,}")
+    print(
+        f"  Frozen parameters: {sum(param.numel() for param in g_model_frozen.parameters()):,}"
+    )
+
+    optimizer = optim.Adam(r_model_params, lr=learning_rate)
+    main_criterion = nn.MSELoss()
+    rho1_criterion = nn.MSELoss()
+    rho2_criterion = nn.MSELoss()
+
+    # Training loop
+    train_main_losses = []
+    train_rho1_losses = []
+    train_rho2_losses = []
+    train_combined_losses = []
+
+    for epoch in range(num_epochs):
+        train_dataloader = data.DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_variable_length_windows,
+        )
+
+        epoch_main_losses = []
+        epoch_rho1_losses = []
+        epoch_rho2_losses = []
+
+        for inputs, labels in train_dataloader:
+            # RNetwork forward pass (training)
+            r_outputs = r_model(
+                inputs["curr_state"],
+                inputs["curr_action"],
+                inputs["curr_term"],
+            )
+
+            # GNetwork forward passes (frozen - no gradients)
+            with torch.no_grad():
+                # Previous window: start_return defaults to 0 (None)
+                g_outputs_prev = g_model_frozen(
+                    inputs["prev_state"],
+                    inputs["prev_action"],
+                    inputs["prev_term"],
+                    mask=inputs["prev_mask"],
+                    start_return=labels["prev_start_return"].unsqueeze(1),
+                )
+
+                # Current window: start_return = prev_end_return (from labels)
+                g_outputs_curr = g_model_frozen(
+                    inputs["curr_state"],
+                    inputs["curr_action"],
+                    inputs["curr_term"],
+                    mask=inputs["curr_mask"],
+                    start_return=labels["curr_start_return"].unsqueeze(1),
+                )
+
+            # Stage 2 Loss: Reward decomposition with frozen return guidance
+            r_hat = r_outputs
+            g_hat_prev = torch.squeeze(g_outputs_prev)
+            g_hat_curr = torch.squeeze(g_outputs_curr)
+
+            r_obs_curr = labels["curr_aggregate_reward"]
+            g_actual_prev = labels["prev_end_return"]
+            g_actual_curr = labels["curr_end_return"]
+
+            # Main loss: Predicted rewards should sum to observed aggregate
+            ro_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))
+            loss_main = main_criterion(ro_hat_curr, r_obs_curr)
+
+            # ρ₁: Predicted return difference should match observed aggregate
+            rho_1 = rho1_criterion(g_hat_curr - r_obs_curr, g_hat_prev)
+
+            # ρ₂: Actual return difference should match predicted aggregate
+            rho_2 = rho2_criterion(g_actual_curr - ro_hat_curr, g_actual_prev)
+
+            # Combined loss
+            loss = loss_main + lam * rho_1 + xi * rho_2
+
+            # Backward and optimize (only RNetwork)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_main_losses.append(loss_main.item())
+            epoch_rho1_losses.append(rho_1.item())
+            epoch_rho2_losses.append(rho_2.item())
+
+        # Logging
+        avg_main_loss = np.mean(epoch_main_losses)
+        avg_rho1_loss = np.mean(epoch_rho1_losses)
+        avg_rho2_loss = np.mean(epoch_rho2_losses)
+        avg_combined = avg_main_loss + lam * avg_rho1_loss + xi * avg_rho2_loss
+
+        train_main_losses.append(avg_main_loss)
+        train_rho1_losses.append(avg_rho1_loss)
+        train_rho2_losses.append(avg_rho2_loss)
+        train_combined_losses.append(avg_combined)
+
+        # Evaluate on test set every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            # Use the existing evaluate_dual_model function from est_o2.py
+            test_metrics, _ = evaluate_dual_model(
+                r_model,
+                g_model_frozen,
+                test_ds,
+                batch_size=batch_size,
+                collect_predictions=False,
+                max_batches=eval_steps,
+                shuffle=False,
+            )
+            print(
+                f"[Stage 2] Epoch [{epoch + 1}/{num_epochs}] | "
+                f"Train Loss: {avg_combined:.4f} "
+                f"(Main: {avg_main_loss:.4f}, ρ₁: {avg_rho1_loss:.4f}, ρ₂: {avg_rho2_loss:.4f}) | "
+                f"Test MSE - Reward: {test_metrics['reward_mse']:.4f}, "
+                f"Return: {test_metrics['return_mse']:.4f}, "
+                f"ρ₁: {test_metrics['rho_1']:.4f}, "
+                f"ρ₂: {test_metrics['rho_2']:.4f}"
+            )
+
+    # Final evaluation on full test set
+    print("\n" + "=" * 80)
+    print("[Stage 2] FINAL EVALUATION")
+    print("=" * 80)
+
+    final_metrics, _ = evaluate_dual_model(
+        r_model,
+        g_model_frozen,
+        test_ds,
+        batch_size=batch_size,
+        collect_predictions=False,
+    )
+
+    print("Reward Prediction (RNetwork):")
+    print(f"  MSE:  {final_metrics['reward_mse']:.6f}")
+    print(f"  RMSE: {np.sqrt(final_metrics['reward_mse']):.6f}")
+    print("\nReturn Prediction (GNetwork - frozen):")
+    print(f"  MSE:  {final_metrics['return_mse']:.6f}")
+    print(f"  RMSE: {np.sqrt(final_metrics['return_mse']):.6f}")
+    print("\nRegularizers:")
+    print(f"  ρ₁: {final_metrics['rho_1']:.6f}")
+    print(f"  ρ₂: {final_metrics['rho_2']:.6f}")
+
+    # Save Stage 2 model
+    output_path = pathlib.Path(output_dir) / "stage2"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    model_file = output_path / f"rnetwork_{reward_model_type}_stage2.pt"
+    torch.save(
+        {
+            "reward_model_state_dict": r_model.state_dict(),
+            "reward_model_type": reward_model_type,
+            "train_main_losses": train_main_losses,
+            "train_rho1_losses": train_rho1_losses,
+            "train_rho2_losses": train_rho2_losses,
+            "train_combined_losses": train_combined_losses,
+            "final_metrics": final_metrics,
+        },
+        model_file,
+    )
+    print(f"\n[Stage 2] Model saved to {model_file}")
+
+    # Save complete dual model (for compatibility with eval_est_o2.py)
+    dual_model_file = output_path / f"model_{reward_model_type}_return.pt"
+    torch.save(
+        {
+            "reward_model_state_dict": r_model.state_dict(),
+            "return_model_state_dict": g_model_frozen.state_dict(),
+            "reward_model_type": reward_model_type,
+            "return_model_type": "transformer",
+        },
+        dual_model_file,
+    )
+    print(f"[Stage 2] Dual model saved to {dual_model_file} (for evaluation)")
+    print("=" * 80)
+
+    return r_model
+
+
 def train(
     env: gym.Env,
     dataset: data.Dataset,
     batch_size: int,
     eval_steps: int,
     reward_model_type: str = "rnn",
+    stage1_epochs: int = 100,
+    stage2_epochs: int = 100,
+    stage1_lr: float = 0.01,
+    stage2_lr: float = 0.01,
     lam: float = 1.0,
     xi: float = 1.0,
+    hidden_dim: int = 256,
     output_dir: str = "outputs",
     seed: Optional[int] = None,
-):
+) -> Tuple[Dict[str, float], List[Any]]:
     """
-    Train dual-window reward and return prediction models with shared embeddings.
+    Two-stage training for O2 model.
 
-    Implements the O2 approach with regularizers ρ₁ and ρ₂ for grounded reward estimation.
+    Stage 1: Pre-train GNetwork (return model) + shared embedding
+    Stage 2: Train RNetwork with frozen GNetwork
 
     Args:
         env: Gymnasium environment
-        dataset: Training dataset (DualWindowDataset)
-        batch_size: Batch size for training
-        eval_steps: Number of evaluation steps
-        reward_model_type: Type of reward model ("mlp", "rnn", or "transformer")
-        lam: Weight for ρ₁ regularizer (grounds predictions on aggregate feedback) (default: 1.0)
-        xi: Weight for ρ₂ regularizer (grounds predictions on actual returns) (default: 1.0)
-        output_dir: Directory to save predictions and results
-        seed: Random seed for reproducibility (default: None)
+        dataset: DualWindowDataset
+        batch_size: Batch size for both stages
+        eval_steps: Evaluation steps
+        reward_model_type: RNetwork architecture
+        stage1_epochs: Epochs for GNetwork training
+        stage2_epochs: Epochs for RNetwork training
+        stage1_lr: Learning rate for Stage 1
+        stage2_lr: Learning rate for Stage 2
+        lam: Weight for ρ₁ regularizer (Stage 2)
+        xi: Weight for ρ₂ regularizer (Stage 2)
+        output_dir: Output directory
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (metrics_dict, predictions_list) - same interface as old train()
     """
     # Set random seeds for reproducibility
     if seed is not None:
@@ -994,297 +1477,59 @@ def train(
         torch.backends.cudnn.benchmark = False
         print(f"Set random seed to {seed} for reproducibility")
 
-    train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+    print("=" * 80)
+    print("O2 TWO-STAGE TRAINING")
+    print("=" * 80)
 
-    # ===== Create shared embedding layer =====
-    shared_embedding = SharedStateActionEmbedding(
-        state_dim=obs_dim, action_dim=act_dim, hidden_dim=256
+    # Stage 1: Train GNetwork
+    print("\n" + "=" * 80)
+    print("STAGE 1: PRE-TRAIN RETURN MODEL (GNetwork)")
+    print("=" * 80)
+    g_model = train_stage1_return_model(
+        env=env,
+        dataset=dataset,
+        batch_size=batch_size,
+        num_epochs=stage1_epochs,
+        learning_rate=stage1_lr,
+        hidden_dim=hidden_dim,
+        eval_steps=eval_steps,
+        output_dir=output_dir,
     )
 
-    # ===== Reward model (user-selectable architecture) =====
-    r_model: nn.Module
-    if reward_model_type == "mlp":
-        r_model = RNetwork(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            shared_embedding=shared_embedding,
-        )
-    elif reward_model_type == "rnn":
-        r_model = RNetworkRNN(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            num_layers=2,
-            rnn_type="lstm",
-            shared_embedding=shared_embedding,
-        )
-    elif reward_model_type == "transformer":
-        r_model = RNetworkTransformer(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            num_heads=2,
-            num_layers=2,
-            shared_embedding=shared_embedding,
-        )
-    else:
-        raise ValueError(
-            f"Unknown reward_model_type: {reward_model_type}. Use 'mlp', 'rnn', or 'transformer'."
-        )
-
-    # ===== Return model (always Transformer) =====
-    # Get max episode steps from environment spec, default to 1000
-    max_episode_steps = (
-        getattr(env.spec, "max_episode_steps", 1000)
-        if hasattr(env, "spec") and env.spec
-        else 1000
+    # Stage 2: Train RNetwork with frozen GNetwork
+    print("\n" + "=" * 80)
+    print("STAGE 2: TRAIN REWARD MODEL (RNetwork) WITH FROZEN GNetwork")
+    print("=" * 80)
+    train_stage2_reward_model(
+        env=env,
+        dataset=dataset,
+        g_model_frozen=g_model,
+        reward_model_type=reward_model_type,
+        batch_size=batch_size,
+        num_epochs=stage2_epochs,
+        learning_rate=stage2_lr,
+        hidden_dim=hidden_dim,
+        lam=lam,
+        xi=xi,
+        eval_steps=eval_steps,
+        output_dir=output_dir,
     )
 
-    g_model: GNetwork = GNetwork(
-        state_dim=obs_dim,
-        action_dim=act_dim,
-        hidden_dim=256,
-        num_heads=2,
-        num_layers=2,
-        shared_embedding=shared_embedding,
-        max_episode_steps=max_episode_steps,
+    print("\n" + "=" * 80)
+    print("TWO-STAGE TRAINING COMPLETE")
+    print("=" * 80)
+    print(f"Stage 1 models: {output_dir}/stage1/")
+    print(f"Stage 2 models: {output_dir}/stage2/")
+
+    # Return final metrics (for compatibility with existing calling code)
+    # Load Stage 2 final metrics from checkpoint
+    stage2_path = (
+        pathlib.Path(output_dir) / "stage2" / f"rnetwork_{reward_model_type}_stage2.pt"
     )
+    checkpoint = torch.load(stage2_path, weights_only=False)
+    final_metrics = checkpoint["final_metrics"]
 
-    print(
-        f"Training with shared embeddings - "
-        f"Reward model: {reward_model_type.upper()}, Return model: TRANSFORMER"
-    )
-
-    # ===== Combined optimizer =====
-    # Collect unique parameters to avoid duplicating shared embedding params
-    seen_params = set()
-    unique_params = []
-    for model in [r_model, g_model]:
-        for param in model.parameters():
-            if id(param) not in seen_params:
-                seen_params.add(id(param))
-                unique_params.append(param)
-
-    optimizer = optim.Adam(unique_params, lr=0.01)
-    criterion = nn.MSELoss()
-
-    # Training Loop
-    epochs = 100
-    train_main_losses = []
-    train_rho1_losses = []
-    train_rho2_losses = []
-    train_combined_losses = []
-    eval_metrics_history = []
-
-    for epoch in range(epochs):
-        train_dataloader = data.DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            collate_fn=collate_variable_length_windows,
-        )
-
-        # Training
-        epoch_main_losses = []
-        epoch_rho1_losses = []
-        epoch_rho2_losses = []
-        epoch_combined_losses = []
-
-        for inputs, labels in train_dataloader:
-            # ===== Forward pass on current window (reward model) =====
-            r_outputs = r_model(
-                inputs["curr_state"], inputs["curr_action"], inputs["curr_term"]
-            )  # Shape: (batch_size, curr_seq_len, 1)
-
-            # ===== Forward pass on previous window (return model) =====
-            g_outputs_prev = g_model(
-                inputs["prev_state"],
-                inputs["prev_action"],
-                inputs["prev_term"],
-                mask=inputs["prev_mask"],
-                timestep=inputs["prev_timestep"],
-            )  # Shape: (batch_size, 1)
-
-            # ===== Forward pass on current window (return model) =====
-            # Following O2 spec: Ĝ_{t_w_i} = h({s_t,a_t}_{w_i}, t_{w_i})
-            # Both windows get independent predictions from the return model
-            g_outputs_curr = g_model(
-                inputs["curr_state"],
-                inputs["curr_action"],
-                inputs["curr_term"],
-                mask=inputs["curr_mask"],
-                timestep=inputs["curr_timestep"],
-            )  # Shape: (batch_size, 1)
-
-            # ===== O2 Specification Loss Function =====
-            # Extract predictions and labels
-            r_hat = r_outputs  # (batch, seq_len, 1) - per-step reward predictions
-            g_hat_prev = torch.squeeze(
-                g_outputs_prev
-            )  # (batch,) - predicted return for prev window
-            g_hat_curr = torch.squeeze(
-                g_outputs_curr
-            )  # (batch,) - predicted return for curr window (INDEPENDENT prediction)
-
-            R_obs_curr = labels["curr_aggregate_reward"]  # Observed aggregate reward
-            G_actual_prev = labels["prev_return"]  # Actual return at end of prev window
-            G_actual_curr = labels["curr_return"]  # Actual return at end of curr window
-
-            # Main loss: Match observed aggregate reward with summed predicted rewards
-            R_hat_curr = torch.squeeze(torch.sum(r_hat, dim=1))  # Predicted aggregate
-            loss_main = criterion(R_hat_curr, R_obs_curr)
-
-            # ρ₁: [(Ĝ_{t_w_i} - R^o_t) - Ĝ_{t_w_{i-1}}]²
-            # Difference in predicted returns should match observed aggregate
-            # Ĝ_curr - Ĝ_prev should equal R_obs_curr
-            rho_1 = torch.mean((g_hat_curr - R_obs_curr - g_hat_prev) ** 2)
-
-            # ρ₂: [(G_{t_w_i} - R̂^o_t) - G_{t_w_{i-1}}]²
-            # Difference in actual returns should match predicted aggregate
-            # G_curr - G_prev should equal R_hat_curr
-            rho_2 = torch.mean((G_actual_curr - R_hat_curr - G_actual_prev) ** 2)
-
-            # Combined loss with two regularization weights
-            # Total: L(φ) = main_loss + λ ρ₁ + ξ ρ₂
-            loss = loss_main + lam * rho_1 + xi * rho_2
-
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_main_losses.append(loss_main.item())
-            epoch_rho1_losses.append(rho_1.item())
-            epoch_rho2_losses.append(rho_2.item())
-            epoch_combined_losses.append(loss.item())
-
-        avg_main_loss = np.mean(epoch_main_losses)
-        avg_rho1_loss = np.mean(epoch_rho1_losses)
-        avg_rho2_loss = np.mean(epoch_rho2_losses)
-        avg_combined_loss = np.mean(epoch_combined_losses)
-
-        train_main_losses.append(avg_main_loss)
-        train_rho1_losses.append(avg_rho1_loss)
-        train_rho2_losses.append(avg_rho2_loss)
-        train_combined_losses.append(avg_combined_loss)
-
-        # Evaluation
-        if (epoch + 1) % 5 == 0:
-            eval_metrics, _ = evaluate_dual_model(
-                r_model,
-                g_model,
-                test_ds,
-                batch_size=batch_size,
-                collect_predictions=False,
-                max_batches=eval_steps,
-                shuffle=True,
-            )
-            eval_metrics_history.append(eval_metrics)
-
-            print(
-                f"Epoch [{epoch + 1}/{epochs}] | "
-                f"Train Loss: {avg_combined_loss:.4f} "
-                f"(Main: {avg_main_loss:.4f}, ρ₁: {avg_rho1_loss:.4f}, ρ₂: {avg_rho2_loss:.4f}) | "
-                f"Eval MSE - Reward: {eval_metrics['reward_mse']:.4f}, "
-                f"Return: {eval_metrics['return_mse']:.4f}, "
-                f"ρ₁: {eval_metrics['rho_1']:.4f}, "
-                f"ρ₂: {eval_metrics['rho_2']:.4f}"
-            )
-
-    # Final evaluation and save predictions
-    print("\nFinal evaluation...")
-    final_metrics, predictions_list = evaluate_dual_model(
-        r_model, g_model, test_ds, batch_size
-    )
-    print(f"Final Test Reward RMSE: {np.sqrt(final_metrics['reward_mse']):.8f}")
-    print(f"Final Test Return RMSE: {np.sqrt(final_metrics['return_mse']):.8f}")
-    print(f"Final Test Combined RMSE: {np.sqrt(final_metrics['combined_mse']):.8f}")
-
-    # Save results
-    output_path = pathlib.Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Save predictions
-    predictions_file = output_path / f"predictions_{reward_model_type}_return.json"
-    with open(predictions_file, "w") as writable:
-        json.dump(
-            {
-                "reward_model_type": reward_model_type,
-                "return_model_type": "transformer",
-                "final_reward_mse": final_metrics["reward_mse"],
-                "final_return_mse": final_metrics["return_mse"],
-                "final_combined_mse": final_metrics["combined_mse"],
-                "num_predictions": len(predictions_list),
-                "predictions": [
-                    {
-                        "prev_window": {
-                            "state": pred["prev_window"]["state"].tolist(),
-                            "action": pred["prev_window"]["action"].tolist(),
-                            "term": pred["prev_window"]["term"].tolist(),
-                            "actual_return": pred["prev_window"]["actual_return"],
-                            "predicted_return": pred["prev_window"]["predicted_return"],
-                        },
-                        "curr_window": {
-                            "state": pred["curr_window"]["state"].tolist(),
-                            "action": pred["curr_window"]["action"].tolist(),
-                            "term": pred["curr_window"]["term"].tolist(),
-                            "actual_aggregate_reward": pred["curr_window"][
-                                "actual_aggregate_reward"
-                            ],
-                            "predicted_aggregate_reward": pred["curr_window"][
-                                "predicted_aggregate_reward"
-                            ],
-                            "per_step_predictions": pred["curr_window"][
-                                "per_step_predictions"
-                            ].tolist(),
-                        },
-                    }
-                    for pred in predictions_list
-                ],
-            },
-            writable,
-            indent=2,
-        )
-    print(f"Predictions saved to {predictions_file}")
-
-    # Save training metrics
-    metrics_file = output_path / f"metrics_{reward_model_type}_return.json"
-    with open(metrics_file, "w") as writable:
-        json.dump(
-            {
-                "reward_model_type": reward_model_type,
-                "return_model_type": "transformer",
-                "train_main_losses": train_main_losses,
-                "train_rho1_losses": train_rho1_losses,
-                "train_rho2_losses": train_rho2_losses,
-                "train_combined_losses": train_combined_losses,
-                "eval_metrics_history": eval_metrics_history,
-                "final_reward_mse": final_metrics["reward_mse"],
-                "final_return_mse": final_metrics["return_mse"],
-                "final_combined_mse": final_metrics["combined_mse"],
-            },
-            writable,
-            indent=2,
-        )
-    print(f"Training metrics saved to {metrics_file}")
-
-    # Save models
-    model_file = output_path / f"model_{reward_model_type}_return.pt"
-    torch.save(
-        {
-            "reward_model_state_dict": r_model.state_dict(),
-            "return_model_state_dict": g_model.state_dict(),
-            "reward_model_type": reward_model_type,
-            "return_model_type": "transformer",
-        },
-        model_file,
-    )
-    print(f"Models saved to {model_file}")
-
-    return final_metrics, predictions_list
+    return final_metrics, []  # Empty predictions list
 
 
 def main():
@@ -1355,6 +1600,30 @@ def main():
         default=None,
         help="Random seed for reproducibility (default: None)",
     )
+    parser.add_argument(
+        "--stage1-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs for Stage 1 (GNetwork) training (default: 100)",
+    )
+    parser.add_argument(
+        "--stage2-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs for Stage 2 (RNetwork) training (default: 100)",
+    )
+    parser.add_argument(
+        "--stage1-lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for Stage 1 (default: 0.01)",
+    )
+    parser.add_argument(
+        "--stage2-lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for Stage 2 (default: 0.01)",
+    )
 
     args = parser.parse_args()
 
@@ -1394,11 +1663,20 @@ def main():
         "curr_timestep": [inp["curr_timestep"] for inp in inputs_list],
     }
     labels_dict = {
-        "prev_return": torch.stack([lab["prev_return"] for lab in labels_list]),
+        "prev_start_return": torch.stack(
+            [lab["prev_start_return"] for lab in labels_list]
+        ),
+        "prev_end_return": torch.stack([lab["prev_end_return"] for lab in labels_list]),
+        "prev_aggregate_reward": torch.stack(
+            [lab["prev_aggregate_reward"] for lab in labels_list]
+        ),
+        "curr_start_return": torch.stack(
+            [lab["curr_start_return"] for lab in labels_list]
+        ),
+        "curr_end_return": torch.stack([lab["curr_end_return"] for lab in labels_list]),
         "curr_aggregate_reward": torch.stack(
             [lab["curr_aggregate_reward"] for lab in labels_list]
         ),
-        "curr_return": torch.stack([lab["curr_return"] for lab in labels_list]),
     }
 
     dataset = DualWindowDataset(inputs=inputs_dict, labels=labels_dict)
@@ -1410,6 +1688,10 @@ def main():
         batch_size=args.batch_size,
         eval_steps=args.eval_steps,
         reward_model_type=args.reward_model_type,
+        stage1_epochs=args.stage1_epochs,
+        stage2_epochs=args.stage2_epochs,
+        stage1_lr=args.stage1_lr,
+        stage2_lr=args.stage2_lr,
         lam=args.lam,
         xi=args.xi,
         output_dir=args.output_dir,
