@@ -47,6 +47,15 @@ from drmdp import dataproc, rewdelay
 SPEC = "o2"
 
 
+def concatenate_state_action_term(
+    state: torch.Tensor,
+    action: torch.Tensor,
+    term: torch.Tensor,
+) -> torch.Tensor:
+    """Concatenate state, action, and term flag along the last dimension."""
+    return torch.concat([state, action, term], dim=-1)
+
+
 def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
     """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
     timestamp = int(time.time())
@@ -55,70 +64,22 @@ def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
     return output_path
 
 
-class SharedStateActionEmbedding(nn.Module):
-    """
-    Shared embedding module for (state, action, term) tuples.
-    Used by both reward and return prediction networks.
-
-    Applies LayerNorm to state and action inputs to handle different scales
-    (e.g., position vs velocity in MountainCar, or different sensor ranges).
-    """
-
-    def __init__(self, state_dim, action_dim, hidden_dim=256, normalize=True):
-        super().__init__()
-        self.normalize = normalize
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-
-        # Normalization layers for state and action (not term, which is binary)
-        if normalize:
-            self.state_norm = nn.LayerNorm(state_dim)
-            self.action_norm = nn.LayerNorm(action_dim)
-
-        # +1 for term flag
-        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-
-    def forward(self, state, action, term):
-        """
-        Args:
-            state: Tensor of shape (..., state_dim)
-            action: Tensor of shape (..., action_dim)
-            term: Tensor of shape (..., 1)
-
-        Returns:
-            embeddings: Tensor of shape (..., hidden_dim)
-        """
-        # Apply normalization to state and action
-        if self.normalize:
-            state = self.state_norm(state)
-            action = self.action_norm(action)
-
-        # Concatenate and project
-        features = torch.concat([state, action, term], dim=-1)
-        return self.input_proj(features)
-
-
 class RNetwork(nn.Module):
     """
     Feedforward MLP for reward prediction.
     Processes (state, action, term) tuples independently.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256, shared_embedding=None):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
 
     def forward(self, state, action, term):
-        features = self.embedding(state, action, term)
+        concatenated = concatenate_state_action_term(state, action, term)
+        features = self.input_proj(concatenated)
         features = nn.functional.relu(self.fc2(features))
         reward = self.fc3(features)
         return reward
@@ -128,7 +89,7 @@ class RNetworkRNN(nn.Module):
     """
     RNN-based reward prediction network.
     Processes sequential (state, action, term) tuples and outputs one reward value per step.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
 
     Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
     Output shape: (batch_size, sequence_length, 1)
@@ -142,7 +103,6 @@ class RNetworkRNN(nn.Module):
         num_layers=2,
         rnn_type="lstm",
         dropout=0.1,
-        shared_embedding=None,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -151,13 +111,7 @@ class RNetworkRNN(nn.Module):
         self.num_layers = num_layers
         self.rnn_type = rnn_type.lower()
 
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # RNN layer
         if self.rnn_type == "lstm":
@@ -206,9 +160,12 @@ class RNetworkRNN(nn.Module):
         action_with_stub = torch.cat([zero_action, action], dim=1)
         term_with_stub = torch.cat([zero_term, term], dim=1)
 
-        # Apply shared embedding to get hidden representation
+        # Apply independent embedding to get hidden representation
         # Shape: (batch_size, sequence_length+1, hidden_dim)
-        hidden = self.embedding(state_with_stub, action_with_stub, term_with_stub)
+        concatenated = concatenate_state_action_term(
+            state_with_stub, action_with_stub, term_with_stub
+        )
+        hidden = self.input_proj(concatenated)
 
         # Process through RNN
         # rnn_out shape: (batch_size, sequence_length+1, hidden_dim)
@@ -226,7 +183,7 @@ class RNetworkTransformer(nn.Module):
     """
     Transformer Decoder-based reward prediction network.
     Processes sequential (state, action, term) tuples and outputs one reward value per step.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
 
     Uses causal masking to ensure predictions at timestep t only depend on steps <= t.
 
@@ -243,20 +200,13 @@ class RNetworkTransformer(nn.Module):
         num_layers=4,
         feedforward_dim=1024,
         dropout=0.1,
-        shared_embedding=None,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # Positional encoding
         self.pos_encoding = nn.Parameter(
@@ -332,9 +282,12 @@ class RNetworkTransformer(nn.Module):
 
         seq_len = state_with_stub.shape[1]
 
-        # Apply shared embedding to get hidden representation
+        # Apply independent embedding to get hidden representation
         # Shape: (batch_size, sequence_length+1, hidden_dim)
-        hidden = self.embedding(state_with_stub, action_with_stub, term_with_stub)
+        concatenated = concatenate_state_action_term(
+            state_with_stub, action_with_stub, term_with_stub
+        )
+        hidden = self.input_proj(concatenated)
 
         # Add positional encoding
         hidden = hidden + self.pos_encoding[:, :seq_len, :]
@@ -367,7 +320,7 @@ class GNetwork(nn.Module):
     """
     Transformer Encoder-based return prediction network with delta prediction.
     Processes entire previous window sequence and outputs single return value.
-    Uses shared embedding for state-action representation.
+    Uses independent embedding for state-action representation.
 
     Architecture: Predicts DELTA (change in return) and adds to start_return via
     residual connection. This enforces delta prediction structure and simplifies
@@ -395,7 +348,6 @@ class GNetwork(nn.Module):
         num_layers=4,
         feedforward_dim=1024,
         dropout=0.1,
-        shared_embedding=None,
         max_episode_steps=1000,
     ):
         super().__init__()
@@ -404,13 +356,7 @@ class GNetwork(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_episode_steps = max_episode_steps
 
-        # Use shared embedding or create new one
-        if shared_embedding is not None:
-            self.embedding = shared_embedding
-        else:
-            self.embedding = SharedStateActionEmbedding(
-                state_dim, action_dim, hidden_dim
-            )
+        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
 
         # Positional encoding
         self.pos_encoding = nn.Parameter(
@@ -484,9 +430,10 @@ class GNetwork(nn.Module):
         if start_return is None:
             start_return = torch.zeros(batch_size, 1, device=state.device)
 
-        # Apply shared embedding to get hidden representation
+        # Apply independent embedding to get hidden representation
         # Shape: (batch_size, sequence_length, hidden_dim)
-        hidden = self.embedding(state, action, term)
+        concatenated = concatenate_state_action_term(state, action, term)
+        hidden = self.input_proj(concatenated)
 
         # Add positional encoding
         hidden = hidden + self.pos_encoding[:, :seq_len, :]
@@ -516,18 +463,18 @@ class GNetwork(nn.Module):
             hidden, src_key_padding_mask=src_key_padding_mask
         )
 
-        # Sum embeddings across all steps
+        # Masked mean pooling across sequence dimension
         # Shape: (batch_size, hidden_dim)
         if mask is not None:
             # Expand mask to match hidden dimension
             # mask: (batch_size, seq_len) -> (batch_size, seq_len, 1)
             mask_expanded = mask.unsqueeze(-1).float()
-            # Zero out padding positions and sum
+            # Zero out padding positions
             masked_output = output * mask_expanded
-            pooled = masked_output.sum(dim=1)
+            # Sum and divide by actual sequence length
+            pooled = masked_output.sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
         else:
-            # Sum across sequence dimension
-            pooled = output.sum(dim=1)
+            pooled = torch.mean(output, dim=1)
 
         # Predict DELTA (change in return), not absolute return
         # Shape: (batch_size, 1)
@@ -536,9 +483,10 @@ class GNetwork(nn.Module):
         # RESIDUAL CONNECTION: output = start_return + predicted_delta
         # This enforces the delta prediction structure and provides a direct
         # gradient path from output to start_return
-        return_value = start_return + delta
+        # return_value = start_return + delta
 
-        return return_value
+        # return return_value
+        return delta
 
 
 class DualWindowDataset(data.Dataset):
@@ -1063,10 +1011,10 @@ def evaluate_stage1_return_model(
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["curr_start_return"].unsqueeze(1),
+                # start_return=labels["curr_start_return"].unsqueeze(1),
             )
             g_hat_curr = torch.squeeze(g_outputs_curr)
-            curr_mse = criterion(g_hat_curr, labels["curr_end_return"])
+            curr_mse = criterion(g_hat_curr, labels["curr_aggregate_reward"])
             errors.append(curr_mse.item())
 
     # Compute final metrics
@@ -1090,9 +1038,9 @@ def train_stage1_return_model(
     hidden_dim: int = 64,
     eval_steps: int = 20,
     output_dir: str = "outputs",
-) -> Tuple[nn.Module, nn.Module]:
+) -> nn.Module:
     """
-    Stage 1: Pre-train GNetwork (return model) and shared embedding.
+    Stage 1: Pre-train GNetwork (return model).
 
     Trains on return prediction task:
     - Loss = MSE(Ĝ_prev, G_prev) + MSE(Ĝ_curr, G_curr)
@@ -1107,19 +1055,14 @@ def train_stage1_return_model(
         output_dir: Directory to save stage 1 models
 
     Returns:
-        Tuple of (GNetwork, SharedEmbedding) - trained models
+        GNetwork - trained model
     """
     # Split dataset
     train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
-    # Create shared embedding
-    shared_embedding = SharedStateActionEmbedding(
-        state_dim=obs_dim, action_dim=act_dim, hidden_dim=hidden_dim
-    )
-
-    # Create GNetwork only
+    # Create GNetwork
     max_episode_steps = (
         getattr(env.spec, "max_episode_steps", 1000)
         if hasattr(env, "spec") and env.spec
@@ -1133,7 +1076,6 @@ def train_stage1_return_model(
         num_heads=2,
         num_layers=2,
         feedforward_dim=512,
-        shared_embedding=shared_embedding,
         max_episode_steps=max_episode_steps,
     )
 
@@ -1141,7 +1083,7 @@ def train_stage1_return_model(
     print("  Model: Transformer Encoder")
     print(f"  Parameters: {sum(param.numel() for param in g_model.parameters()):,}")
 
-    # Optimizer for GNetwork only (includes shared embedding)
+    # Optimizer for GNetwork
     optimizer = optim.Adam(g_model.parameters(), lr=learning_rate)
     criterion = nn.MSELoss()
 
@@ -1165,12 +1107,12 @@ def train_stage1_return_model(
                 inputs["curr_action"],
                 inputs["curr_term"],
                 mask=inputs["curr_mask"],
-                start_return=labels["curr_start_return"].unsqueeze(1),
+                # start_return=labels["curr_start_return"].unsqueeze(1),
             )
 
             # Stage 1 Loss: Return prediction only
             g_hat_curr = torch.squeeze(g_outputs_curr)
-            loss = criterion(g_hat_curr, labels["curr_end_return"])
+            loss = criterion(g_hat_curr, labels["curr_aggregate_reward"])
 
             # Backward and optimize
             optimizer.zero_grad()
@@ -1207,7 +1149,7 @@ def train_stage1_return_model(
     print(f"  MSE:  {final_metrics['return_mse']:.6f}")
     print(f"  RMSE: {final_metrics['return_rmse']:.6f}")
 
-    # Save Stage 1 models
+    # Save Stage 1 model
     output_path = pathlib.Path(output_dir) / "stage1"
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -1215,23 +1157,21 @@ def train_stage1_return_model(
     torch.save(
         {
             "return_model_state_dict": g_model.state_dict(),
-            "shared_embedding_state_dict": shared_embedding.state_dict(),
             "train_losses": train_losses,
             "final_metrics": final_metrics,
         },
         model_file,
     )
-    print(f"\n[Stage 1] Models saved to {model_file}")
+    print(f"\n[Stage 1] Model saved to {model_file}")
     print("=" * 80)
 
-    return g_model, shared_embedding
+    return g_model
 
 
 def train_stage2_reward_model(
     env: gym.Env,
     dataset: data.Dataset,
     g_model_frozen: nn.Module,
-    shared_embedding_frozen: nn.Module,
     reward_model_type: str = "rnn",
     batch_size: int = 64,
     num_epochs: int = 100,
@@ -1252,7 +1192,6 @@ def train_stage2_reward_model(
         env: Gymnasium environment
         dataset: DualWindowDataset
         g_model_frozen: Frozen GNetwork from Stage 1
-        shared_embedding_frozen: Frozen shared embedding from Stage 1
         reward_model_type: RNetwork architecture ("mlp", "rnn", "transformer")
         batch_size: Batch size for training
         num_epochs: Number of training epochs
@@ -1265,28 +1204,26 @@ def train_stage2_reward_model(
     Returns:
         Trained RNetwork
     """
-    # Freeze GNetwork and shared embedding
+    # Freeze GNetwork
     g_model_frozen.eval()
     for param in g_model_frozen.parameters():
         param.requires_grad = False
 
     print("[Stage 2] Training RNetwork (reward model)")
     print("  GNetwork: FROZEN")
-    print("  Shared Embedding: FROZEN")
 
     # Split dataset
     train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
-    # Create RNetwork with frozen shared embedding
+    # Create RNetwork
     r_model: nn.Module
     if reward_model_type == "mlp":
         r_model = RNetwork(
             state_dim=obs_dim,
             action_dim=act_dim,
             hidden_dim=hidden_dim,
-            shared_embedding=shared_embedding_frozen,
         )
     elif reward_model_type == "rnn":
         r_model = RNetworkRNN(
@@ -1295,7 +1232,6 @@ def train_stage2_reward_model(
             hidden_dim=hidden_dim,
             num_layers=2,
             rnn_type="lstm",
-            shared_embedding=shared_embedding_frozen,
         )
     elif reward_model_type == "transformer":
         r_model = RNetworkTransformer(
@@ -1304,20 +1240,14 @@ def train_stage2_reward_model(
             hidden_dim=hidden_dim,
             num_heads=2,
             num_layers=2,
-            shared_embedding=shared_embedding_frozen,
         )
     else:
         raise ValueError(f"Unknown reward_model_type: {reward_model_type}")
 
     print(f"  Model: {reward_model_type.upper()}")
 
-    # CRITICAL: Only optimize RNetwork parameters (NOT shared embedding)
-    # Shared embedding is frozen and should not receive gradients
-    r_model_params = [
-        param
-        for param in r_model.parameters()
-        if param.requires_grad  # Excludes frozen shared embedding
-    ]
+    # Optimize all RNetwork parameters
+    r_model_params = list(r_model.parameters())
 
     print(f"  Trainable parameters: {sum(param.numel() for param in r_model_params):,}")
     print(
@@ -1555,7 +1485,7 @@ def train(
     print("\n" + "=" * 80)
     print("STAGE 1: PRE-TRAIN RETURN MODEL (GNetwork)")
     print("=" * 80)
-    g_model, shared_embedding = train_stage1_return_model(
+    g_model = train_stage1_return_model(
         env=env,
         dataset=dataset,
         batch_size=batch_size,
@@ -1574,7 +1504,6 @@ def train(
         env=env,
         dataset=dataset,
         g_model_frozen=g_model,
-        shared_embedding_frozen=shared_embedding,
         reward_model_type=reward_model_type,
         batch_size=batch_size,
         num_epochs=stage2_epochs,

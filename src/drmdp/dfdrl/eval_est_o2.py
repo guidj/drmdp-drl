@@ -2,7 +2,6 @@
 Evaluation module for O2 (return-grounded reward estimation) models.
 
 Loads saved dual models (reward + return) from est_o2.py and evaluates them.
-CRITICAL: Both models share a single embedding layer that must be properly reconstructed.
 
 Evaluation modes:
 1. Predictions mode: Loads and displays predictions from saved JSON
@@ -72,16 +71,14 @@ def load_dual_models(
     hidden_dim: int = 256,
     num_layers: int = 2,
     num_heads: int = 2,
-) -> Tuple[nn.Module, nn.Module, nn.Module]:
+    return_model_type: str = "transformer",
+) -> Tuple[nn.Module, nn.Module]:
     """
     Load dual models (reward + return) from checkpoint.
 
     Supports both formats:
     - Two-stage: model_path points to stage2/ directory or parent directory
     - Legacy: model_path points to model_{type}_return.pt file
-
-    CRITICAL: Recreates shared embedding layer first, then both models reference it.
-    Both models MUST use the SAME embedding object.
 
     Args:
         model_path: Path to model file or directory containing models
@@ -92,25 +89,20 @@ def load_dual_models(
         hidden_dim: Hidden layer dimension (default: 256)
         num_layers: Number of layers (default: 2)
         num_heads: Number of attention heads (default: 2)
+        return_model_type: Type of return model (only "transformer" is supported) (default: "transformer")
 
     Returns:
-        Tuple of (reward_model, return_model, shared_embedding)
+        Tuple of (reward_model, return_model)
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Step 1: Create shared embedding layer FIRST
-    shared_embedding = est_o2.SharedStateActionEmbedding(
-        state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim
-    )
-
-    # Step 2: Create reward model with shared embedding
+    # Step 1: Create reward model
     r_model: nn.Module
     if reward_model_type == "mlp":
         r_model = est_o2.RNetwork(
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=hidden_dim,
-            shared_embedding=shared_embedding,
         )
     elif reward_model_type == "rnn":
         r_model = est_o2.RNetworkRNN(
@@ -119,7 +111,6 @@ def load_dual_models(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             rnn_type="lstm",
-            shared_embedding=shared_embedding,
         )
     elif reward_model_type == "transformer":
         r_model = est_o2.RNetworkTransformer(
@@ -128,30 +119,28 @@ def load_dual_models(
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             num_layers=num_layers,
-            shared_embedding=shared_embedding,
         )
     else:
         raise ValueError(
             f"Unknown reward_model_type: {reward_model_type}. Use 'mlp', 'rnn', or 'transformer'."
         )
 
-    # Step 3: Create return model (always Transformer) with SAME shared embedding
-    g_model = est_o2.GNetwork(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        num_layers=num_layers,
-        shared_embedding=shared_embedding,
-        max_episode_steps=max_episode_steps,
-    )
+    # Step 2: Create return model
+    if return_model_type == "transformer":
+        g_model = est_o2.GNetwork(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            max_episode_steps=max_episode_steps,
+        )
+    else:
+        raise ValueError(
+            f"Unknown return_model_type: {return_model_type}. Only 'transformer' is supported."
+        )
 
-    # CRITICAL: Verify both models use the same embedding object
-    assert r_model.embedding is g_model.embedding, (
-        "CRITICAL ERROR: Reward and return models must share the same embedding object!"
-    )
-
-    # Step 4: Load checkpoint - auto-detect format
+    # Step 3: Load checkpoint - auto-detect format
     model_path_obj = pathlib.Path(model_path)
 
     # NEW: Check if this is a two-stage checkpoint directory
@@ -194,7 +183,7 @@ def load_dual_models(
     r_model.eval()
     g_model.eval()
 
-    return r_model, g_model, shared_embedding
+    return r_model, g_model
 
 
 def evaluate_from_predictions_file(
@@ -581,6 +570,13 @@ def main():
         help="Reward model architecture type",
     )
     parser.add_argument(
+        "--return-model-type",
+        type=str,
+        default="transformer",
+        choices=["transformer", "rnn"],
+        help="Return model architecture type (default: transformer)",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         default="predictions",
@@ -671,7 +667,7 @@ def main():
         max_episode_steps = config["architecture"].get(
             "max_episode_steps", args.max_episode_steps
         )
-        r_model, g_model, shared_embedding = load_dual_models(
+        r_model, g_model = load_dual_models(
             str(model_path),
             reward_model_type=args.reward_model_type,
             state_dim=config["state_dim"],
@@ -680,9 +676,10 @@ def main():
             hidden_dim=config["architecture"].get("hidden_dim", 256),
             num_layers=config["architecture"].get("num_layers", 2),
             num_heads=config["architecture"].get("num_heads", 2),
+            return_model_type=args.return_model_type,
         )
         print(
-            f"Loaded dual models ({args.reward_model_type.upper()} + TRANSFORMER) from {model_path}"
+            f"Loaded dual models ({args.reward_model_type.upper()} + {args.return_model_type.upper()}) from {model_path}"
         )
         print(f"Shared embedding verified: {r_model.embedding is g_model.embedding}")
 
