@@ -95,8 +95,7 @@ class SharedStateActionEmbedding(nn.Module):
 
         # Concatenate and project
         features = torch.concat([state, action, term], dim=-1)
-        # TODO: Remove relu after noting result from removing projection of return
-        return nn.functional.relu(self.input_proj(features))
+        return self.input_proj(features)
 
 
 class RNetwork(nn.Module):
