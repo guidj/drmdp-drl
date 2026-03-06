@@ -48,7 +48,9 @@ class RNetwork(nn.Module):
     Maps (state, action, term) -> reward.
     """
 
-    def __init__(self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256):
+    def __init__(
+        self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
+    ):
         super().__init__()
         # +1 for term flag
         self.layers = []
@@ -57,9 +59,7 @@ class RNetwork(nn.Module):
         input_dim = (state_dim + action_dim + 1) * powers
         output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
         for _ in range(self.num_hidden_layers):
-            self.layers.append(
-                nn.Linear(input_dim, output_dim)
-            )
+            self.layers.append(nn.Linear(input_dim, output_dim))
             input_dim = output_dim
         self.final_layer = nn.Linear(output_dim, 1)
 
