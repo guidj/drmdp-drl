@@ -48,12 +48,20 @@ class RNetwork(nn.Module):
     Maps (state, action, term) -> reward.
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256):
         super().__init__()
         # +1 for term flag
-        self.fc1 = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.layers = []
+        self.powers = torch.tensor(range(powers)) + 1
+        self.num_hidden_layers = num_hidden_layers
+        input_dim = (state_dim + action_dim + 1) * powers
+        output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
+        for _ in range(self.num_hidden_layers):
+            self.layers.append(
+                nn.Linear(input_dim, output_dim)
+            )
+            input_dim = output_dim
+        self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
         """
@@ -65,11 +73,12 @@ class RNetwork(nn.Module):
         Returns:
             reward: Tensor of shape (batch_size, 1)
         """
-        features = torch.concat([state, action, term], dim=-1)
-        features = nn.functional.relu(self.fc1(features))
-        features = nn.functional.relu(self.fc2(features))
-        reward = self.fc3(features)
-        return reward
+        out = torch.concat([state, action, term], dim=-1)
+        out = torch.pow(torch.unsqueeze(out, -1), self.powers)
+        out = torch.flatten(out, start_dim=1)
+        for layer in self.layers:
+            out = layer(out)
+        return self.final_layer(out)
 
 
 class DictDataset(data.Dataset):
@@ -237,7 +246,7 @@ def train(
     model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
     print("Training immediate reward prediction model (MLP)")
 
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
 
     # Training Loop
