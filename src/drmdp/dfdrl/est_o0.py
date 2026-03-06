@@ -52,10 +52,10 @@ class RNetwork(nn.Module):
         self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
     ):
         super().__init__()
-        # +1 for term flag
         self.layers = []
         self.powers = torch.tensor(range(powers)) + 1
         self.num_hidden_layers = num_hidden_layers
+        # +1 for term flag
         input_dim = (state_dim + action_dim + 1) * powers
         output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
         for _ in range(self.num_hidden_layers):
