@@ -70,20 +70,37 @@ class RNetwork(nn.Module):
     Processes (state, action, term) tuples independently.
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(
+        self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
+    ):
         super().__init__()
+        self.layers = []
+        self.powers = torch.tensor(range(powers)) + 1
+        self.num_hidden_layers = num_hidden_layers
         # +1 for term flag
-        self.fc1 = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        input_dim = (state_dim + action_dim + 1) * powers
+        output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
+        for _ in range(self.num_hidden_layers):
+            self.layers.append(nn.Linear(input_dim, output_dim))
+            input_dim = output_dim
+        self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
-        features = torch.concat([state, action, term], dim=-1)
-        features = nn.functional.relu(self.fc1(features))
-        features = nn.functional.relu(self.fc2(features))
-        reward = self.fc3(features)
-        # TODO: distributional reward prediction
-        return reward
+        """
+        Args:
+            state: Tensor of shape (batch_size, time step, state_dim)
+            action: Tensor of shape (batch_size, time step, action_dim)
+            term: Tensor of shape (batch_size, time step, 1)
+
+        Returns:
+            reward: Tensor of shape (batch_size, 1)
+        """
+        out = torch.concat([state, action, term], dim=-1)
+        out = torch.pow(torch.unsqueeze(out, -1), self.powers)
+        out = torch.flatten(out, start_dim=2)
+        for layer in self.layers:
+            out = layer(out)
+        return self.final_layer(out)
 
 
 class RNetworkRNN(nn.Module):
@@ -361,8 +378,18 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     def create_example(traj_steps: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
         # assumes labels single value tensors
         inputs, labels = zip(*traj_steps)
-        # agg rewards
-        return data.default_collate(inputs), torch.sum(torch.stack(labels))
+
+        # Extract per-step rewards and compute aggregate
+        per_step_rewards = [label.item() for label in labels]
+        aggregate_reward = sum(per_step_rewards)
+
+        # Return dict with both aggregate and per-step rewards
+        label_dict = {
+            "aggregate_reward": aggregate_reward,
+            "per_step_rewards": per_step_rewards,
+        }
+
+        return data.default_collate(inputs), label_dict
 
     states = np.concatenate(
         [
@@ -461,18 +488,30 @@ def evaluate_model(
 
             # Sum predictions across sequence to get aggregate reward
             pred_window_reward = torch.squeeze(torch.sum(predictions, dim=1))
-            mean_squared_error = eval_criterion(pred_window_reward, labels)
+
+            # Extract aggregate rewards from batched label dict
+            # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
+            aggregate_rewards = labels["aggregate_reward"].float()
+            mean_squared_error = eval_criterion(pred_window_reward, aggregate_rewards)
             errors.append(mean_squared_error)
 
             # Optionally collect predictions for analysis
             if collect_predictions:
                 for idx in range(batch_size_actual):
+                    # Extract per-step rewards for this batch element
+                    # labels["per_step_rewards"] is a list of tensors, one per timestep
+                    per_step_rewards = [
+                        labels["per_step_rewards"][step_idx][idx].item()
+                        for step_idx in range(len(labels["per_step_rewards"]))
+                    ]
+
                     predictions_list.append(
                         {
                             "state": inputs["state"][idx].cpu().numpy(),
                             "action": inputs["action"][idx].cpu().numpy(),
                             "term": inputs["term"][idx].cpu().numpy(),
-                            "actual_reward": labels[idx].item(),
+                            "actual_reward": aggregate_rewards[idx].item(),
+                            "per_step_rewards": per_step_rewards,
                             "predicted_reward": pred_window_reward[idx].item(),
                             "per_step_predictions": predictions[idx]
                             .squeeze(-1)
@@ -537,11 +576,11 @@ def train(
         )
 
     print(f"Training with {model_type.upper()} model")
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
 
     # Training Loop
-    epochs = 100
+    epochs = 300
     train_losses = []
     eval_losses = []
 
@@ -559,7 +598,11 @@ def train(
             # Calculate loss for each seq in batch
             # outputs shape: (batch_size, seq_len, 1)
             window_reward = torch.squeeze(torch.sum(outputs, dim=1))
-            loss = criterion(window_reward, labels)
+
+            # Extract aggregate rewards from batched label dict
+            # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
+            aggregate_rewards = labels["aggregate_reward"].float()
+            loss = criterion(window_reward, aggregate_rewards)
 
             # Backward and optimize
             optimizer.zero_grad()
@@ -612,6 +655,7 @@ def train(
                         "term": pred["term"].tolist(),
                         "actual_reward": pred["actual_reward"],
                         "predicted_reward": pred["predicted_reward"],
+                        "per_step_rewards": pred["per_step_rewards"],
                         "per_step_predictions": pred["per_step_predictions"].tolist(),
                     }
                     for pred in predictions_list
@@ -676,7 +720,7 @@ def main():
     parser.add_argument(
         "--model-type",
         type=str,
-        default="rnn",
+        default="mlp",
         choices=["mlp", "rnn", "transformer", "all"],
         help="Model architecture to train (default: mlp). Use 'all' to train all models.",
     )
@@ -739,7 +783,8 @@ def main():
 
     # Create dataset
     inputs, labels = zip(*training_buffer)
-    dataset = DictDataset(data.default_collate(inputs), torch.stack(labels))
+    # Labels are now dicts, not tensors - pass them as-is
+    dataset = DictDataset(data.default_collate(inputs), list(labels))
 
     # Train model(s)
     if args.model_type == "all":
