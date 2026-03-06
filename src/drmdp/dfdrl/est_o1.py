@@ -580,7 +580,7 @@ def train(
     criterion = nn.MSELoss()
 
     # Training Loop
-    epochs = 300
+    epochs = 1000
     train_losses = []
     eval_losses = []
 
