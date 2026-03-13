@@ -41,14 +41,6 @@ from drmdp import dataproc, rewdelay
 SPEC = "o1"
 
 
-def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
-    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
-    timestamp = int(time.time())
-    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
-    output_path.mkdir(parents=True, exist_ok=True)
-    return output_path
-
-
 class RNetwork(nn.Module):
     """
     Feedforward MLP for reward prediction.
@@ -56,7 +48,7 @@ class RNetwork(nn.Module):
     """
 
     def __init__(
-        self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
+        self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
         super().__init__()
         self.layers = []
@@ -67,6 +59,7 @@ class RNetwork(nn.Module):
         output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
         for _ in range(self.num_hidden_layers):
             self.layers.append(nn.Linear(input_dim, output_dim))
+            self.layers.append(nn.ReLU())
             input_dim = output_dim
         self.final_layer = nn.Linear(output_dim, 1)
 
@@ -443,6 +436,14 @@ def train(
     print(f"Config saved to {config_file}")
 
     return final_mse, predictions_list
+
+
+def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
+    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
+    timestamp = int(time.time())
+    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
+    output_path.mkdir(parents=True, exist_ok=True)
+    return output_path
 
 
 def main():
