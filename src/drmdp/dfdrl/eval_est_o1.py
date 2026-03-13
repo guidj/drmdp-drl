@@ -4,25 +4,6 @@ Evaluation module for O1 (delayed aggregate reward prediction) models.
 Loads saved models from est_o1.py and evaluates them in two modes:
 1. Predictions mode: Loads and displays predictions from saved JSON
 2. Interactive mode: Runs live environment rollouts with delayed rewards
-
-Supports three model architectures: MLP, RNN, and Transformer.
-
-Usage Examples:
-    # Evaluate from saved predictions (RNN)
-    python -m drmdp.dfdrl.eval_est_o1 \
-        --model-dir outputs/o1/1709564425 \
-        --model-type rnn \
-        --mode predictions \
-        --num-examples 10
-
-    # Interactive evaluation with live environment (Transformer)
-    python -m drmdp.dfdrl.eval_est_o1 \
-        --model-dir outputs/o1/1709564425 \
-        --model-type transformer \
-        --mode interactive \
-        --env MountainCarContinuous-v0 \
-        --delay 3 \
-        --num-episodes 5
 """
 
 import argparse
@@ -70,11 +51,9 @@ def load_model(
     """
     Load O1 model from checkpoint.
 
-    Supports three architectures: MLP, RNN, Transformer.
-
     Args:
         model_path: Path to model_{model_type}.pt file
-        model_type: Type of model ("mlp", "rnn", or "transformer")
+        model_type: Type of model ("mlp",)
         state_dim: State dimension
         action_dim: Action dimension
         hidden_dim: Hidden layer dimension (default: 256)
@@ -89,22 +68,6 @@ def load_model(
     if model_type == "mlp":
         model = est_o1.RNetwork(
             state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim
-        )
-    elif model_type == "rnn":
-        model = est_o1.RNetworkRNN(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_dim=hidden_dim,
-            num_layers=2,
-            rnn_type="lstm",
-        )
-    elif model_type == "transformer":
-        model = est_o1.RNetworkTransformer(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_dim=hidden_dim,
-            num_heads=8,
-            num_layers=4,
         )
     else:
         raise ValueError(
@@ -325,7 +288,7 @@ def main():
         "--model-type",
         type=str,
         required=True,
-        choices=["mlp", "rnn", "transformer"],
+        choices=["mlp"],
         help="Model architecture type",
     )
     parser.add_argument(

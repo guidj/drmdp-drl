@@ -515,7 +515,7 @@ def main():
 
     # Create dataset
     inputs, labels = zip(*training_buffer)
-    # Labels are now dicts, not tensors - pass them as-is
+    # Labels are dicts - pass them as-is
     dataset = DictDataset(data.default_collate(inputs), list(labels))
 
     # Train model(s)
