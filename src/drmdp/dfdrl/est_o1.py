@@ -5,37 +5,22 @@ This module provides three architectures for predicting rewards from sequences
 of (state, action) pairs:
 
 1. RNetwork: Feedforward MLP - processes each (s,a) pair independently
-2. RNetworkRNN: Recurrent network - processes sequences with LSTM/GRU
-3. RNetworkTransformer: Transformer decoder - processes sequences with self-attention
 
 All models support two modes:
 - forward(): Sequential prediction for training on delayed reward sequences
 - forward_markovian(): Markovian prediction for test time (reward depends only on current s,a)
 
 Usage Example:
-    # Feedforward (no stub needed - each step is independent)
+    # Feedforward (Each step is independent)
     model = RNetwork(state_dim=4, action_dim=2, hidden_dim=256)
-    # Sequential input: (batch_size, seq_len, state_dim), (batch_size, seq_len, action_dim)
+    # The last variable indicates termination
+    # Sequential input: (batch_size, seq_len, state_dim), (batch_size, seq_len, action_dim), (batch_size, seq_len, 1)
     rewards = model(states, actions)  # Output: (batch_size, seq_len, 1)
-    # Markovian input: (batch_size, state_dim), (batch_size, action_dim)
+    # Markovian input: (batch_size, state_dim), (batch_size, action_dim), (batch_size, 1)
     reward = model.forward_markovian(state, action)  # Output: (batch_size, 1)
 
-    # RNN-based (stub handled internally)
-    model = RNetworkRNN(state_dim=4, action_dim=2, hidden_dim=256,
-                        rnn_type="lstm", num_layers=2)
-    rewards = model(states, actions)  # Sequential
-    reward = model.forward_markovian(state, action)  # Markovian
-
-    # Transformer-based (stub handled internally)
-    model = RNetworkTransformer(state_dim=4, action_dim=2, hidden_dim=256,
-                                num_heads=8, num_layers=4)
-    rewards = model(states, actions)  # Sequential
-    reward = model.forward_markovian(state, action)  # Markovian
-
 All models output per-step reward predictions that are summed during training
-to match the delayed aggregate reward signal. RNN and Transformer models
-internally prepend a zero stub [0, 0, ...] to sequences for consistent
-initialization, ensuring predictions depend only on the current context.
+to match the delayed aggregate reward signal.
 """
 
 import argparse
@@ -101,243 +86,6 @@ class RNetwork(nn.Module):
         for layer in self.layers:
             out = layer(out)
         return self.final_layer(out)
-
-
-class RNetworkRNN(nn.Module):
-    """
-    RNN-based reward prediction network.
-    Processes sequential (state, action, term) tuples and outputs one reward value per step.
-
-    Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
-    Output shape: (batch_size, sequence_length, 1)
-    """
-
-    def __init__(
-        self,
-        state_dim,
-        action_dim,
-        hidden_dim=256,
-        num_layers=2,
-        rnn_type="lstm",
-        dropout=0.1,
-    ):
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.rnn_type = rnn_type.lower()
-
-        # Input projection: (state, action, term) -> hidden_dim
-        self.input_proj = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-
-        # RNN layer
-        if self.rnn_type == "lstm":
-            self.rnn = nn.LSTM(
-                input_size=hidden_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-        elif self.rnn_type == "gru":
-            self.rnn = nn.GRU(
-                input_size=hidden_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-        else:
-            raise ValueError(f"Unknown RNN type: {rnn_type}. Use 'lstm' or 'gru'.")
-
-        # Output projection: hidden_dim -> 1 (reward per step)
-        self.output_proj = nn.Linear(hidden_dim, 1)
-
-    def forward(self, state, action, term):
-        """
-        Args:
-            state: Tensor of shape (batch_size, sequence_length, state_dim)
-            action: Tensor of shape (batch_size, sequence_length, action_dim)
-            term: Tensor of shape (batch_size, sequence_length, 1)
-
-        Returns:
-            rewards: Tensor of shape (batch_size, sequence_length, 1)
-                Predictions for real timesteps only (stub is handled internally)
-        """
-        batch_size = state.shape[0]
-        device = state.device
-
-        # Prepend zero stub for position 0 to ensure consistent RNN initialization
-        zero_state = torch.zeros(batch_size, 1, self.state_dim, device=device)
-        zero_action = torch.zeros(batch_size, 1, self.action_dim, device=device)
-        zero_term = torch.zeros(batch_size, 1, 1, device=device)
-
-        # Create sequence with stub: [zero_stub, actual_sequence]
-        state_with_stub = torch.cat([zero_state, state], dim=1)
-        action_with_stub = torch.cat([zero_action, action], dim=1)
-        term_with_stub = torch.cat([zero_term, term], dim=1)
-
-        # Concatenate state, action, and term along feature dimension
-        # Shape: (batch_size, sequence_length+1, state_dim + action_dim + 1)
-        features = torch.concat(
-            [state_with_stub, action_with_stub, term_with_stub], dim=-1
-        )
-
-        # Project to hidden dimension and apply activation
-        # Shape: (batch_size, sequence_length+1, hidden_dim)
-        features = nn.functional.relu(self.input_proj(features))
-
-        # Process through RNN
-        # rnn_out shape: (batch_size, sequence_length+1, hidden_dim)
-        rnn_out, _ = self.rnn(features)
-
-        # Project to reward predictions (one per timestep)
-        # Shape: (batch_size, sequence_length+1, 1)
-        rewards = self.output_proj(rnn_out)
-
-        # Return only predictions for real timesteps (skip position 0)
-        return rewards[:, 1:, :]
-
-
-class RNetworkTransformer(nn.Module):
-    """
-    Transformer Decoder-based reward prediction network.
-    Processes sequential (state, action, term) tuples and outputs one reward value per step.
-
-    Uses causal masking to ensure predictions at timestep t only depend on steps <= t.
-
-    Input shape: (batch_size, sequence_length, state_dim + action_dim + 1)
-    Output shape: (batch_size, sequence_length, 1)
-    """
-
-    def __init__(
-        self,
-        state_dim,
-        action_dim,
-        hidden_dim=256,
-        num_heads=8,
-        num_layers=4,
-        feedforward_dim=1024,
-        dropout=0.1,
-    ):
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.hidden_dim = hidden_dim
-
-        # Input embedding: (state, action, term) -> hidden_dim
-        self.input_embedding = nn.Linear(state_dim + action_dim + 1, hidden_dim)
-
-        # Positional encoding
-        self.pos_encoding = nn.Parameter(
-            torch.zeros(1, 1000, hidden_dim)
-        )  # Max sequence length 1000
-
-        # Transformer decoder layers
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=feedforward_dim,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_layers
-        )
-
-        # Output projection: hidden_dim -> 1 (reward per step)
-        self.output_proj = nn.Linear(hidden_dim, 1)
-
-        # Layer normalization
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-
-        # Initialize positional encoding with sinusoidal pattern
-        self._init_positional_encoding()
-
-    def _init_positional_encoding(self):
-        """Initialize positional encoding with sinusoidal pattern."""
-        max_len = self.pos_encoding.size(1)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(
-            torch.arange(0, self.hidden_dim, 2).float()
-            * (-torch.log(torch.tensor(10000.0)) / self.hidden_dim)
-        )
-
-        pe = torch.zeros(1, max_len, self.hidden_dim)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.pos_encoding.data.copy_(pe)
-
-    def _generate_square_subsequent_mask(self, sz):
-        """
-        Generate causal mask for transformer decoder.
-        Ensures that position i can only attend to positions <= i.
-        """
-        mask = torch.triu(torch.ones(sz, sz), diagonal=1).bool()
-        return mask
-
-    def forward(self, state, action, term):
-        """
-        Args:
-            state: Tensor of shape (batch_size, sequence_length, state_dim)
-            action: Tensor of shape (batch_size, sequence_length, action_dim)
-            term: Tensor of shape (batch_size, sequence_length, 1)
-
-        Returns:
-            rewards: Tensor of shape (batch_size, sequence_length, 1)
-                Predictions for real timesteps only (stub is handled internally)
-        """
-        batch_size = state.shape[0]
-        device = state.device
-
-        # Prepend zero stub for position 0 to ensure consistent initialization
-        zero_state = torch.zeros(batch_size, 1, self.state_dim, device=device)
-        zero_action = torch.zeros(batch_size, 1, self.action_dim, device=device)
-        zero_term = torch.zeros(batch_size, 1, 1, device=device)
-
-        # Create sequence with stub: [zero_stub, actual_sequence]
-        state_with_stub = torch.cat([zero_state, state], dim=1)
-        action_with_stub = torch.cat([zero_action, action], dim=1)
-        term_with_stub = torch.cat([zero_term, term], dim=1)
-
-        # Concatenate state, action, and term along feature dimension
-        # Shape: (batch_size, sequence_length+1, state_dim + action_dim + 1)
-        features = torch.concat(
-            [state_with_stub, action_with_stub, term_with_stub], dim=-1
-        )
-
-        seq_len = features.shape[1]
-
-        # Embed input
-        # Shape: (batch_size, sequence_length+1, hidden_dim)
-        features = self.input_embedding(features)
-
-        # Add positional encoding
-        features = features + self.pos_encoding[:, :seq_len, :]
-
-        # Apply layer normalization
-        features = self.layer_norm(features)
-
-        # Generate causal mask
-        causal_mask = self._generate_square_subsequent_mask(seq_len).to(features.device)
-
-        # For transformer decoder, we use the input as both memory and target
-        # This is a decoder-only architecture (similar to GPT)
-        # The causal mask ensures autoregressive behavior
-        output = self.transformer_decoder(
-            tgt=features,
-            memory=features,
-            tgt_mask=causal_mask,
-            memory_mask=causal_mask,
-        )
-
-        # Project to reward predictions (one per timestep)
-        # Shape: (batch_size, sequence_length+1, 1)
-        rewards = self.output_proj(output)
-
-        # Return only predictions for real timesteps (skip position 0)
-        return rewards[:, 1:, :]
 
 
 class DictDataset(data.Dataset):
@@ -554,22 +302,6 @@ def train(
     # Select model architecture
     if model_type == "mlp":
         model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
-    elif model_type == "rnn":
-        model = RNetworkRNN(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            num_layers=2,
-            rnn_type="lstm",
-        )
-    elif model_type == "transformer":
-        model = RNetworkTransformer(
-            state_dim=obs_dim,
-            action_dim=act_dim,
-            hidden_dim=256,
-            num_heads=8,
-            num_layers=4,
-        )
     else:
         raise ValueError(
             f"Unknown model_type: {model_type}. Use 'mlp', 'rnn', or 'transformer'."
@@ -721,7 +453,7 @@ def main():
         "--model-type",
         type=str,
         default="mlp",
-        choices=["mlp", "rnn", "transformer", "all"],
+        choices=["mlp", "all"],
         help="Model architecture to train (default: mlp). Use 'all' to train all models.",
     )
     parser.add_argument(
