@@ -510,7 +510,8 @@ def train(
 
         # Save model
         model_file = os.path.join(output_dir, f"model_{model_type}.pt")
-        torch.save(model.state_dict(), model_file)
+        with tf.io.gfile.GFile(model_file, "wb") as writable:
+            torch.save(model.state_dict(), writable)
         logging.info("Model saved to %s", model_file)
 
         # Save config and metrics
