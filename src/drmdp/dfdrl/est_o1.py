@@ -51,16 +51,17 @@ class RNetwork(nn.Module):
         self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
         super().__init__()
-        self.layers = []
-        self.powers = torch.tensor(range(powers)) + 1
+        self.register_buffer("powers", torch.tensor(range(powers)) + 1)
         self.num_hidden_layers = num_hidden_layers
         # +1 for term flag
         input_dim = (state_dim + action_dim + 1) * powers
         output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
+        layers = []
         for _ in range(self.num_hidden_layers):
-            self.layers.append(nn.Linear(input_dim, output_dim))
-            self.layers.append(nn.ReLU())
+            layers.append(nn.Linear(input_dim, output_dim))
+            layers.append(nn.ReLU())
             input_dim = output_dim
+        self.layers = nn.ModuleList(layers)
         self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
@@ -126,8 +127,8 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
 
         # Return dict with both aggregate and per-step rewards
         label_dict = {
-            "aggregate_reward": aggregate_reward,
-            "per_step_rewards": per_step_rewards,
+            "aggregate_reward": torch.tensor(aggregate_reward),
+            "per_step_rewards": torch.tensor(per_step_rewards),
         }
 
         return data.default_collate(inputs), label_dict
@@ -239,13 +240,7 @@ def evaluate_model(
             # Optionally collect predictions for analysis
             if collect_predictions:
                 for idx in range(batch_size_actual):
-                    # Extract per-step rewards for this batch element
-                    # labels["per_step_rewards"] is a list of tensors, one per timestep
-                    per_step_rewards = [
-                        labels["per_step_rewards"][step_idx][idx].item()
-                        for step_idx in range(len(labels["per_step_rewards"]))
-                    ]
-
+                    per_step_rewards = labels["per_step_rewards"][idx].cpu().numpy()
                     predictions_list.append(
                         {
                             "state": inputs["state"][idx].cpu().numpy(),
@@ -362,81 +357,97 @@ def train(
                     f"Epoch [{epoch + 1}/{train_epochs}], Train RMSE: {train_rmse:.8f}, Eval RMSE: {eval_rmse:.8f}"
                 )
 
-    # Final evaluation and save predictions
-    print("\nFinal evaluation...")
-    final_mse, predictions_list = evaluate_model(model, test_ds, batch_size)
-    final_rmse = np.sqrt(final_mse)
-    print(f"Final Test RMSE: {final_rmse:.8f}")
+        # Final evaluation and save predictions
+        print("\nFinal evaluation...")
+        final_mse, predictions_list = evaluate_model(model, test_ds, batch_size)
+        final_rmse = np.sqrt(final_mse)
+        print(f"Final Test RMSE: {final_rmse:.8f}")
 
-    # Save predictions
-    predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
-    with open(predictions_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "model_type": model_type,
-                "final_mse": final_mse,
-                "num_predictions": len(predictions_list),
-                "predictions": [
-                    {
-                        "state": pred["state"].tolist(),
-                        "action": pred["action"].tolist(),
-                        "term": pred["term"].tolist(),
-                        "actual_reward": pred["actual_reward"],
-                        "predicted_reward": pred["predicted_reward"],
-                        "per_step_rewards": pred["per_step_rewards"],
-                        "per_step_predictions": pred["per_step_predictions"].tolist(),
-                    }
-                    for pred in predictions_list
-                ],
-            },
-            writable,
-            indent=2,
+        # Save predictions
+        predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
+        with open(predictions_file, "w", encoding="UTF-8") as writable:
+            json.dump(
+                {
+                    "model_type": model_type,
+                    "final_mse": final_mse,
+                    "num_predictions": len(predictions_list),
+                    "predictions": [
+                        {
+                            "state": pred["state"].tolist(),
+                            "action": pred["action"].tolist(),
+                            "term": pred["term"].tolist(),
+                            "actual_reward": pred["actual_reward"],
+                            "predicted_reward": pred["predicted_reward"],
+                            "per_step_rewards": pred["per_step_rewards"].tolist(),
+                            "per_step_predictions": pred[
+                                "per_step_predictions"
+                            ].tolist(),
+                        }
+                        for pred in predictions_list
+                    ],
+                },
+                writable,
+                indent=2,
+            )
+        print(f"Predictions saved to {predictions_file}")
+
+        # Save training metrics
+        metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
+        with open(metrics_file, "w", encoding="UTF-8") as writable:
+            json.dump(
+                {
+                    "model_type": model_type,
+                    "train_losses": train_losses,
+                    "eval_losses": eval_losses,
+                    "final_mse": final_mse,
+                },
+                writable,
+                indent=2,
+            )
+        print(f"Training metrics saved to {metrics_file}")
+
+        # Save model
+        model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
+        torch.save(model.state_dict(), model_file)
+        print(f"Model saved to {model_file}")
+
+        # Save config
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.shape[0]
+        config_file = pathlib.Path(output_dir) / "config.json"
+        hparams = {
+            "spec": SPEC,
+            "model_type": model_type,
+            "env_name": env.spec.id if hasattr(env, "spec") and env.spec else "unknown",
+            "state_dim": obs_dim,
+            "action_dim": act_dim,
+            "batch_size": batch_size,
+            "eval_steps": eval_steps,
+            "hidden_dim": 256,
+        }
+        with open(config_file, "w", encoding="UTF-8") as writable:
+            json.dump(
+                hparams,
+                writable,
+                indent=2,
+            )
+        print(f"Config saved to {config_file}")
+
+        # Save config and final metrics
+        summary_writer.add_hparams(
+            hparam_dict=hparams,
+            metric_dict={"MSE/eval": final_mse, "RMSE/eval": final_rmse},
         )
-    print(f"Predictions saved to {predictions_file}")
-
-    # Save training metrics
-    metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
-    with open(metrics_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "model_type": model_type,
-                "train_losses": train_losses,
-                "eval_losses": eval_losses,
-                "final_mse": final_mse,
-            },
-            writable,
-            indent=2,
+        # Create sample input for graph tracing
+        sample_input = (
+            # state
+            torch.zeros(1, 1, obs_dim),
+            # action
+            torch.zeros(1, 1, act_dim),
+            # term
+            torch.zeros(1, 1, 1),
         )
-    print(f"Training metrics saved to {metrics_file}")
-
-    # Save model
-    model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
-    torch.save(model.state_dict(), model_file)
-    print(f"Model saved to {model_file}")
-
-    # Save config
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    config_file = pathlib.Path(output_dir) / "config.json"
-    with open(config_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "spec": SPEC,
-                "model_type": model_type,
-                "env_name": env.spec.id
-                if hasattr(env, "spec") and env.spec
-                else "unknown",
-                "state_dim": obs_dim,
-                "action_dim": act_dim,
-                "batch_size": batch_size,
-                "eval_steps": eval_steps,
-                "hidden_dim": 256,
-                "timestamp": int(pathlib.Path(output_dir).name),
-            },
-            writable,
-            indent=2,
-        )
-    print(f"Config saved to {config_file}")
+        summary_writer.add_graph(model, sample_input)
 
     return final_mse, predictions_list
 
@@ -473,13 +484,13 @@ def main():
     parser.add_argument(
         "--train-epochs",
         type=int,
-        default=1000,
+        default=100,
         help="Number of epochs to train",
     )
     parser.add_argument(
         "--num-steps",
         type=int,
-        default=100_000,
+        default=100,
         help="Number of steps to collect",
     )
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
