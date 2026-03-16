@@ -363,7 +363,6 @@ def train(
     criterion = nn.MSELoss()
 
     # Training Loop
-    global_step = 0
     train_losses = []
     eval_losses = []
 
@@ -393,12 +392,13 @@ def train(
                 optimizer.step()
 
                 epoch_losses.append(loss.item())
-                global_step += 1
 
             avg_train_loss = np.mean(epoch_losses)
             train_losses.append(avg_train_loss)
             # Epoch results
-            summary_writer.add_scalar("Loss/train", loss, global_step=epoch)
+            summary_writer.add_scalar(
+                "Loss/train", np.mean(epoch_losses), global_step=epoch
+            )
 
             # Evaluation using Markovian predictions
             if (epoch + 1) % log_episode_frequency == 0:
@@ -414,8 +414,12 @@ def train(
                 train_rmse = np.sqrt(avg_train_loss)
                 eval_rmse = np.sqrt(eval_mse)
                 # Epoch results
-                summary_writer.add_scalar("MSE/eval", eval_mse, global_step=epoch)
-                summary_writer.add_scalar("RMSE/eval", eval_rmse, global_step=epoch)
+                summary_writer.add_scalar(
+                    "MSE/eval", np.mean(eval_losses), global_step=epoch
+                )
+                summary_writer.add_scalar(
+                    "RMSE/eval", np.mean(np.sqrt(eval_losses)), global_step=epoch
+                )
                 print(
                     f"Epoch [{epoch + 1}/{train_epochs}], Train RMSE: {train_rmse:.8f}, Eval RMSE: {eval_rmse:.8f}"
                 )
@@ -474,7 +478,7 @@ def train(
         # Save config and final metrics
         summary_writer.add_hparams(
             hparam_dict=hparams,
-            metric_dict={"MSE/eval": final_mse, "RMSE/eval": final_rmse},
+            metric_dict={"MSE": final_mse, "RMSE": final_rmse},
         )
         # Create sample input for graph tracing
         sample_input = (
