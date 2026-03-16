@@ -25,6 +25,7 @@ to match the delayed aggregate reward signal.
 
 import argparse
 import dataclasses
+import io
 import json
 import logging
 import os
@@ -510,8 +511,13 @@ def train(
 
         # Save model
         model_file = os.path.join(output_dir, f"model_{model_type}.pt")
+        # torch.save requires a real file path, not a file handle
+        # First save to temporary buffer, then write to GFile
+        buffer = io.BytesIO()
+        torch.save(model.state_dict(), buffer)
+        buffer.seek(0)
         with tf.io.gfile.GFile(model_file, "wb") as writable:
-            torch.save(model.state_dict(), writable)
+            writable.write(buffer.read())
         logging.info("Model saved to %s", model_file)
 
         # Save config and metrics

@@ -7,13 +7,15 @@ Loads saved models from est_o1.py and evaluates them in two modes:
 """
 
 import argparse
+import io
 import json
-import pathlib
+import os
 import typing
 from typing import Any, Dict
 
 import gymnasium as gym
 import numpy as np
+import tensorflow as tf
 import torch
 from torch import nn
 
@@ -31,11 +33,11 @@ def load_config(output_dir: str) -> Dict[str, Any]:
     Returns:
         Configuration dictionary
     """
-    config_path = pathlib.Path(output_dir) / "config.json"
-    if not config_path.exists():
+    config_path = os.path.join(output_dir, "config.json")
+    if not tf.io.gfile.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(config_path, "r", encoding="UTF-8") as readable:
+    with tf.io.gfile.GFile(config_path, "r") as readable:
         config = typing.cast(Dict[str, Any], json.load(readable))
 
     return config
@@ -70,16 +72,17 @@ def load_model(
             state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim
         )
     else:
-        raise ValueError(
-            f"Unknown model_type: {model_type}. Use 'mlp', 'rnn', or 'transformer'."
-        )
+        raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
     # Load state dict
-    model_path_obj = pathlib.Path(model_path)
-    if not model_path_obj.exists():
+    if not tf.io.gfile.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    checkpoint = torch.load(model_path_obj, map_location=device, weights_only=False)
+    # Load from GFile into BytesIO buffer for torch.load compatibility
+    with tf.io.gfile.GFile(model_path, "rb") as readable:
+        buffer = io.BytesIO(readable.read())
+    buffer.seek(0)
+    checkpoint = torch.load(buffer, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()
@@ -99,11 +102,10 @@ def evaluate_from_predictions_file(
         predictions_path: Path to predictions_{model_type}.json
         num_examples: Number of examples to display (default: 10)
     """
-    predictions_path_obj = pathlib.Path(predictions_path)
-    if not predictions_path_obj.exists():
+    if not tf.io.gfile.exists(predictions_path):
         raise FileNotFoundError(f"Predictions file not found: {predictions_path}")
 
-    with open(predictions_path_obj, "r", encoding="UTF-8") as readable:
+    with tf.io.gfile.GFile(predictions_path, "r") as readable:
         data = json.load(readable)
 
     predictions = data["predictions"]
@@ -347,16 +349,16 @@ def main():
 
     if args.mode == "predictions":
         # Evaluate from predictions file
-        predictions_path = (
-            pathlib.Path(args.model_dir) / f"predictions_{args.model_type}.json"
+        predictions_path = os.path.join(
+            args.model_dir, f"predictions_{args.model_type}.json"
         )
-        evaluate_from_predictions_file(str(predictions_path), args.num_examples)
+        evaluate_from_predictions_file(predictions_path, args.num_examples)
 
     elif args.mode == "interactive":
         # Load model
-        model_path = pathlib.Path(args.model_dir) / f"model_{args.model_type}.pt"
+        model_path = os.path.join(args.model_dir, f"model_{args.model_type}.pt")
         model = load_model(
-            str(model_path),
+            model_path,
             model_type=args.model_type,
             state_dim=config["state_dim"],
             action_dim=config["action_dim"],
