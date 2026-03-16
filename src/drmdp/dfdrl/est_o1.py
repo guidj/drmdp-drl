@@ -28,13 +28,13 @@ import dataclasses
 import json
 import logging
 import os
-import pathlib
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
 import ray
+import tensorflow as tf
 import torch
 from torch import nn, optim
 from torch.utils import data, tensorboard
@@ -334,8 +334,8 @@ def save_config_and_metrics(
     act_dim = env.action_space.shape[0]
 
     # Save training metrics
-    metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
-    with open(metrics_file, "w", encoding="UTF-8") as writable:
+    metrics_file = os.path.join(output_dir, f"metrics_{model_type}.json")
+    with tf.io.gfile.GFile(metrics_file, "w") as writable:
         json.dump(
             {
                 "model_type": model_type,
@@ -349,7 +349,7 @@ def save_config_and_metrics(
     logging.info("Training metrics saved to %s", metrics_file)
 
     # Save config
-    config_file = pathlib.Path(output_dir) / "config.json"
+    config_file = os.path.join(output_dir, "config.json")
     hparams = {
         "spec": SPEC,
         "model_type": model_type,
@@ -360,7 +360,7 @@ def save_config_and_metrics(
         "eval_steps": eval_steps,
         "hidden_dim": 256,
     }
-    with open(config_file, "w", encoding="UTF-8") as writable:
+    with tf.io.gfile.GFile(config_file, "w") as writable:
         json.dump(
             hparams,
             writable,
@@ -481,8 +481,8 @@ def train(
         logging.info("Final Test RMSE: %.8f", final_rmse)
 
         # Save predictions
-        predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
-        with open(predictions_file, "w", encoding="UTF-8") as writable:
+        predictions_file = os.path.join(output_dir, f"predictions_{model_type}.json")
+        with tf.io.gfile.GFile(predictions_file, "w") as writable:
             json.dump(
                 {
                     "model_type": model_type,
@@ -509,7 +509,7 @@ def train(
         logging.info("Predictions saved to %s", predictions_file)
 
         # Save model
-        model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
+        model_file = os.path.join(output_dir, f"model_{model_type}.pt")
         torch.save(model.state_dict(), model_file)
         logging.info("Model saved to %s", model_file)
 
@@ -573,17 +573,21 @@ def run_fn(args: TrainingArgs):
     if args.model_type == "mlp":
         logging.info("=" * 80)
         logging.info("Training MLP")
-        train(
-            env,
-            dataset=dataset,
-            train_epochs=args.train_epochs,
-            batch_size=args.batch_size,
-            eval_steps=args.eval_steps,
-            model_type=args.model_type,
-            log_episode_frequency=args.log_episode_frequency,
-            output_dir=args.output_dir,
-            seed=args.seed,
-        )
+        try:
+            train(
+                env,
+                dataset=dataset,
+                train_epochs=args.train_epochs,
+                batch_size=args.batch_size,
+                eval_steps=args.eval_steps,
+                model_type=args.model_type,
+                log_episode_frequency=args.log_episode_frequency,
+                output_dir=args.output_dir,
+                seed=args.seed,
+            )
+        except Exception as err:
+            logging.error("Error in task %s: %s", args.seed, err)
+            raise RuntimeError(f"Experiment {args.seed} failed") from err
 
 
 def main():
