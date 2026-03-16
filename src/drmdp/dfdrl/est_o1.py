@@ -25,6 +25,7 @@ to match the delayed aggregate reward signal.
 
 import argparse
 import json
+import logging
 import pathlib
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple
@@ -303,7 +304,7 @@ def save_config_and_metrics(
             writable,
             indent=2,
         )
-    print(f"Training metrics saved to {metrics_file}")
+    logging.info("Training metrics saved to %s", metrics_file)
 
     # Save config
     config_file = pathlib.Path(output_dir) / "config.json"
@@ -323,7 +324,7 @@ def save_config_and_metrics(
             writable,
             indent=2,
         )
-    print(f"Config saved to {config_file}")
+    logging.info("Config saved to %s", config_file)
     return hparams
 
 
@@ -358,7 +359,7 @@ def train(
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
-    print(f"Training with {model_type.upper()} model")
+    logging.info("Training with %s model", model_type.upper())
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
 
@@ -420,15 +421,19 @@ def train(
                 summary_writer.add_scalar(
                     "RMSE/eval", np.mean(np.sqrt(eval_losses)), global_step=epoch
                 )
-                print(
-                    f"Epoch [{epoch + 1}/{train_epochs}], Train RMSE: {train_rmse:.8f}, Eval RMSE: {eval_rmse:.8f}"
+                logging.info(
+                    "Epoch [%d/%d], Train RMSE: %.8f, Eval RMSE: %.8f",
+                    epoch + 1,
+                    train_epochs,
+                    train_rmse,
+                    eval_rmse,
                 )
 
         # Final evaluation and save predictions
-        print("\nFinal evaluation...")
+        logging.info("Final evaluation...")
         final_mse, predictions_list = evaluate_model(model, test_ds, batch_size)
         final_rmse = np.sqrt(final_mse)
-        print(f"Final Test RMSE: {final_rmse:.8f}")
+        logging.info("Final Test RMSE: %.8f", final_rmse)
 
         # Save predictions
         predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
@@ -456,12 +461,12 @@ def train(
                 writable,
                 indent=2,
             )
-        print(f"Predictions saved to {predictions_file}")
+        logging.info("Predictions saved to %s", predictions_file)
 
         # Save model
         model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
         torch.save(model.state_dict(), model_file)
-        print(f"Model saved to {model_file}")
+        logging.info("Model saved to %s", model_file)
 
         # Save config and metrics
         hparams = save_config_and_metrics(
@@ -495,6 +500,48 @@ def train(
 
 
 def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+
+    # Create environment
+    env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
+    logging.info("Environment: %s", args.env)
+    logging.info("Observation space: %s", env.observation_space)
+    logging.info("Action space: %s", env.action_space)
+
+    # Create delay and training buffer
+    delay = rewdelay.FixedDelay(args.delay)
+    _, max_delay = delay.range()
+    logging.info(
+        "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
+    )
+    training_buffer = create_training_buffer(
+        env, delay=delay, num_steps=args.num_steps * max_delay
+    )
+    logging.info("Created %d training examples", len(training_buffer))
+
+    # Create dataset
+    inputs, labels = zip(*training_buffer)
+    # Labels are dicts - pass them as-is
+    dataset = DictDataset(data.default_collate(inputs), list(labels))
+
+    # Train model(s)
+    if args.model_type == "mlp":
+        logging.info("=" * 80)
+        logging.info("Training MLP")
+        train(
+            env,
+            dataset=dataset,
+            train_epochs=args.train_epochs,
+            batch_size=args.batch_size,
+            eval_steps=args.eval_steps,
+            model_type=args.model_type,
+            log_episode_frequency=args.log_episode_frequency,
+            output_dir=args.output_dir,
+        )
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
         description="Train reward prediction models for delayed feedback"
     )
@@ -556,41 +603,7 @@ def main():
     )
 
     args, _ = parser.parse_known_args()
-
-    # Create environment
-    env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
-    print(f"Environment: {args.env}")
-    print(f"Observation space: {env.observation_space}")
-    print(f"Action space: {env.action_space}")
-
-    # Create delay and training buffer
-    delay = rewdelay.FixedDelay(args.delay)
-    _, max_delay = delay.range()
-    print(f"\nCollecting {args.num_steps * max_delay} steps with delay={args.delay}...")
-    training_buffer = create_training_buffer(
-        env, delay=delay, num_steps=args.num_steps * max_delay
-    )
-    print(f"Created {len(training_buffer)} training examples")
-
-    # Create dataset
-    inputs, labels = zip(*training_buffer)
-    # Labels are dicts - pass them as-is
-    dataset = DictDataset(data.default_collate(inputs), list(labels))
-
-    # Train model(s)
-    if args.model_type == "mlp":
-        print("\n" + "=" * 80)
-        print("Training MLP")
-        train(
-            env,
-            dataset=dataset,
-            train_epochs=args.train_epochs,
-            batch_size=args.batch_size,
-            eval_steps=args.eval_steps,
-            model_type=args.model_type,
-            log_episode_frequency=args.log_episode_frequency,
-            output_dir=args.output_dir,
-        )
+    return args
 
 
 if __name__ == "__main__":
