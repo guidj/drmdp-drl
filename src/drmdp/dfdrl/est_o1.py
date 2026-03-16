@@ -26,14 +26,14 @@ to match the delayed aggregate reward signal.
 import argparse
 import json
 import pathlib
-import time
+import tempfile
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
 import torch
 from torch import nn, optim
-from torch.utils import data
+from torch.utils import data, tensorboard
 
 from drmdp import dataproc, rewdelay
 
@@ -272,8 +272,10 @@ def evaluate_model(
 def train(
     env: gym.Env,
     dataset: data.Dataset,
+    train_epochs: int,
     batch_size: int,
     eval_steps: int,
+    log_episode_frequency: int,
     model_type: str = "mlp",
     output_dir: str = "outputs",
 ):
@@ -296,65 +298,69 @@ def train(
     if model_type == "mlp":
         model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
     else:
-        raise ValueError(
-            f"Unknown model_type: {model_type}. Use 'mlp', 'rnn', or 'transformer'."
-        )
+        raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
     print(f"Training with {model_type.upper()} model")
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
 
     # Training Loop
-    epochs = 1000
+    global_step = 0
     train_losses = []
     eval_losses = []
 
-    for epoch in range(epochs):
-        train_dataloader = data.DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True
-        )
-
-        # Training
-        epoch_losses = []
-        for inputs, labels in train_dataloader:
-            # Forward pass (models handle zero stub internally for RNN/Transformer)
-            outputs = model(**inputs)
-
-            # Calculate loss for each seq in batch
-            # outputs shape: (batch_size, seq_len, 1)
-            window_reward = torch.squeeze(torch.sum(outputs, dim=1))
-
-            # Extract aggregate rewards from batched label dict
-            # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
-            aggregate_rewards = labels["aggregate_reward"].float()
-            loss = criterion(window_reward, aggregate_rewards)
-
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_losses.append(loss.item())
-
-        avg_train_loss = np.mean(epoch_losses)
-        train_losses.append(avg_train_loss)
-
-        # Evaluation using Markovian predictions
-        if (epoch + 1) % 5 == 0:
-            eval_mse, _ = evaluate_model(
-                model,
-                test_ds,
-                batch_size=batch_size,
-                collect_predictions=False,
-                max_batches=eval_steps,
-                shuffle=True,
+    with tensorboard.SummaryWriter(log_dir=output_dir) as summary_writer:
+        for epoch in range(train_epochs):
+            train_dataloader = data.DataLoader(
+                train_ds, batch_size=batch_size, shuffle=True
             )
-            eval_losses.append(eval_mse)
-            train_rmse = np.sqrt(avg_train_loss)
-            eval_rmse = np.sqrt(eval_mse)
-            print(
-                f"Epoch [{epoch + 1}/{epochs}], Train RMSE: {train_rmse:.8f}, Eval RMSE: {eval_rmse:.8f}"
-            )
+            # Training
+            epoch_losses = []
+            for inputs, labels in train_dataloader:
+                # Forward pass (models handle zero stub internally for RNN/Transformer)
+                outputs = model(**inputs)
+
+                # Calculate loss for each seq in batch
+                # outputs shape: (batch_size, seq_len, 1)
+                window_reward = torch.squeeze(torch.sum(outputs, dim=1))
+
+                # Extract aggregate rewards from batched label dict
+                # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
+                aggregate_rewards = labels["aggregate_reward"].float()
+                loss = criterion(window_reward, aggregate_rewards)
+
+                # Backward and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+                global_step += 1
+
+            avg_train_loss = np.mean(epoch_losses)
+            train_losses.append(avg_train_loss)
+            # Epoch results
+            summary_writer.add_scalar("Loss/train", loss, global_step=epoch)
+
+            # Evaluation using Markovian predictions
+            if (epoch + 1) % log_episode_frequency == 0:
+                eval_mse, _ = evaluate_model(
+                    model,
+                    test_ds,
+                    batch_size=batch_size,
+                    collect_predictions=False,
+                    max_batches=eval_steps,
+                    shuffle=True,
+                )
+                eval_losses.append(eval_mse)
+                train_rmse = np.sqrt(avg_train_loss)
+                eval_rmse = np.sqrt(eval_mse)
+                # Epoch results
+                summary_writer.add_scalar("MSE/eval", eval_mse, global_step=epoch)
+                summary_writer.add_scalar("RMSE/eval", eval_rmse, global_step=epoch)
+                print(
+                    f"Epoch [{epoch + 1}/{train_epochs}], Train RMSE: {train_rmse:.8f}, Eval RMSE: {eval_rmse:.8f}"
+                )
 
     # Final evaluation and save predictions
     print("\nFinal evaluation...")
@@ -362,11 +368,8 @@ def train(
     final_rmse = np.sqrt(final_mse)
     print(f"Final Test RMSE: {final_rmse:.8f}")
 
-    # Save results
-    output_path = create_timestamped_output_dir(output_dir)
-
     # Save predictions
-    predictions_file = output_path / f"predictions_{model_type}.json"
+    predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
     with open(predictions_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
@@ -392,7 +395,7 @@ def train(
     print(f"Predictions saved to {predictions_file}")
 
     # Save training metrics
-    metrics_file = output_path / f"metrics_{model_type}.json"
+    metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
     with open(metrics_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
@@ -407,14 +410,14 @@ def train(
     print(f"Training metrics saved to {metrics_file}")
 
     # Save model
-    model_file = output_path / f"model_{model_type}.pt"
+    model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
     torch.save(model.state_dict(), model_file)
     print(f"Model saved to {model_file}")
 
     # Save config
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
-    config_file = output_path / "config.json"
+    config_file = pathlib.Path(output_dir) / "config.json"
     with open(config_file, "w", encoding="UTF-8") as writable:
         json.dump(
             {
@@ -428,7 +431,7 @@ def train(
                 "batch_size": batch_size,
                 "eval_steps": eval_steps,
                 "hidden_dim": 256,
-                "timestamp": int(output_path.name),
+                "timestamp": int(pathlib.Path(output_dir).name),
             },
             writable,
             indent=2,
@@ -436,14 +439,6 @@ def train(
     print(f"Config saved to {config_file}")
 
     return final_mse, predictions_list
-
-
-def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
-    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
-    timestamp = int(time.time())
-    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
-    output_path.mkdir(parents=True, exist_ok=True)
-    return output_path
 
 
 def main():
@@ -454,50 +449,60 @@ def main():
         "--model-type",
         type=str,
         default="mlp",
-        choices=["mlp", "all"],
-        help="Model architecture to train (default: mlp). Use 'all' to train all models.",
+        choices=["mlp"],
+        help="Model architecture to train",
     )
     parser.add_argument(
         "--env",
         type=str,
         default="MountainCarContinuous-v0",
-        help="Gymnasium environment (default: MountainCarContinuous-v0)",
+        help="Gymnasium environment",
     )
     parser.add_argument(
         "--max-episode-steps",
         type=int,
         default=2500,
-        help="Maximum steps per episode (default: 2500)",
+        help="Maximum steps per episode",
     )
     parser.add_argument(
         "--delay",
         type=int,
         default=3,
-        help="Fixed delay for reward feedback (default: 3)",
+        help="Fixed delay for reward feedback",
+    )
+    parser.add_argument(
+        "--train-epochs",
+        type=int,
+        default=1000,
+        help="Number of epochs to train",
     )
     parser.add_argument(
         "--num-steps",
         type=int,
         default=100_000,
-        help="Number of steps to collect (default: 100000)",
+        help="Number of steps to collect",
     )
-    parser.add_argument(
-        "--batch-size", type=int, default=64, help="Batch size (default: 64)"
-    )
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument(
         "--eval-steps",
         type=int,
         default=20,
-        help="Number of evaluation steps (default: 20)",
+        help="Number of evaluation steps",
+    )
+    parser.add_argument(
+        "--log-episode-frequency",
+        type=int,
+        default=5,
+        help="Number of evaluation steps",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="outputs",
-        help="Output directory for results (default: outputs)",
+        default=tempfile.gettempdir(),
+        help="Output directory for results",
     )
 
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
@@ -520,38 +525,17 @@ def main():
     dataset = DictDataset(data.default_collate(inputs), list(labels))
 
     # Train model(s)
-    if args.model_type == "all":
+    if args.model_type == "mlp":
         print("\n" + "=" * 80)
-        print("Training all model types...")
-        print("=" * 80)
-        results = {}
-        for model_type in ["mlp", "rnn", "transformer"]:
-            print(f"\n{'=' * 80}")
-            print(f"Training {model_type.upper()} model")
-            print("=" * 80)
-            final_mse, _ = train(
-                env,
-                dataset=dataset,
-                batch_size=args.batch_size,
-                eval_steps=args.eval_steps,
-                model_type=model_type,
-                output_dir=args.output_dir,
-            )
-            results[model_type] = final_mse
-
-        print("\n" + "=" * 80)
-        print("FINAL RESULTS")
-        print("=" * 80)
-        for model_type, mse in results.items():
-            rmse = np.sqrt(mse)
-            print(f"{model_type.upper():15s}: RMSE = {rmse:.8f}")
-    else:
+        print("Training MLP")
         train(
             env,
             dataset=dataset,
+            train_epochs=args.train_epochs,
             batch_size=args.batch_size,
             eval_steps=args.eval_steps,
             model_type=args.model_type,
+            log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
         )
 
