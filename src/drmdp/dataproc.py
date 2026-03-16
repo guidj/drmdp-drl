@@ -7,11 +7,11 @@ import pandas as pd
 import ray
 import ray.data
 
-MAPPERS_NAMES = {}
+MAPPERS_NAMES: Mapping[str, str] = {}
 
-POLICY_TYPES = {}
+POLICY_TYPES: Mapping[str, str] = {}
 
-ORDERED_METHODS = []
+ORDERED_METHODS: Sequence[str] = []
 
 
 def collection_traj_data(
