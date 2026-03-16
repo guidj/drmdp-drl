@@ -132,8 +132,25 @@ def create_training_buffer(
 
 def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     """
-    Creates a dataset where each sample corresponds to.
-    Assumes actions are continuous or intended to be used as is.
+    Creates a dataset of delayed reward sequences from trajectory buffer.
+
+    Converts raw trajectory data into training examples where rewards are delayed
+    according to the specified delay distribution. Each example consists of a
+    sequence of (state, action, term) tuples with corresponding aggregate and
+    per-step rewards.
+
+    Args:
+        buffer: List of trajectory tuples (state, action, next_state, reward, term)
+        delay: RewardDelay object that determines how many steps to aggregate
+
+    Returns:
+        List of tuples (inputs, labels) where:
+            - inputs: Dict with batched tensors of 'state', 'action', 'term'
+            - labels: Dict with 'aggregate_reward' (sum) and 'per_step_rewards' (list)
+
+    Note:
+        Assumes actions are continuous or intended to be used as is.
+        Sequences shorter than the sampled delay are discarded.
     """
 
     def create_traj_step(state, action, reward, term):

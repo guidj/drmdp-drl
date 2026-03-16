@@ -7,28 +7,11 @@ import pandas as pd
 import ray
 import ray.data
 
-MAPPERS_NAMES = {
-    "identity": "FR",
-    "impute-missing": "IMR",
-    # backwards compatibility
-    "zero-impute": "IMR",
-    "least-lfa": "BLADE-TD[N-B]",
-    "bayes-least-lfa": "BLADE-TD",
-    # backwards compatibility
-    "least-bayes-lfa": "BLADE-TD",
-    "cvlps": "L-TDD[CV]",
-    "recurring-cvlps": "L-TDD[CV-R]",
-    "discrete-least-lfa": "LEAST",
-}
+MAPPERS_NAMES = {}
 
-POLICY_TYPES = {
-    "drop-missing": "DMR",
-    "markovian": "PP",
-    "options": "OP-A",
-    "single-action-options": "OP-S",
-}
+POLICY_TYPES = {}
 
-ORDERED_METHODS = ["BLADE-TD", "BLADE-TD[N-B]", "IMR", "OP-A", "OP-S", "DMR", "FR"]
+ORDERED_METHODS = []
 
 
 def collection_traj_data(

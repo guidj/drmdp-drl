@@ -2,7 +2,6 @@
 This module defines core abstractions and types.
 """
 
-import abc
 import dataclasses
 from typing import (
     Any,
@@ -42,77 +41,6 @@ class PolicyStep:
     action: ActType
     state: Any
     info: Mapping[str, Any]
-
-
-class PyPolicy(abc.ABC):
-    """
-    Base class for python policies.
-    """
-
-    def __init__(
-        self,
-        action_space: gym.Space,
-        emit_log_probability: bool = False,
-        seed: Optional[int] = None,
-    ):
-        self.action_space = action_space
-        self.emit_log_probability = emit_log_probability
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
-
-    @abc.abstractmethod
-    def get_initial_state(self, batch_size: Optional[int] = None) -> Any:
-        """Returns an initial state usable by the policy.
-
-        Args:
-          batch_size: An optional batch size.
-
-        Returns:
-          An initial policy state.
-        """
-
-    @abc.abstractmethod
-    def action(
-        self,
-        observation: ObsType,
-        epsilon: float = 0.0,
-        policy_state: Any = (),
-    ) -> PolicyStep:
-        """Implementation of `action`.
-
-        Args:
-          observation: An observation.
-          policy_state: An Array, or a nested dict, list or tuple of Arrays
-            representing the previous policy state.
-          seed: Seed to use when choosing action. Impl specific.
-
-        Returns:
-          A `PolicyStep` named tuple containing:
-            `action`: The policy's chosen action.
-            `state`: A policy state to be fed into the next call to action.
-            `info`: Optional side information such as action log probabilities.
-        """
-
-
-class PyValueFnPolicy(PyPolicy):
-    @abc.abstractmethod
-    def action_values_gradients(self, observation: ObsType, actions: Sequence[ActType]):
-        """
-        Value for multiple actions
-        """
-
-    @abc.abstractmethod
-    def step(self, action: ActType, scaled_gradients):
-        """
-        Updates the policy's value
-        """
-
-    @property
-    @abc.abstractmethod
-    def model(self):
-        """
-        Model backing the policy.
-        """
 
 
 @dataclasses.dataclass(frozen=True)
