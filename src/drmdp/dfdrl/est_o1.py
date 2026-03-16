@@ -24,22 +24,43 @@ to match the delayed aggregate reward signal.
 """
 
 import argparse
+import dataclasses
 import json
 import logging
+import os
 import pathlib
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
+import ray
 import torch
 from torch import nn, optim
 from torch.utils import data, tensorboard
 
-from drmdp import dataproc, rewdelay
+from drmdp import dataproc, ray_utils, rewdelay
 
 # Spec version identifier
 SPEC = "o1"
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainingArgs:
+    """Arguments for training reward prediction models."""
+
+    model_type: str
+    env: str
+    max_episode_steps: int
+    delay: int
+    train_epochs: int
+    num_steps: int
+    batch_size: int
+    eval_steps: int
+    log_episode_frequency: int
+    output_dir: str
+    num_runs: int
+    seed: Optional[int] = None
 
 
 class RNetwork(nn.Module):
@@ -97,11 +118,15 @@ class DictDataset(data.Dataset):
         return {key: self.inputs[key][idx] for key in self.inputs}, self.labels[idx]
 
 
-def create_training_buffer(env, delay: rewdelay.RewardDelay, num_steps: int):
+def create_training_buffer(
+    env, delay: rewdelay.RewardDelay, num_steps: int, seed: Optional[int] = None
+):
     """
     Collects example of (s,a,s',r,d) from an environment.
     """
-    buffer = dataproc.collection_traj_data(env, steps=num_steps, include_term=True)
+    buffer = dataproc.collection_traj_data(
+        env, steps=num_steps, include_term=True, seed=seed
+    )
     return delayed_reward_data(buffer, delay=delay)
 
 
@@ -335,6 +360,7 @@ def train(
     batch_size: int,
     eval_steps: int,
     log_episode_frequency: int,
+    seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
 ):
@@ -349,6 +375,8 @@ def train(
         model_type: Type of model to use ("mlp", "rnn", or "transformer")
         output_dir: Directory to save predictions and results
     """
+    logging.info("Training with seed: %s", seed)
+    torch.manual_seed(seed if seed is not None else 127)
     train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -499,10 +527,9 @@ def train(
     return final_mse, predictions_list
 
 
-def main():
-    args = parse_args()
+@ray.remote
+def run_fn(args: TrainingArgs):
     logging.basicConfig(level=logging.INFO)
-
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
     logging.info("Environment: %s", args.env)
@@ -516,7 +543,7 @@ def main():
         "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
     )
     training_buffer = create_training_buffer(
-        env, delay=delay, num_steps=args.num_steps * max_delay
+        env, delay=delay, num_steps=args.num_steps * max_delay, seed=args.seed
     )
     logging.info("Created %d training examples", len(training_buffer))
 
@@ -538,10 +565,27 @@ def main():
             model_type=args.model_type,
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
+            seed=args.seed,
         )
 
 
-def parse_args():
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+
+    with ray.init():
+        tasks = []
+        for seed in range(args.num_runs):
+            seed_output_path = os.path.join(args.output_dir, str(seed))
+            seed_args = dataclasses.replace(
+                args, output_dir=seed_output_path, seed=seed
+            )
+            tasks.append(run_fn.remote(seed_args))
+
+        ray_utils.wait_till_completion(tasks)
+
+
+def parse_args() -> TrainingArgs:
     parser = argparse.ArgumentParser(
         description="Train reward prediction models for delayed feedback"
     )
@@ -601,9 +645,15 @@ def parse_args():
         default=tempfile.gettempdir(),
         help="Output directory for results",
     )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of runs - with their own seed.",
+    )
 
     args, _ = parser.parse_known_args()
-    return args
+    return TrainingArgs(**vars(args))
 
 
 if __name__ == "__main__":
