@@ -561,7 +561,7 @@ def run_fn(args: TrainingArgs):
     logging.info("Action space: %s", env.action_space)
 
     # Create delay and training buffer
-    delay = rewdelay.FixedDelay(args.delay)
+    delay = rewdelay.ClippedPoissonDelay(args.delay)
     _, max_delay = delay.range()
     logging.info(
         "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
