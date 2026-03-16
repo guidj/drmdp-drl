@@ -264,6 +264,69 @@ def evaluate_model(
     return mse, predictions_list
 
 
+def save_config_and_metrics(
+    output_dir: str,
+    model_type: str,
+    env: gym.Env,
+    batch_size: int,
+    eval_steps: int,
+    train_losses: list,
+    eval_losses: list,
+    final_mse: float,
+):
+    """
+    Save configuration and training metrics to JSON files.
+
+    Args:
+        output_dir: Directory to save files
+        model_type: Type of model used
+        env: Gymnasium environment
+        batch_size: Batch size used in training
+        eval_steps: Number of evaluation steps
+        train_losses: List of training losses per epoch
+        eval_losses: List of evaluation losses
+        final_mse: Final mean squared error on test set
+    """
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    # Save training metrics
+    metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
+    with open(metrics_file, "w", encoding="UTF-8") as writable:
+        json.dump(
+            {
+                "model_type": model_type,
+                "train_losses": train_losses,
+                "eval_losses": eval_losses,
+                "final_mse": final_mse,
+            },
+            writable,
+            indent=2,
+        )
+    print(f"Training metrics saved to {metrics_file}")
+
+    # Save config
+    config_file = pathlib.Path(output_dir) / "config.json"
+    hparams = {
+        "spec": SPEC,
+        "model_type": model_type,
+        "env_name": env.spec.id if hasattr(env, "spec") and env.spec else "unknown",
+        "state_dim": obs_dim,
+        "action_dim": act_dim,
+        "batch_size": batch_size,
+        "eval_steps": eval_steps,
+        "hidden_dim": 256,
+    }
+    with open(config_file, "w", encoding="UTF-8") as writable:
+        json.dump(
+            hparams,
+            writable,
+            indent=2,
+        )
+    print(f"Config saved to {config_file}")
+    return hparams
+
+
 def train(
     env: gym.Env,
     dataset: data.Dataset,
@@ -391,47 +454,22 @@ def train(
             )
         print(f"Predictions saved to {predictions_file}")
 
-        # Save training metrics
-        metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
-        with open(metrics_file, "w", encoding="UTF-8") as writable:
-            json.dump(
-                {
-                    "model_type": model_type,
-                    "train_losses": train_losses,
-                    "eval_losses": eval_losses,
-                    "final_mse": final_mse,
-                },
-                writable,
-                indent=2,
-            )
-        print(f"Training metrics saved to {metrics_file}")
-
         # Save model
         model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
         torch.save(model.state_dict(), model_file)
         print(f"Model saved to {model_file}")
 
-        # Save config
-        obs_dim = env.observation_space.shape[0]
-        act_dim = env.action_space.shape[0]
-        config_file = pathlib.Path(output_dir) / "config.json"
-        hparams = {
-            "spec": SPEC,
-            "model_type": model_type,
-            "env_name": env.spec.id if hasattr(env, "spec") and env.spec else "unknown",
-            "state_dim": obs_dim,
-            "action_dim": act_dim,
-            "batch_size": batch_size,
-            "eval_steps": eval_steps,
-            "hidden_dim": 256,
-        }
-        with open(config_file, "w", encoding="UTF-8") as writable:
-            json.dump(
-                hparams,
-                writable,
-                indent=2,
-            )
-        print(f"Config saved to {config_file}")
+        # Save config and metrics
+        hparams = save_config_and_metrics(
+            output_dir=output_dir,
+            model_type=model_type,
+            env=env,
+            batch_size=batch_size,
+            eval_steps=eval_steps,
+            train_losses=train_losses,
+            eval_losses=eval_losses,
+            final_mse=final_mse,
+        )
 
         # Save config and final metrics
         summary_writer.add_hparams(
