@@ -49,7 +49,7 @@ class RNetwork(nn.Module):
     """
 
     def __init__(
-        self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
+        self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
         super().__init__()
         self.layers = []
@@ -60,6 +60,7 @@ class RNetwork(nn.Module):
         output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
         for _ in range(self.num_hidden_layers):
             self.layers.append(nn.Linear(input_dim, output_dim))
+            self.layers.append(nn.ReLU())
             input_dim = output_dim
         self.final_layer = nn.Linear(output_dim, 1)
 
@@ -78,6 +79,7 @@ class RNetwork(nn.Module):
         out = torch.flatten(out, start_dim=1)
         for layer in self.layers:
             out = layer(out)
+
         return self.final_layer(out)
 
 

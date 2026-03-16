@@ -25,28 +25,21 @@ to match the delayed aggregate reward signal.
 
 import argparse
 import json
+import logging
 import pathlib
-import time
+import tempfile
 from typing import Any, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
 import torch
 from torch import nn, optim
-from torch.utils import data
+from torch.utils import data, tensorboard
 
 from drmdp import dataproc, rewdelay
 
 # Spec version identifier
 SPEC = "o1"
-
-
-def create_timestamped_output_dir(base_dir: str) -> pathlib.Path:
-    """Create versioned timestamped output directory: {base_dir}/{SPEC}/{unix_timestamp}/"""
-    timestamp = int(time.time())
-    output_path = pathlib.Path(base_dir) / SPEC / str(timestamp)
-    output_path.mkdir(parents=True, exist_ok=True)
-    return output_path
 
 
 class RNetwork(nn.Module):
@@ -56,18 +49,20 @@ class RNetwork(nn.Module):
     """
 
     def __init__(
-        self, state_dim, action_dim, powers=2, num_hidden_layers=2, hidden_dim=256
+        self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
         super().__init__()
-        self.layers = []
-        self.powers = torch.tensor(range(powers)) + 1
+        self.register_buffer("powers", torch.tensor(range(powers)) + 1)
         self.num_hidden_layers = num_hidden_layers
         # +1 for term flag
         input_dim = (state_dim + action_dim + 1) * powers
         output_dim = hidden_dim if num_hidden_layers > 0 else input_dim
+        layers = []
         for _ in range(self.num_hidden_layers):
-            self.layers.append(nn.Linear(input_dim, output_dim))
+            layers.append(nn.Linear(input_dim, output_dim))
+            layers.append(nn.ReLU())
             input_dim = output_dim
+        self.layers = nn.ModuleList(layers)
         self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
@@ -133,8 +128,8 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
 
         # Return dict with both aggregate and per-step rewards
         label_dict = {
-            "aggregate_reward": aggregate_reward,
-            "per_step_rewards": per_step_rewards,
+            "aggregate_reward": torch.tensor(aggregate_reward),
+            "per_step_rewards": torch.tensor(per_step_rewards),
         }
 
         return data.default_collate(inputs), label_dict
@@ -246,13 +241,7 @@ def evaluate_model(
             # Optionally collect predictions for analysis
             if collect_predictions:
                 for idx in range(batch_size_actual):
-                    # Extract per-step rewards for this batch element
-                    # labels["per_step_rewards"] is a list of tensors, one per timestep
-                    per_step_rewards = [
-                        labels["per_step_rewards"][step_idx][idx].item()
-                        for step_idx in range(len(labels["per_step_rewards"]))
-                    ]
-
+                    per_step_rewards = labels["per_step_rewards"][idx].cpu().numpy()
                     predictions_list.append(
                         {
                             "state": inputs["state"][idx].cpu().numpy(),
@@ -276,11 +265,76 @@ def evaluate_model(
     return mse, predictions_list
 
 
+def save_config_and_metrics(
+    output_dir: str,
+    model_type: str,
+    env: gym.Env,
+    batch_size: int,
+    eval_steps: int,
+    train_losses: list,
+    eval_losses: list,
+    final_mse: float,
+):
+    """
+    Save configuration and training metrics to JSON files.
+
+    Args:
+        output_dir: Directory to save files
+        model_type: Type of model used
+        env: Gymnasium environment
+        batch_size: Batch size used in training
+        eval_steps: Number of evaluation steps
+        train_losses: List of training losses per epoch
+        eval_losses: List of evaluation losses
+        final_mse: Final mean squared error on test set
+    """
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    # Save training metrics
+    metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
+    with open(metrics_file, "w", encoding="UTF-8") as writable:
+        json.dump(
+            {
+                "model_type": model_type,
+                "train_losses": train_losses,
+                "eval_losses": eval_losses,
+                "final_mse": final_mse,
+            },
+            writable,
+            indent=2,
+        )
+    logging.info("Training metrics saved to %s", metrics_file)
+
+    # Save config
+    config_file = pathlib.Path(output_dir) / "config.json"
+    hparams = {
+        "spec": SPEC,
+        "model_type": model_type,
+        "env_name": env.spec.id if hasattr(env, "spec") and env.spec else "unknown",
+        "state_dim": obs_dim,
+        "action_dim": act_dim,
+        "batch_size": batch_size,
+        "eval_steps": eval_steps,
+        "hidden_dim": 256,
+    }
+    with open(config_file, "w", encoding="UTF-8") as writable:
+        json.dump(
+            hparams,
+            writable,
+            indent=2,
+        )
+    logging.info("Config saved to %s", config_file)
+    return hparams
+
+
 def train(
     env: gym.Env,
     dataset: data.Dataset,
+    train_epochs: int,
     batch_size: int,
     eval_steps: int,
+    log_episode_frequency: int,
     model_type: str = "mlp",
     output_dir: str = "outputs",
 ):
@@ -303,215 +357,168 @@ def train(
     if model_type == "mlp":
         model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
     else:
-        raise ValueError(
-            f"Unknown model_type: {model_type}. Use 'mlp', 'rnn', or 'transformer'."
-        )
+        raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
-    print(f"Training with {model_type.upper()} model")
+    logging.info("Training with %s model", model_type.upper())
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
 
     # Training Loop
-    epochs = 1000
     train_losses = []
     eval_losses = []
 
-    for epoch in range(epochs):
-        train_dataloader = data.DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True
-        )
-
-        # Training
-        epoch_losses = []
-        for inputs, labels in train_dataloader:
-            # Forward pass (models handle zero stub internally for RNN/Transformer)
-            outputs = model(**inputs)
-
-            # Calculate loss for each seq in batch
-            # outputs shape: (batch_size, seq_len, 1)
-            window_reward = torch.squeeze(torch.sum(outputs, dim=1))
-
-            # Extract aggregate rewards from batched label dict
-            # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
-            aggregate_rewards = labels["aggregate_reward"].float()
-            loss = criterion(window_reward, aggregate_rewards)
-
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_losses.append(loss.item())
-
-        avg_train_loss = np.mean(epoch_losses)
-        train_losses.append(avg_train_loss)
-
-        # Evaluation using Markovian predictions
-        if (epoch + 1) % 5 == 0:
-            eval_mse, _ = evaluate_model(
-                model,
-                test_ds,
-                batch_size=batch_size,
-                collect_predictions=False,
-                max_batches=eval_steps,
-                shuffle=True,
+    with tensorboard.SummaryWriter(log_dir=output_dir) as summary_writer:
+        for epoch in range(train_epochs):
+            train_dataloader = data.DataLoader(
+                train_ds, batch_size=batch_size, shuffle=True
             )
-            eval_losses.append(eval_mse)
-            train_rmse = np.sqrt(avg_train_loss)
-            eval_rmse = np.sqrt(eval_mse)
-            print(
-                f"Epoch [{epoch + 1}/{epochs}], Train RMSE: {train_rmse:.8f}, Eval RMSE: {eval_rmse:.8f}"
+            # Training
+            epoch_losses = []
+            for inputs, labels in train_dataloader:
+                # Forward pass (models handle zero stub internally for RNN/Transformer)
+                outputs = model(**inputs)
+
+                # Calculate loss for each seq in batch
+                # outputs shape: (batch_size, seq_len, 1)
+                window_reward = torch.squeeze(torch.sum(outputs, dim=1))
+
+                # Extract aggregate rewards from batched label dict
+                # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
+                aggregate_rewards = labels["aggregate_reward"].float()
+                loss = criterion(window_reward, aggregate_rewards)
+
+                # Backward and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+
+            avg_train_loss = np.mean(epoch_losses)
+            train_losses.append(avg_train_loss)
+            # Epoch results
+            summary_writer.add_scalar(
+                "Loss/train", np.mean(epoch_losses), global_step=epoch
             )
 
-    # Final evaluation and save predictions
-    print("\nFinal evaluation...")
-    final_mse, predictions_list = evaluate_model(model, test_ds, batch_size)
-    final_rmse = np.sqrt(final_mse)
-    print(f"Final Test RMSE: {final_rmse:.8f}")
+            # Evaluation using Markovian predictions
+            if (epoch + 1) % log_episode_frequency == 0:
+                eval_mse, _ = evaluate_model(
+                    model,
+                    test_ds,
+                    batch_size=batch_size,
+                    collect_predictions=False,
+                    max_batches=eval_steps,
+                    shuffle=True,
+                )
+                eval_losses.append(eval_mse)
+                train_rmse = np.sqrt(avg_train_loss)
+                eval_rmse = np.sqrt(eval_mse)
+                # Epoch results
+                summary_writer.add_scalar(
+                    "MSE/eval", np.mean(eval_losses), global_step=epoch
+                )
+                summary_writer.add_scalar(
+                    "RMSE/eval", np.mean(np.sqrt(eval_losses)), global_step=epoch
+                )
+                logging.info(
+                    "Epoch [%d/%d], Train RMSE: %.8f, Eval RMSE: %.8f",
+                    epoch + 1,
+                    train_epochs,
+                    train_rmse,
+                    eval_rmse,
+                )
 
-    # Save results
-    output_path = create_timestamped_output_dir(output_dir)
+        # Final evaluation and save predictions
+        logging.info("Final evaluation...")
+        final_mse, predictions_list = evaluate_model(model, test_ds, batch_size)
+        final_rmse = np.sqrt(final_mse)
+        logging.info("Final Test RMSE: %.8f", final_rmse)
 
-    # Save predictions
-    predictions_file = output_path / f"predictions_{model_type}.json"
-    with open(predictions_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "model_type": model_type,
-                "final_mse": final_mse,
-                "num_predictions": len(predictions_list),
-                "predictions": [
-                    {
-                        "state": pred["state"].tolist(),
-                        "action": pred["action"].tolist(),
-                        "term": pred["term"].tolist(),
-                        "actual_reward": pred["actual_reward"],
-                        "predicted_reward": pred["predicted_reward"],
-                        "per_step_rewards": pred["per_step_rewards"],
-                        "per_step_predictions": pred["per_step_predictions"].tolist(),
-                    }
-                    for pred in predictions_list
-                ],
-            },
-            writable,
-            indent=2,
+        # Save predictions
+        predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
+        with open(predictions_file, "w", encoding="UTF-8") as writable:
+            json.dump(
+                {
+                    "model_type": model_type,
+                    "final_mse": final_mse,
+                    "num_predictions": len(predictions_list),
+                    "predictions": [
+                        {
+                            "state": pred["state"].tolist(),
+                            "action": pred["action"].tolist(),
+                            "term": pred["term"].tolist(),
+                            "actual_reward": pred["actual_reward"],
+                            "predicted_reward": pred["predicted_reward"],
+                            "per_step_rewards": pred["per_step_rewards"].tolist(),
+                            "per_step_predictions": pred[
+                                "per_step_predictions"
+                            ].tolist(),
+                        }
+                        for pred in predictions_list
+                    ],
+                },
+                writable,
+                indent=2,
+            )
+        logging.info("Predictions saved to %s", predictions_file)
+
+        # Save model
+        model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
+        torch.save(model.state_dict(), model_file)
+        logging.info("Model saved to %s", model_file)
+
+        # Save config and metrics
+        hparams = save_config_and_metrics(
+            output_dir=output_dir,
+            model_type=model_type,
+            env=env,
+            batch_size=batch_size,
+            eval_steps=eval_steps,
+            train_losses=train_losses,
+            eval_losses=eval_losses,
+            final_mse=final_mse,
         )
-    print(f"Predictions saved to {predictions_file}")
 
-    # Save training metrics
-    metrics_file = output_path / f"metrics_{model_type}.json"
-    with open(metrics_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "model_type": model_type,
-                "train_losses": train_losses,
-                "eval_losses": eval_losses,
-                "final_mse": final_mse,
-            },
-            writable,
-            indent=2,
+        # Save config and final metrics
+        summary_writer.add_hparams(
+            hparam_dict=hparams,
+            metric_dict={"MSE": final_mse, "RMSE": final_rmse},
         )
-    print(f"Training metrics saved to {metrics_file}")
-
-    # Save model
-    model_file = output_path / f"model_{model_type}.pt"
-    torch.save(model.state_dict(), model_file)
-    print(f"Model saved to {model_file}")
-
-    # Save config
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    config_file = output_path / "config.json"
-    with open(config_file, "w", encoding="UTF-8") as writable:
-        json.dump(
-            {
-                "spec": SPEC,
-                "model_type": model_type,
-                "env_name": env.spec.id
-                if hasattr(env, "spec") and env.spec
-                else "unknown",
-                "state_dim": obs_dim,
-                "action_dim": act_dim,
-                "batch_size": batch_size,
-                "eval_steps": eval_steps,
-                "hidden_dim": 256,
-                "timestamp": int(output_path.name),
-            },
-            writable,
-            indent=2,
+        # Create sample input for graph tracing
+        sample_input = (
+            # state
+            torch.zeros(1, 1, obs_dim),
+            # action
+            torch.zeros(1, 1, act_dim),
+            # term
+            torch.zeros(1, 1, 1),
         )
-    print(f"Config saved to {config_file}")
+        summary_writer.add_graph(model, sample_input)
 
     return final_mse, predictions_list
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train reward prediction models for delayed feedback"
-    )
-    parser.add_argument(
-        "--model-type",
-        type=str,
-        default="mlp",
-        choices=["mlp", "all"],
-        help="Model architecture to train (default: mlp). Use 'all' to train all models.",
-    )
-    parser.add_argument(
-        "--env",
-        type=str,
-        default="MountainCarContinuous-v0",
-        help="Gymnasium environment (default: MountainCarContinuous-v0)",
-    )
-    parser.add_argument(
-        "--max-episode-steps",
-        type=int,
-        default=2500,
-        help="Maximum steps per episode (default: 2500)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=int,
-        default=3,
-        help="Fixed delay for reward feedback (default: 3)",
-    )
-    parser.add_argument(
-        "--num-steps",
-        type=int,
-        default=100_000,
-        help="Number of steps to collect (default: 100000)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=64, help="Batch size (default: 64)"
-    )
-    parser.add_argument(
-        "--eval-steps",
-        type=int,
-        default=20,
-        help="Number of evaluation steps (default: 20)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="outputs",
-        help="Output directory for results (default: outputs)",
-    )
-
-    args = parser.parse_args()
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
 
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
-    print(f"Environment: {args.env}")
-    print(f"Observation space: {env.observation_space}")
-    print(f"Action space: {env.action_space}")
+    logging.info("Environment: %s", args.env)
+    logging.info("Observation space: %s", env.observation_space)
+    logging.info("Action space: %s", env.action_space)
 
     # Create delay and training buffer
     delay = rewdelay.FixedDelay(args.delay)
     _, max_delay = delay.range()
-    print(f"\nCollecting {args.num_steps * max_delay} steps with delay={args.delay}...")
+    logging.info(
+        "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
+    )
     training_buffer = create_training_buffer(
         env, delay=delay, num_steps=args.num_steps * max_delay
     )
-    print(f"Created {len(training_buffer)} training examples")
+    logging.info("Created %d training examples", len(training_buffer))
 
     # Create dataset
     inputs, labels = zip(*training_buffer)
@@ -519,40 +526,84 @@ def main():
     dataset = DictDataset(data.default_collate(inputs), list(labels))
 
     # Train model(s)
-    if args.model_type == "all":
-        print("\n" + "=" * 80)
-        print("Training all model types...")
-        print("=" * 80)
-        results = {}
-        for model_type in ["mlp", "rnn", "transformer"]:
-            print(f"\n{'=' * 80}")
-            print(f"Training {model_type.upper()} model")
-            print("=" * 80)
-            final_mse, _ = train(
-                env,
-                dataset=dataset,
-                batch_size=args.batch_size,
-                eval_steps=args.eval_steps,
-                model_type=model_type,
-                output_dir=args.output_dir,
-            )
-            results[model_type] = final_mse
-
-        print("\n" + "=" * 80)
-        print("FINAL RESULTS")
-        print("=" * 80)
-        for model_type, mse in results.items():
-            rmse = np.sqrt(mse)
-            print(f"{model_type.upper():15s}: RMSE = {rmse:.8f}")
-    else:
+    if args.model_type == "mlp":
+        logging.info("=" * 80)
+        logging.info("Training MLP")
         train(
             env,
             dataset=dataset,
+            train_epochs=args.train_epochs,
             batch_size=args.batch_size,
             eval_steps=args.eval_steps,
             model_type=args.model_type,
+            log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
         )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train reward prediction models for delayed feedback"
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="mlp",
+        choices=["mlp"],
+        help="Model architecture to train",
+    )
+    parser.add_argument(
+        "--env",
+        type=str,
+        default="MountainCarContinuous-v0",
+        help="Gymnasium environment",
+    )
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=2500,
+        help="Maximum steps per episode",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=3,
+        help="Fixed delay for reward feedback",
+    )
+    parser.add_argument(
+        "--train-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs to train",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=100,
+        help="Number of steps to collect",
+    )
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=20,
+        help="Number of evaluation steps",
+    )
+    parser.add_argument(
+        "--log-episode-frequency",
+        type=int,
+        default=5,
+        help="Number of evaluation steps",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=tempfile.gettempdir(),
+        help="Output directory for results",
+    )
+
+    args, _ = parser.parse_known_args()
+    return args
 
 
 if __name__ == "__main__":
