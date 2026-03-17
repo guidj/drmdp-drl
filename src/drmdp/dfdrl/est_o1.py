@@ -673,6 +673,10 @@ def experiment(args: TrainingArgs):
 
 @ray.remote
 def run_fn(args: TrainingArgs):
+    """
+    Wrapper function for `experiment`.
+    Allows Ray to report failures.
+    """
     try:
         experiment(args)
     except Exception as err:
