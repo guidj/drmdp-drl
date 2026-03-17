@@ -84,7 +84,7 @@ class RNetwork(nn.Module):
             layers.append(nn.Linear(input_dim, output_dim))
             layers.append(nn.ReLU())
             input_dim = output_dim
-        self.layers = nn.Sequential(layers)
+        self.layers = nn.Sequential(*layers)
         self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
@@ -694,7 +694,8 @@ def main():
             seed_args = dataclasses.replace(
                 args, output_dir=seed_output_path, seed=seed
             )
-            tasks.append(run_fn.remote(seed_args))
+            # tasks.append(run_fn.remote(seed_args))
+            experiment(seed_args)
 
         ray_utils.wait_till_completion(tasks)
 
