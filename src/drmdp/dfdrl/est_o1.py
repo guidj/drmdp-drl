@@ -29,6 +29,7 @@ import io
 import json
 import logging
 import os
+import sys
 import tempfile
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -680,7 +681,8 @@ def run_fn(args: TrainingArgs):
         experiment(args)
     except Exception as err:
         logging.error("Error in task %s: %s", args.seed, err)
-        raise RuntimeError(f"Experiment {args.seed} failed") from err
+        # Fail job for ray status reporting
+        sys.exit(1)
 
 
 def main():
