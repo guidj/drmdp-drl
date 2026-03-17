@@ -106,7 +106,14 @@ class RNetwork(nn.Module):
 
 
 class DictDataset(data.Dataset):
-    def __init__(self, inputs, labels):
+    """Dataset that stores raw (uncollated) examples with variable-length sequences."""
+
+    def __init__(self, inputs: Sequence, labels: Sequence):
+        """
+        Args:
+            inputs: Sequence of input dicts (one per example)
+            labels: Sequence of label dicts (one per example)
+        """
         self.inputs = inputs
         self.labels = labels
         self.length = len(labels)
@@ -115,8 +122,70 @@ class DictDataset(data.Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        # Return a dictionary for the given index
-        return {key: self.inputs[key][idx] for key in self.inputs}, self.labels[idx]
+        # Return raw example without collation
+        return self.inputs[idx], self.labels[idx]
+
+
+def collate_variable_length_sequences(batch):
+    """
+    Custom collate function for batching variable-length sequences.
+    Pads sequences to the maximum length within the batch.
+
+    Args:
+        batch: List of (inputs_dict, labels_dict) tuples
+
+    Returns:
+        (batched_inputs_dict, batched_labels_dict) with padded sequences
+    """
+    inputs_list, labels_list = zip(*batch)
+
+    # Find max sequence length in this batch
+    seq_lengths = [inputs["state"].shape[0] for inputs in inputs_list]
+    max_seq_len = max(seq_lengths)
+
+    # Pad and stack inputs
+    batched_inputs = {}
+    for key in inputs_list[0].keys():
+        sequences = [inputs[key] for inputs in inputs_list]
+
+        # Pad each sequence to max_seq_len
+        padded_sequences = []
+        for seq in sequences:
+            seq_len = seq.shape[0]
+            if seq_len < max_seq_len:
+                # Pad with zeros
+                pad_shape = (max_seq_len - seq_len,) + seq.shape[1:]
+                padding = torch.zeros(pad_shape, dtype=seq.dtype)
+                padded_seq = torch.cat([seq, padding], dim=0)
+            else:
+                padded_seq = seq
+            padded_sequences.append(padded_seq)
+
+        # Stack: (batch_size, max_seq_len, dim)
+        batched_inputs[key] = torch.stack(padded_sequences)
+
+    # Stack labels
+    batched_labels = {
+        "aggregate_reward": torch.stack(
+            [labels["aggregate_reward"] for labels in labels_list]
+        )
+    }
+
+    # Pad per_step_rewards to match max_seq_len
+    per_step_rewards_list = [labels["per_step_rewards"] for labels in labels_list]
+    padded_per_step_rewards = []
+    for rewards in per_step_rewards_list:
+        seq_len = rewards.shape[0]
+        if seq_len < max_seq_len:
+            padding = torch.zeros(max_seq_len - seq_len, dtype=rewards.dtype)
+            padded_rewards = torch.cat([rewards, padding], dim=0)
+        else:
+            padded_rewards = rewards
+        padded_per_step_rewards.append(padded_rewards)
+
+    batched_labels["per_step_rewards"] = torch.stack(padded_per_step_rewards)
+
+    return batched_inputs, batched_labels
 
 
 def create_training_buffer(
@@ -240,7 +309,12 @@ def evaluate_model(
         Tuple of (mean_squared_error, predictions_list)
         If collect_predictions=False, predictions_list will be empty.
     """
-    test_dataloader = data.DataLoader(test_ds, batch_size=batch_size, shuffle=shuffle)
+    test_dataloader = data.DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_variable_length_sequences,
+    )
     eval_criterion = nn.MSELoss()
     errors = []
     predictions_list = []
@@ -273,7 +347,8 @@ def evaluate_model(
             predictions = torch.stack(per_step_predictions, dim=1)
 
             # Sum predictions across sequence to get aggregate reward
-            pred_window_reward = torch.squeeze(torch.sum(predictions, dim=1))
+            # Use squeeze(-1) to only squeeze the last dimension, preserving batch dimension
+            pred_window_reward = torch.sum(predictions, dim=1).squeeze(-1)
 
             # Extract aggregate rewards from batched label dict
             # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
@@ -283,17 +358,19 @@ def evaluate_model(
 
             # Optionally collect predictions for analysis
             if collect_predictions:
-                for idx in range(batch_size_actual):
-                    per_step_rewards = labels["per_step_rewards"][idx].cpu().numpy()
+                for batch_idx in range(batch_size_actual):
+                    per_step_rewards = (
+                        labels["per_step_rewards"][batch_idx].cpu().numpy()
+                    )
                     predictions_list.append(
                         {
-                            "state": inputs["state"][idx].cpu().numpy(),
-                            "action": inputs["action"][idx].cpu().numpy(),
-                            "term": inputs["term"][idx].cpu().numpy(),
-                            "actual_reward": aggregate_rewards[idx].item(),
+                            "state": inputs["state"][batch_idx].cpu().numpy(),
+                            "action": inputs["action"][batch_idx].cpu().numpy(),
+                            "term": inputs["term"][batch_idx].cpu().numpy(),
+                            "actual_reward": aggregate_rewards[batch_idx].item(),
                             "per_step_rewards": per_step_rewards,
-                            "predicted_reward": pred_window_reward[idx].item(),
-                            "per_step_predictions": predictions[idx]
+                            "predicted_reward": pred_window_reward[batch_idx].item(),
+                            "per_step_predictions": predictions[batch_idx]
                             .squeeze(-1)
                             .cpu()
                             .numpy(),
@@ -416,7 +493,10 @@ def train(
     with tensorboard.SummaryWriter(log_dir=output_dir) as summary_writer:
         for epoch in range(train_epochs):
             train_dataloader = data.DataLoader(
-                train_ds, batch_size=batch_size, shuffle=True
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=collate_variable_length_sequences,
             )
             # Training
             epoch_losses = []
@@ -426,7 +506,8 @@ def train(
 
                 # Calculate loss for each seq in batch
                 # outputs shape: (batch_size, seq_len, 1)
-                window_reward = torch.squeeze(torch.sum(outputs, dim=1))
+                # Use squeeze(-1) to only squeeze the last dimension, preserving batch dimension
+                window_reward = torch.sum(outputs, dim=1).squeeze(-1)
 
                 # Extract aggregate rewards from batched label dict
                 # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
@@ -551,17 +632,14 @@ def train(
     return final_mse, predictions_list
 
 
-@ray.remote
-def run_fn(args: TrainingArgs):
+def experiment(args: TrainingArgs):
     logging.basicConfig(level=logging.INFO)
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
-    logging.info("Environment: %s", args.env)
-    logging.info("Observation space: %s", env.observation_space)
-    logging.info("Action space: %s", env.action_space)
+    logging.info("Spec: %s", args)
 
     # Create delay and training buffer
-    delay = rewdelay.ClippedPoissonDelay(args.delay)
+    delay = rewdelay.ClippedPoissonDelay(args.delay, min_delay=2)
     _, max_delay = delay.range()
     logging.info(
         "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
@@ -573,28 +651,33 @@ def run_fn(args: TrainingArgs):
 
     # Create dataset
     inputs, labels = zip(*training_buffer)
-    # Labels are dicts - pass them as-is
-    dataset = DictDataset(data.default_collate(inputs), list(labels))
+    # Store raw examples instead of pre-collated tensors
+    dataset = DictDataset(inputs=list(inputs), labels=list(labels))
 
     # Train model(s)
     if args.model_type == "mlp":
         logging.info("=" * 80)
         logging.info("Training MLP")
-        try:
-            train(
-                env,
-                dataset=dataset,
-                train_epochs=args.train_epochs,
-                batch_size=args.batch_size,
-                eval_steps=args.eval_steps,
-                model_type=args.model_type,
-                log_episode_frequency=args.log_episode_frequency,
-                output_dir=args.output_dir,
-                seed=args.seed,
-            )
-        except Exception as err:
-            logging.error("Error in task %s: %s", args.seed, err)
-            raise RuntimeError(f"Experiment {args.seed} failed") from err
+        train(
+            env,
+            dataset=dataset,
+            train_epochs=args.train_epochs,
+            batch_size=args.batch_size,
+            eval_steps=args.eval_steps,
+            model_type=args.model_type,
+            log_episode_frequency=args.log_episode_frequency,
+            output_dir=args.output_dir,
+            seed=args.seed,
+        )
+
+
+@ray.remote
+def run_fn(args: TrainingArgs):
+    try:
+        experiment(args)
+    except Exception as err:
+        logging.error("Error in task %s: %s", args.seed, err)
+        raise RuntimeError(f"Experiment {args.seed} failed") from err
 
 
 def main():
