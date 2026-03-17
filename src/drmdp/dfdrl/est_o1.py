@@ -697,8 +697,7 @@ def main():
             seed_args = dataclasses.replace(
                 args, output_dir=seed_output_path, seed=seed
             )
-            # tasks.append(run_fn.remote(seed_args))
-            experiment(seed_args)
+            tasks.append(run_fn.remote(seed_args))
 
         ray_utils.wait_till_completion(tasks)
 
