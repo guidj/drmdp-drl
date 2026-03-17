@@ -31,7 +31,7 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -689,7 +689,8 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    with ray.init():
+    ray_env: Dict[str, Any] = {}
+    with ray.init(runtime_env=ray_env):
         tasks = []
         for seed in range(args.num_runs):
             seed_output_path = os.path.join(args.output_dir, str(seed))
