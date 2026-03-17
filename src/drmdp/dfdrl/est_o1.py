@@ -84,7 +84,7 @@ class RNetwork(nn.Module):
             layers.append(nn.Linear(input_dim, output_dim))
             layers.append(nn.ReLU())
             input_dim = output_dim
-        self.layers = nn.ModuleList(layers)
+        self.layers = nn.Sequential(layers)
         self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
@@ -100,8 +100,7 @@ class RNetwork(nn.Module):
         out = torch.concat([state, action, term], dim=-1)
         out = torch.pow(torch.unsqueeze(out, -1), self.powers)
         out = torch.flatten(out, start_dim=2)
-        for layer in self.layers:
-            out = layer(out)
+        out = self.layers(out)
         return self.final_layer(out)
 
 
