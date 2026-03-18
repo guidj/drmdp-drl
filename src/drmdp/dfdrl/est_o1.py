@@ -24,22 +24,45 @@ to match the delayed aggregate reward signal.
 """
 
 import argparse
+import dataclasses
+import io
 import json
 import logging
-import pathlib
+import os
+import sys
 import tempfile
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
+import ray
+import tensorflow as tf
 import torch
 from torch import nn, optim
 from torch.utils import data, tensorboard
 
-from drmdp import dataproc, rewdelay
+from drmdp import dataproc, ray_utils, rewdelay
 
 # Spec version identifier
 SPEC = "o1"
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainingArgs:
+    """Arguments for training reward prediction models."""
+
+    model_type: str
+    env: str
+    max_episode_steps: int
+    delay: int
+    train_epochs: int
+    num_steps: int
+    batch_size: int
+    eval_steps: int
+    log_episode_frequency: int
+    output_dir: str
+    num_runs: int
+    seed: Optional[int] = None
 
 
 class RNetwork(nn.Module):
@@ -62,7 +85,7 @@ class RNetwork(nn.Module):
             layers.append(nn.Linear(input_dim, output_dim))
             layers.append(nn.ReLU())
             input_dim = output_dim
-        self.layers = nn.ModuleList(layers)
+        self.layers = nn.Sequential(*layers)
         self.final_layer = nn.Linear(output_dim, 1)
 
     def forward(self, state, action, term):
@@ -78,13 +101,19 @@ class RNetwork(nn.Module):
         out = torch.concat([state, action, term], dim=-1)
         out = torch.pow(torch.unsqueeze(out, -1), self.powers)
         out = torch.flatten(out, start_dim=2)
-        for layer in self.layers:
-            out = layer(out)
+        out = self.layers(out)
         return self.final_layer(out)
 
 
 class DictDataset(data.Dataset):
-    def __init__(self, inputs, labels):
+    """Dataset that stores raw (uncollated) examples with variable-length sequences."""
+
+    def __init__(self, inputs: Sequence, labels: Sequence):
+        """
+        Args:
+            inputs: Sequence of input dicts (one per example)
+            labels: Sequence of label dicts (one per example)
+        """
         self.inputs = inputs
         self.labels = labels
         self.length = len(labels)
@@ -93,22 +122,105 @@ class DictDataset(data.Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        # Return a dictionary for the given index
-        return {key: self.inputs[key][idx] for key in self.inputs}, self.labels[idx]
+        # Return raw example without collation
+        return self.inputs[idx], self.labels[idx]
 
 
-def create_training_buffer(env, delay: rewdelay.RewardDelay, num_steps: int):
+def collate_variable_length_sequences(batch):
+    """
+    Custom collate function for batching variable-length sequences.
+    Pads sequences to the maximum length within the batch.
+
+    Args:
+        batch: List of (inputs_dict, labels_dict) tuples
+
+    Returns:
+        (batched_inputs_dict, batched_labels_dict) with padded sequences
+    """
+    inputs_list, labels_list = zip(*batch)
+
+    # Find max sequence length in this batch
+    seq_lengths = [inputs["state"].shape[0] for inputs in inputs_list]
+    max_seq_len = max(seq_lengths)
+
+    # Pad and stack inputs
+    batched_inputs = {}
+    for key in inputs_list[0].keys():
+        sequences = [inputs[key] for inputs in inputs_list]
+
+        # Pad each sequence to max_seq_len
+        padded_sequences = []
+        for seq in sequences:
+            seq_len = seq.shape[0]
+            if seq_len < max_seq_len:
+                # Pad with zeros
+                pad_shape = (max_seq_len - seq_len,) + seq.shape[1:]
+                padding = torch.zeros(pad_shape, dtype=seq.dtype)
+                padded_seq = torch.cat([seq, padding], dim=0)
+            else:
+                padded_seq = seq
+            padded_sequences.append(padded_seq)
+
+        # Stack: (batch_size, max_seq_len, dim)
+        batched_inputs[key] = torch.stack(padded_sequences)
+
+    # Stack labels
+    batched_labels = {
+        "aggregate_reward": torch.stack(
+            [labels["aggregate_reward"] for labels in labels_list]
+        )
+    }
+
+    # Pad per_step_rewards to match max_seq_len
+    per_step_rewards_list = [labels["per_step_rewards"] for labels in labels_list]
+    padded_per_step_rewards = []
+    for rewards in per_step_rewards_list:
+        seq_len = rewards.shape[0]
+        if seq_len < max_seq_len:
+            padding = torch.zeros(max_seq_len - seq_len, dtype=rewards.dtype)
+            padded_rewards = torch.cat([rewards, padding], dim=0)
+        else:
+            padded_rewards = rewards
+        padded_per_step_rewards.append(padded_rewards)
+
+    batched_labels["per_step_rewards"] = torch.stack(padded_per_step_rewards)
+
+    return batched_inputs, batched_labels
+
+
+def create_training_buffer(
+    env, delay: rewdelay.RewardDelay, num_steps: int, seed: Optional[int] = None
+):
     """
     Collects example of (s,a,s',r,d) from an environment.
     """
-    buffer = dataproc.collection_traj_data(env, steps=num_steps, include_term=True)
+    buffer = dataproc.collection_traj_data(
+        env, steps=num_steps, include_term=True, seed=seed
+    )
     return delayed_reward_data(buffer, delay=delay)
 
 
 def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     """
-    Creates a dataset where each sample corresponds to.
-    Assumes actions are continuous or intended to be used as is.
+    Creates a dataset of delayed reward sequences from trajectory buffer.
+
+    Converts raw trajectory data into training examples where rewards are delayed
+    according to the specified delay distribution. Each example consists of a
+    sequence of (state, action, term) tuples with corresponding aggregate and
+    per-step rewards.
+
+    Args:
+        buffer: List of trajectory tuples (state, action, next_state, reward, term)
+        delay: RewardDelay object that determines how many steps to aggregate
+
+    Returns:
+        List of tuples (inputs, labels) where:
+            - inputs: Dict with batched tensors of 'state', 'action', 'term'
+            - labels: Dict with 'aggregate_reward' (sum) and 'per_step_rewards' (list)
+
+    Note:
+        Assumes actions are continuous or intended to be used as is.
+        Sequences shorter than the sampled delay are discarded.
     """
 
     def create_traj_step(state, action, reward, term):
@@ -197,7 +309,12 @@ def evaluate_model(
         Tuple of (mean_squared_error, predictions_list)
         If collect_predictions=False, predictions_list will be empty.
     """
-    test_dataloader = data.DataLoader(test_ds, batch_size=batch_size, shuffle=shuffle)
+    test_dataloader = data.DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_variable_length_sequences,
+    )
     eval_criterion = nn.MSELoss()
     errors = []
     predictions_list = []
@@ -230,7 +347,8 @@ def evaluate_model(
             predictions = torch.stack(per_step_predictions, dim=1)
 
             # Sum predictions across sequence to get aggregate reward
-            pred_window_reward = torch.squeeze(torch.sum(predictions, dim=1))
+            # Use squeeze(-1) to only squeeze the last dimension, preserving batch dimension
+            pred_window_reward = torch.sum(predictions, dim=1).squeeze(-1)
 
             # Extract aggregate rewards from batched label dict
             # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
@@ -240,17 +358,19 @@ def evaluate_model(
 
             # Optionally collect predictions for analysis
             if collect_predictions:
-                for idx in range(batch_size_actual):
-                    per_step_rewards = labels["per_step_rewards"][idx].cpu().numpy()
+                for batch_idx in range(batch_size_actual):
+                    per_step_rewards = (
+                        labels["per_step_rewards"][batch_idx].cpu().numpy()
+                    )
                     predictions_list.append(
                         {
-                            "state": inputs["state"][idx].cpu().numpy(),
-                            "action": inputs["action"][idx].cpu().numpy(),
-                            "term": inputs["term"][idx].cpu().numpy(),
-                            "actual_reward": aggregate_rewards[idx].item(),
+                            "state": inputs["state"][batch_idx].cpu().numpy(),
+                            "action": inputs["action"][batch_idx].cpu().numpy(),
+                            "term": inputs["term"][batch_idx].cpu().numpy(),
+                            "actual_reward": aggregate_rewards[batch_idx].item(),
                             "per_step_rewards": per_step_rewards,
-                            "predicted_reward": pred_window_reward[idx].item(),
-                            "per_step_predictions": predictions[idx]
+                            "predicted_reward": pred_window_reward[batch_idx].item(),
+                            "per_step_predictions": predictions[batch_idx]
                             .squeeze(-1)
                             .cpu()
                             .numpy(),
@@ -292,8 +412,8 @@ def save_config_and_metrics(
     act_dim = env.action_space.shape[0]
 
     # Save training metrics
-    metrics_file = pathlib.Path(output_dir) / f"metrics_{model_type}.json"
-    with open(metrics_file, "w", encoding="UTF-8") as writable:
+    metrics_file = os.path.join(output_dir, f"metrics_{model_type}.json")
+    with tf.io.gfile.GFile(metrics_file, "w") as writable:
         json.dump(
             {
                 "model_type": model_type,
@@ -307,7 +427,7 @@ def save_config_and_metrics(
     logging.info("Training metrics saved to %s", metrics_file)
 
     # Save config
-    config_file = pathlib.Path(output_dir) / "config.json"
+    config_file = os.path.join(output_dir, "config.json")
     hparams = {
         "spec": SPEC,
         "model_type": model_type,
@@ -318,7 +438,7 @@ def save_config_and_metrics(
         "eval_steps": eval_steps,
         "hidden_dim": 256,
     }
-    with open(config_file, "w", encoding="UTF-8") as writable:
+    with tf.io.gfile.GFile(config_file, "w") as writable:
         json.dump(
             hparams,
             writable,
@@ -335,6 +455,7 @@ def train(
     batch_size: int,
     eval_steps: int,
     log_episode_frequency: int,
+    seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
 ):
@@ -349,6 +470,8 @@ def train(
         model_type: Type of model to use ("mlp", "rnn", or "transformer")
         output_dir: Directory to save predictions and results
     """
+    logging.info("Training with seed: %s", seed)
+    torch.manual_seed(seed if seed is not None else 127)
     train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -370,7 +493,10 @@ def train(
     with tensorboard.SummaryWriter(log_dir=output_dir) as summary_writer:
         for epoch in range(train_epochs):
             train_dataloader = data.DataLoader(
-                train_ds, batch_size=batch_size, shuffle=True
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=collate_variable_length_sequences,
             )
             # Training
             epoch_losses = []
@@ -380,7 +506,8 @@ def train(
 
                 # Calculate loss for each seq in batch
                 # outputs shape: (batch_size, seq_len, 1)
-                window_reward = torch.squeeze(torch.sum(outputs, dim=1))
+                # Use squeeze(-1) to only squeeze the last dimension, preserving batch dimension
+                window_reward = torch.sum(outputs, dim=1).squeeze(-1)
 
                 # Extract aggregate rewards from batched label dict
                 # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
@@ -436,8 +563,8 @@ def train(
         logging.info("Final Test RMSE: %.8f", final_rmse)
 
         # Save predictions
-        predictions_file = pathlib.Path(output_dir) / f"predictions_{model_type}.json"
-        with open(predictions_file, "w", encoding="UTF-8") as writable:
+        predictions_file = os.path.join(output_dir, f"predictions_{model_type}.json")
+        with tf.io.gfile.GFile(predictions_file, "w") as writable:
             json.dump(
                 {
                     "model_type": model_type,
@@ -464,8 +591,14 @@ def train(
         logging.info("Predictions saved to %s", predictions_file)
 
         # Save model
-        model_file = pathlib.Path(output_dir) / f"model_{model_type}.pt"
-        torch.save(model.state_dict(), model_file)
+        model_file = os.path.join(output_dir, f"model_{model_type}.pt")
+        # torch.save requires a real file path, not a file handle
+        # First save to temporary buffer, then write to GFile
+        buffer = io.BytesIO()
+        torch.save(model.state_dict(), buffer)
+        buffer.seek(0)
+        with tf.io.gfile.GFile(model_file, "wb") as writable:
+            writable.write(buffer.read())
         logging.info("Model saved to %s", model_file)
 
         # Save config and metrics
@@ -499,31 +632,27 @@ def train(
     return final_mse, predictions_list
 
 
-def main():
-    args = parse_args()
+def experiment(args: TrainingArgs):
     logging.basicConfig(level=logging.INFO)
-
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
-    logging.info("Environment: %s", args.env)
-    logging.info("Observation space: %s", env.observation_space)
-    logging.info("Action space: %s", env.action_space)
+    logging.info("Spec: %s", args)
 
     # Create delay and training buffer
-    delay = rewdelay.FixedDelay(args.delay)
+    delay = rewdelay.ClippedPoissonDelay(args.delay, min_delay=2)
     _, max_delay = delay.range()
     logging.info(
         "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
     )
     training_buffer = create_training_buffer(
-        env, delay=delay, num_steps=args.num_steps * max_delay
+        env, delay=delay, num_steps=args.num_steps * max_delay, seed=args.seed
     )
     logging.info("Created %d training examples", len(training_buffer))
 
     # Create dataset
     inputs, labels = zip(*training_buffer)
-    # Labels are dicts - pass them as-is
-    dataset = DictDataset(data.default_collate(inputs), list(labels))
+    # Store raw examples instead of pre-collated tensors
+    dataset = DictDataset(inputs=list(inputs), labels=list(labels))
 
     # Train model(s)
     if args.model_type == "mlp":
@@ -538,10 +667,42 @@ def main():
             model_type=args.model_type,
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
+            seed=args.seed,
         )
 
 
-def parse_args():
+@ray.remote
+def run_fn(args: TrainingArgs):
+    """
+    Wrapper function for `experiment`.
+    Allows Ray to report failures.
+    """
+    try:
+        experiment(args)
+    except Exception as err:
+        logging.error("Error in task %s: %s", args.seed, err)
+        # Fail job for ray status reporting
+        sys.exit(1)
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+
+    ray_env: Dict[str, Any] = {}
+    with ray.init(runtime_env=ray_env):
+        tasks = []
+        for seed in range(args.num_runs):
+            seed_output_path = os.path.join(args.output_dir, str(seed))
+            seed_args = dataclasses.replace(
+                args, output_dir=seed_output_path, seed=seed
+            )
+            tasks.append(run_fn.remote(seed_args))
+
+        ray_utils.wait_till_completion(tasks)
+
+
+def parse_args() -> TrainingArgs:
     parser = argparse.ArgumentParser(
         description="Train reward prediction models for delayed feedback"
     )
@@ -601,9 +762,15 @@ def parse_args():
         default=tempfile.gettempdir(),
         help="Output directory for results",
     )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of runs - with their own seed.",
+    )
 
     args, _ = parser.parse_known_args()
-    return args
+    return TrainingArgs(**vars(args))
 
 
 if __name__ == "__main__":
