@@ -153,6 +153,52 @@ When processing consecutive windows:
 
 Follow **Google's Python Style Guide** with these specific conventions:
 
+**Code Organization (Newspaper Style)**: Organize code top-down with classes before functions, main routines before subroutines
+```python
+# Good - Classes first, then functions, main before helpers
+class RNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        ...
+
+    def forward(self, state, action):
+        # Main routine
+        out = self._preprocess(state, action)
+        return self._predict(out)
+
+    def _preprocess(self, state, action):
+        # Helper/subroutine
+        ...
+
+    def _predict(self, features):
+        # Helper/subroutine
+        ...
+
+def train_model(model, data):
+    # Main function
+    for batch in data:
+        loss = _compute_loss(model, batch)
+        _update_weights(model, loss)
+
+def _compute_loss(model, batch):
+    # Helper function
+    ...
+
+def _update_weights(model, loss):
+    # Helper function
+    ...
+```
+
+**Comments**: Keep comments focused on explaining why, not what; avoid meta-commentary
+```python
+# Good
+# Use polynomial features to capture non-linear reward patterns
+out = torch.pow(torch.unsqueeze(out, -1), self.powers)
+
+# Avoid - don't add meta-commentary about criticality or implementation changes
+# CRITICAL: now we use variable length sequences so we need padding
+# IMPORTANT: this was changed from fixed to dynamic
+```
+
 **Imports**: Only import modules and types, not functions or variables directly
 ```python
 # Good
