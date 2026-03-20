@@ -225,9 +225,9 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
 
     def create_traj_step(state, action, reward, term):
         return {
-            "state": torch.tensor(state),
-            "action": torch.tensor(action),
-            "term": torch.tensor([float(term)]),
+            "state": torch.tensor(state, dtype=torch.float32),
+            "action": torch.tensor(action, dtype=torch.float32),
+            "term": torch.tensor([float(term)], dtype=torch.float32),
         }, torch.tensor(reward, dtype=torch.float32)
 
     def create_example(traj_steps: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
@@ -246,6 +246,10 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
 
         return data.default_collate(inputs), label_dict
 
+    # Handle empty buffer
+    if len(buffer) == 0:
+        return []
+
     states = np.concatenate(
         [
             np.stack([example[0] for example in buffer]),
@@ -260,24 +264,24 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     n_steps = states.shape[0]
     examples = []
     idx = 0
-    while True:
+    while idx < n_steps:
         example_steps = []
         steps = 0
         reward_delay = delay.sample()
-        while True:
+        while idx < n_steps and steps < reward_delay:
             traj_step = create_traj_step(
                 states[idx][:obs_dim], action[idx], reward[idx], term[idx]
             )
             example_steps.append(traj_step)
+            current_is_terminal = term[idx]
             idx += 1
             steps += 1
-            if steps == reward_delay or (idx >= n_steps):
+            # Stop window at terminal state (episode boundary)
+            if current_is_terminal:
                 break
-        # example is complete:
+        # Keep window only if it has the expected delay length
         if steps == reward_delay:
             examples.append(create_example(example_steps))
-        if idx >= n_steps:
-            break
     return examples
 
 
