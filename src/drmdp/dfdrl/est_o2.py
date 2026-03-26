@@ -24,6 +24,7 @@ to match the delayed aggregate reward signal.
 """
 
 import argparse
+import collections
 import dataclasses
 import io
 import json
@@ -31,7 +32,7 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -62,6 +63,8 @@ class TrainingArgs:
     log_episode_frequency: int
     output_dir: str
     num_runs: int
+    regu_lam: float
+    local_eager_mode: bool
     seed: Optional[int] = None
 
 
@@ -322,10 +325,11 @@ def evaluate_model(
     model: nn.Module,
     test_ds: data.Dataset,
     batch_size: int,
+    regu_lam: float,
     collect_predictions: bool = True,
     max_batches: Optional[int] = None,
     shuffle: bool = False,
-) -> Tuple[float, List[Any]]:
+) -> Tuple[Mapping[str, float], List[Any]]:
     """
     Evaluate model using Markovian predictions.
 
@@ -353,7 +357,8 @@ def evaluate_model(
         collate_fn=collate_variable_length_sequences,
     )
     eval_criterion = nn.MSELoss()
-    errors = []
+    regu_criterion = nn.MSELoss()
+    errors = collections.defaultdict(list)
     predictions_list = []
 
     with torch.no_grad():
@@ -390,8 +395,14 @@ def evaluate_model(
             # Extract aggregate rewards from batched label dict
             # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
             aggregate_rewards = labels["aggregate_reward"].float()
-            mean_squared_error = eval_criterion(pred_window_reward, aggregate_rewards)
-            errors.append(mean_squared_error)
+            reward_mse = eval_criterion(pred_window_reward, aggregate_rewards)
+            regu_mse = regu_criterion(
+                labels["start_return"] + aggregate_rewards, labels["end_return"]
+            )
+            mean_squared_error = reward_mse + (regu_lam * regu_mse)
+            errors["reward"].append(reward_mse)
+            errors["regu"].append(regu_mse)
+            errors["total"].append(mean_squared_error)
 
             # Optionally collect predictions for analysis
             if collect_predictions:
@@ -418,8 +429,11 @@ def evaluate_model(
             if max_batches is not None and idx + 1 >= max_batches:
                 break
 
-    mse = torch.mean(torch.stack(errors)).item()
-    return mse, predictions_list
+    metrics = {
+        key: torch.mean(torch.stack(errors[key])).item()
+        for key in ("reward", "regu", "total")
+    }
+    return metrics, predictions_list
 
 
 def save_config_and_metrics(
@@ -492,6 +506,7 @@ def train(
     batch_size: int,
     eval_steps: int,
     log_episode_frequency: int,
+    regu_lam: float,
     seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
@@ -522,6 +537,7 @@ def train(
     logging.info("Training with %s model", model_type.upper())
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     criterion = nn.MSELoss()
+    regu_criterion = nn.MSELoss()
 
     # Training Loop
     train_losses = []
@@ -536,7 +552,7 @@ def train(
                 collate_fn=collate_variable_length_sequences,
             )
             # Training
-            epoch_losses = []
+            epoch_losses = collections.defaultdict(list)
             for inputs, labels in train_dataloader:
                 # Forward pass (models handle zero stub internally for RNN/Transformer)
                 outputs = model(**inputs)
@@ -549,21 +565,33 @@ def train(
                 # Extract aggregate rewards from batched label dict
                 # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
                 aggregate_rewards = labels["aggregate_reward"].float()
-                loss = criterion(window_reward, aggregate_rewards)
+                regu_loss = regu_criterion(
+                    labels["start_return"] + aggregate_rewards, labels["end_return"]
+                )
+                reward_loss = criterion(window_reward, aggregate_rewards)
+                loss = reward_loss + (regu_lam * regu_loss)
 
                 # Backward and optimize
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-                epoch_losses.append(loss.item())
+                epoch_losses["reward"].append(reward_loss.item())
+                epoch_losses["regu"].append(regu_loss.item())
+                epoch_losses["total"].append(loss.item())
 
-            avg_train_loss = np.mean(epoch_losses)
+            avg_train_loss = np.mean(epoch_losses["total"])
             train_losses.append(avg_train_loss)
             # Epoch results
-            summary_writer.add_scalar(
-                "Loss/train", np.mean(epoch_losses), global_step=epoch
-            )
+            for key in ("reward", "regu", "total"):
+                summary_writer.add_scalar(
+                    f"MSE/train/{key}", np.mean(epoch_losses[key]), global_step=epoch
+                )
+                summary_writer.add_scalar(
+                    f"RMSE/train/{key}",
+                    np.mean(np.sqrt(epoch_losses[key])),
+                    global_step=epoch,
+                )
 
             # Evaluation using Markovian predictions
             if (epoch + 1) % log_episode_frequency == 0:
@@ -571,20 +599,24 @@ def train(
                     model,
                     test_ds,
                     batch_size=batch_size,
+                    regu_lam=regu_lam,
                     collect_predictions=False,
                     max_batches=eval_steps,
                     shuffle=True,
                 )
-                eval_losses.append(eval_mse)
+                eval_losses.append(eval_mse["total"])
                 train_rmse = np.sqrt(avg_train_loss)
-                eval_rmse = np.sqrt(eval_mse)
+                eval_rmse = np.sqrt(eval_mse["total"])
                 # Epoch results
-                summary_writer.add_scalar(
-                    "MSE/eval", np.mean(eval_losses), global_step=epoch
-                )
-                summary_writer.add_scalar(
-                    "RMSE/eval", np.mean(np.sqrt(eval_losses)), global_step=epoch
-                )
+                for key in ("reward", "regu", "total"):
+                    summary_writer.add_scalar(
+                        f"MSE/eval/{key}", np.mean(eval_losses), global_step=epoch
+                    )
+                    summary_writer.add_scalar(
+                        f"RMSE/eval/{key}",
+                        np.mean(np.sqrt(eval_losses)),
+                        global_step=epoch,
+                    )
                 logging.info(
                     "Epoch [%d/%d], Train RMSE: %.8f, Eval RMSE: %.8f",
                     epoch + 1,
@@ -595,9 +627,14 @@ def train(
 
         # Final evaluation and save predictions
         logging.info("Final evaluation...")
-        final_mse, predictions_list = evaluate_model(model, test_ds, batch_size)
-        final_rmse = np.sqrt(final_mse)
-        logging.info("Final Test RMSE: %.8f", final_rmse)
+        final_mse, predictions_list = evaluate_model(
+            model,
+            test_ds,
+            batch_size,
+            regu_lam=regu_lam,
+        )
+        final_rmse = {key: np.sqrt(final_mse[key]) for key in final_mse}
+        logging.info("Final Test RMSE: %.8f", final_rmse["total"])
 
         # Save predictions
         predictions_file = os.path.join(output_dir, f"predictions_{model_type}.json")
@@ -653,7 +690,10 @@ def train(
         # Save config and final metrics
         summary_writer.add_hparams(
             hparam_dict=hparams,
-            metric_dict={"MSE": final_mse, "RMSE": final_rmse},
+            metric_dict=dict(
+                **{f"mse.{key}": value for key, value in final_mse.items()},
+                **{f"rmse.{key}": value for key, value in final_rmse.items()},
+            ),
         )
         # Create sample input for graph tracing
         sample_input = (
@@ -702,6 +742,7 @@ def experiment(args: TrainingArgs):
             batch_size=args.batch_size,
             eval_steps=args.eval_steps,
             model_type=args.model_type,
+            regu_lam=args.regu_lam,
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
             seed=args.seed,
@@ -734,7 +775,11 @@ def main():
             seed_args = dataclasses.replace(
                 args, output_dir=seed_output_path, seed=seed
             )
-            tasks.append(run_fn.remote(seed_args))
+            if args.local_eager_mode:
+                # run locally in earger mode
+                experiment(seed_args)
+            else:
+                tasks.append(run_fn.remote(seed_args))
 
         ray_utils.wait_till_completion(tasks)
 
@@ -805,6 +850,13 @@ def parse_args() -> TrainingArgs:
         default=1,
         help="Number of runs - with their own seed.",
     )
+    parser.add_argument(
+        "--regu-lam",
+        type=float,
+        default=1.0,
+        help="Weight of regualirisation. lam in [0, 1]",
+    )
+    parser.add_argument("--local-eager-mode", action="store_true", default=True)
 
     args, _ = parser.parse_known_args()
     return TrainingArgs(**vars(args))
