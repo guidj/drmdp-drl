@@ -50,7 +50,24 @@ SPEC = "o2"
 
 @dataclasses.dataclass(frozen=True)
 class TrainingArgs:
-    """Arguments for training reward prediction models."""
+    """Arguments for training reward prediction models.
+
+    Attributes:
+        model_type: Model architecture identifier ("mlp").
+        env: Gymnasium environment name.
+        max_episode_steps: Maximum steps per episode before truncation.
+        delay: Mean reward delay (Poisson parameter).
+        train_epochs: Number of training epochs.
+        num_steps: Number of environment steps to collect per run.
+        batch_size: Mini-batch size for training and evaluation.
+        eval_steps: Max batches per evaluation pass.
+        log_episode_frequency: Evaluate every N epochs.
+        output_dir: Directory for model checkpoints and metrics.
+        num_runs: Number of independent runs (one seed per run).
+        regu_lam: Weight for the return-consistency regularization term (λ ∈ [0, 1]).
+        local_eager_mode: If True, run experiments in-process; otherwise submit via Ray.
+        seed: Random seed for reproducibility. None uses a default.
+    """
 
     model_type: str
     env: str
@@ -340,6 +357,8 @@ def evaluate_model(
         model: Trained model
         test_ds: Test dataset
         batch_size: Batch size for evaluation
+        regu_lam: Weight applied to the return-consistency regularization MSE when
+            computing the total loss.
         collect_predictions: Whether to collect detailed predictions for analysis.
             If False, only MSE is computed (faster, less memory).
         max_batches: Maximum number of batches to evaluate. If None, evaluates
@@ -347,8 +366,9 @@ def evaluate_model(
         shuffle: Whether to shuffle the test dataloader
 
     Returns:
-        Tuple of (mean_squared_error, predictions_list)
-        If collect_predictions=False, predictions_list will be empty.
+        Tuple of (metrics, predictions_list) where metrics is a dict with keys
+        "reward", "regu", and "total", each mapping to an array of per-batch MSE
+        values. If collect_predictions=False, predictions_list will be empty.
     """
     test_dataloader = data.DataLoader(
         test_ds,
@@ -518,12 +538,21 @@ def train(
     Train a reward prediction model.
 
     Args:
-        env: Gymnasium environment
-        dataset: Training dataset
-        batch_size: Batch size for training
-        eval_steps: Number of evaluation steps
-        model_type: Type of model to use ("mlp", "rnn", or "transformer")
-        output_dir: Directory to save predictions and results
+        env: Gymnasium environment.
+        dataset: Training dataset of (inputs, labels) examples.
+        train_epochs: Number of full passes over the training split.
+        batch_size: Mini-batch size for training and evaluation.
+        eval_steps: Max batches per mid-training evaluation pass.
+        log_episode_frequency: Run evaluation every this many epochs.
+        regu_lam: Weight for the return-consistency regularization term (λ ∈ [0, 1]).
+        seed: Random seed for weight initialisation and data splitting.
+        model_type: Model architecture to use ("mlp").
+        output_dir: Directory for model checkpoints, metrics, and predictions.
+
+    Returns:
+        Tuple of (final_mse, predictions_list) where final_mse is a dict with
+        keys "reward", "regu", and "total" mapping to scalar MSE values, and
+        predictions_list is a list of per-example prediction dicts.
     """
     logging.info("Training with seed: %s", seed)
     torch.manual_seed(seed if seed is not None else 127)
@@ -722,6 +751,11 @@ def train(
 
 
 def experiment(args: TrainingArgs):
+    """Run a full experiment: collect data, create dataset, and train a model.
+
+    Args:
+        args: Training configuration and hyperparameters.
+    """
     logging.basicConfig(level=logging.INFO)
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
@@ -776,6 +810,7 @@ def run_fn(args: TrainingArgs):
 
 
 def main():
+    """Parse arguments and launch experiment runs via Ray or locally."""
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
@@ -797,6 +832,11 @@ def main():
 
 
 def parse_args() -> TrainingArgs:
+    """Parse command-line arguments into a TrainingArgs instance.
+
+    Returns:
+        TrainingArgs populated from command-line flags.
+    """
     parser = argparse.ArgumentParser(
         description="Train reward prediction models for delayed feedback"
     )
@@ -868,7 +908,7 @@ def parse_args() -> TrainingArgs:
         default=1.0,
         help="Weight of regualirisation. lam in [0, 1]",
     )
-    parser.add_argument("--local-eager-mode", action="store_true", default=True)
+    parser.add_argument("--local-eager-mode", action="store_true", default=False)
 
     args, _ = parser.parse_known_args()
     return TrainingArgs(**vars(args))

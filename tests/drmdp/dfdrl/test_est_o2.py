@@ -814,17 +814,18 @@ class TestEvaluateModel:
     """Tests for evaluate_model() function."""
 
     def test_basic(self, simple_model_and_dataset):
-        """Verify MSE and predictions returned."""
+        """Verify MSE dict and predictions returned."""
         model, dataset = simple_model_and_dataset
         model.eval()
 
-        mse, predictions = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=True
+        metrics, predictions = est_o2.evaluate_model(
+            model, dataset, batch_size=2, regu_lam=1.0, collect_predictions=True
         )
 
-        # Verify MSE is a valid float
-        assert isinstance(mse, float)
-        assert mse >= 0.0
+        # Verify metrics is a dict with expected keys
+        assert isinstance(metrics, dict)
+        assert "total" in metrics
+        assert metrics["total"].mean() >= 0.0
 
         # Verify predictions list is not empty
         assert len(predictions) > 0
@@ -834,13 +835,14 @@ class TestEvaluateModel:
         model, dataset = simple_model_and_dataset
         model.eval()
 
-        mse, predictions = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=False
+        metrics, predictions = est_o2.evaluate_model(
+            model, dataset, batch_size=2, regu_lam=1.0, collect_predictions=False
         )
 
-        # Verify MSE is still computed
-        assert isinstance(mse, float)
-        assert mse >= 0.0
+        # Verify metrics is still computed
+        assert isinstance(metrics, dict)
+        assert "total" in metrics
+        assert metrics["total"].mean() >= 0.0
 
         # Verify predictions list is empty
         assert len(predictions) == 0
@@ -851,8 +853,13 @@ class TestEvaluateModel:
         model.eval()
 
         # Evaluate with max_batches=1
-        mse, predictions = est_o2.evaluate_model(
-            model, dataset, batch_size=1, collect_predictions=True, max_batches=1
+        metrics, predictions = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=1,
+            regu_lam=1.0,
+            collect_predictions=True,
+            max_batches=1,
         )
 
         # Should only process 1 batch
@@ -863,8 +870,8 @@ class TestEvaluateModel:
         model, dataset = simple_model_and_dataset
         model.eval()
 
-        mse, predictions = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=True
+        metrics, predictions = est_o2.evaluate_model(
+            model, dataset, batch_size=2, regu_lam=1.0, collect_predictions=True
         )
 
         # Check first prediction structure
@@ -889,8 +896,8 @@ class TestEvaluateModel:
         model, dataset = simple_model_and_dataset
         model.eval()
 
-        mse, predictions = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=True
+        metrics, predictions = est_o2.evaluate_model(
+            model, dataset, batch_size=2, regu_lam=1.0, collect_predictions=True
         )
 
         # Verify relationship for all predictions
@@ -906,11 +913,11 @@ class TestEvaluateModel:
         model.train()  # Set to train mode to verify no_grad works
 
         # Should not raise error even in train mode (because of no_grad)
-        mse, predictions = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=False
+        metrics, predictions = est_o2.evaluate_model(
+            model, dataset, batch_size=2, regu_lam=1.0, collect_predictions=False
         )
 
-        assert isinstance(mse, float)
+        assert isinstance(metrics, dict)
 
     def test_shuffle_behavior(self, simple_model_and_dataset):
         """Test shuffle parameter works correctly."""
@@ -918,16 +925,48 @@ class TestEvaluateModel:
         model.eval()
 
         # Run with shuffle=False twice, should get same order
-        mse1, preds1 = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=True, shuffle=False
+        metrics1, preds1 = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=2,
+            regu_lam=1.0,
+            collect_predictions=True,
+            shuffle=False,
         )
-        mse2, preds2 = est_o2.evaluate_model(
-            model, dataset, batch_size=2, collect_predictions=True, shuffle=False
+        metrics2, preds2 = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=2,
+            regu_lam=1.0,
+            collect_predictions=True,
+            shuffle=False,
         )
 
         # Same MSE and same number of predictions
-        np.testing.assert_allclose(mse1, mse2, atol=1e-6)
+        np.testing.assert_allclose(
+            metrics1["total"].mean(), metrics2["total"].mean(), atol=1e-6
+        )
         assert len(preds1) == len(preds2)
+
+    def test_returns_dict_with_keys(self, simple_model_and_dataset):
+        """Verify evaluate_model returns dict with reward/regu/total keys."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+
+        metrics, _ = est_o2.evaluate_model(model, dataset, batch_size=2, regu_lam=1.0)
+
+        for key in ("reward", "regu", "total"):
+            assert key in metrics
+            assert len(metrics[key]) > 0
+
+    def test_regu_lam_zero_disables_regularization(self, simple_model_and_dataset):
+        """Verify regu_lam=0 makes total equal to reward loss."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+
+        metrics, _ = est_o2.evaluate_model(model, dataset, batch_size=2, regu_lam=0.0)
+
+        np.testing.assert_allclose(metrics["total"], metrics["reward"], atol=1e-6)
 
 
 class TestSaveConfigAndMetrics:
@@ -945,6 +984,7 @@ class TestSaveConfigAndMetrics:
                 train_losses=[0.5, 0.4, 0.3],
                 eval_losses=[0.6, 0.5],
                 final_mse=0.25,
+                final_rmse=0.5,
             )
 
             # Verify files exist
@@ -966,6 +1006,7 @@ class TestSaveConfigAndMetrics:
                 train_losses=[0.5, 0.4],
                 eval_losses=[0.6],
                 final_mse=0.25,
+                final_rmse=0.5,
             )
 
             config_file = os.path.join(output_dir, "config.json")
@@ -993,6 +1034,7 @@ class TestSaveConfigAndMetrics:
             train_losses = [0.5, 0.4, 0.3]
             eval_losses = [0.6, 0.5]
             final_mse = 0.25
+            final_rmse = 0.5
 
             est_o2.save_config_and_metrics(
                 output_dir=output_dir,
@@ -1003,6 +1045,7 @@ class TestSaveConfigAndMetrics:
                 train_losses=train_losses,
                 eval_losses=eval_losses,
                 final_mse=final_mse,
+                final_rmse=final_rmse,
             )
 
             metrics_file = os.path.join(output_dir, "metrics_mlp.json")
@@ -1014,11 +1057,13 @@ class TestSaveConfigAndMetrics:
             assert "train_losses" in metrics
             assert "eval_losses" in metrics
             assert "final_mse" in metrics
+            assert "final_rmse" in metrics
 
             # Verify values
             assert metrics["train_losses"] == train_losses
             assert metrics["eval_losses"] == eval_losses
             assert metrics["final_mse"] == final_mse
+            assert metrics["final_rmse"] == final_rmse
 
     def test_spec_value(self, simple_env):
         """Assert spec field equals o2."""
@@ -1032,6 +1077,7 @@ class TestSaveConfigAndMetrics:
                 train_losses=[0.5],
                 eval_losses=[0.6],
                 final_mse=0.25,
+                final_rmse=0.5,
             )
 
             config_file = os.path.join(output_dir, "config.json")
@@ -1052,6 +1098,7 @@ class TestSaveConfigAndMetrics:
                 train_losses=[0.5],
                 eval_losses=[0.6],
                 final_mse=0.25,
+                final_rmse=0.5,
             )
 
             # Verify returned hparams structure
@@ -1061,12 +1108,34 @@ class TestSaveConfigAndMetrics:
             assert hparams["batch_size"] == 32
             assert hparams["eval_steps"] == 10
 
+    def test_final_rmse_saved(self, simple_env):
+        """Verify final_rmse is saved in metrics JSON."""
+        with tempfile.TemporaryDirectory() as output_dir:
+            est_o2.save_config_and_metrics(
+                output_dir=output_dir,
+                model_type="mlp",
+                env=simple_env,
+                batch_size=32,
+                eval_steps=10,
+                train_losses=[0.5],
+                eval_losses=[0.6],
+                final_mse=0.25,
+                final_rmse=0.5,
+            )
+
+            metrics_file = os.path.join(output_dir, "metrics_mlp.json")
+            with open(metrics_file, "r", encoding="utf-8") as readable:
+                metrics = json.load(readable)
+
+            assert "final_rmse" in metrics
+            assert metrics["final_rmse"] == 0.5
+
 
 class TestTrain:
     """Tests for train() function."""
 
     def test_basic_convergence(self, simple_env, training_dataset):
-        """Verify training runs 10 epochs, returns valid MSE and predictions."""
+        """Verify training runs 10 epochs, returns valid MSE dict and predictions."""
         with tempfile.TemporaryDirectory() as output_dir:
             final_mse, predictions = est_o2.train(
                 env=simple_env,
@@ -1075,14 +1144,15 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=5,
                 log_episode_frequency=5,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir,
             )
 
-            # Verify valid MSE
-            assert isinstance(final_mse, float)
-            assert final_mse >= 0.0
+            # Verify valid MSE dict
+            assert isinstance(final_mse, dict)
+            assert final_mse["total"] >= 0.0
 
             # Verify predictions returned
             assert isinstance(predictions, list)
@@ -1098,6 +1168,7 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir,
@@ -1125,6 +1196,7 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir1,
@@ -1138,14 +1210,15 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=43,
                 model_type="mlp",
                 output_dir=output_dir2,
             )
 
         # Both should produce valid results
-        assert isinstance(mse1, float) and mse1 >= 0.0
-        assert isinstance(mse2, float) and mse2 >= 0.0
+        assert isinstance(mse1, dict) and mse1["total"] >= 0.0
+        assert isinstance(mse2, dict) and mse2["total"] >= 0.0
         assert len(preds1) > 0
         assert len(preds2) > 0
 
@@ -1159,6 +1232,7 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir1,
@@ -1172,13 +1246,14 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir2,
             )
 
         # Should be reproducible with same seed
-        np.testing.assert_allclose(mse1, mse2, atol=1e-6)
+        np.testing.assert_allclose(mse1["total"], mse2["total"], atol=1e-6)
 
     def test_invalid_model_type(self, simple_env, training_dataset):
         """Verify pytest.raises(ValueError, match='Unknown model_type') for invalid model type."""
@@ -1191,6 +1266,7 @@ class TestTrain:
                     batch_size=16,
                     eval_steps=3,
                     log_episode_frequency=3,
+                    regu_lam=1.0,
                     seed=42,
                     model_type="invalid_type",
                     output_dir=output_dir,
@@ -1206,6 +1282,7 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=5,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir,
@@ -1229,6 +1306,7 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir,
@@ -1242,7 +1320,7 @@ class TestTrain:
             assert has_events_file, "No tensorboard events file found"
 
     def test_predictions_structure(self, simple_env, training_dataset):
-        """Verify predictions JSON contains model_type, final_mse, num_predictions, predictions list."""
+        """Verify predictions JSON contains model_type, final_mse, final_rmse, num_predictions, predictions list."""
         with tempfile.TemporaryDirectory() as output_dir:
             est_o2.train(
                 env=simple_env,
@@ -1251,6 +1329,7 @@ class TestTrain:
                 batch_size=16,
                 eval_steps=3,
                 log_episode_frequency=3,
+                regu_lam=1.0,
                 seed=42,
                 model_type="mlp",
                 output_dir=output_dir,
@@ -1264,14 +1343,35 @@ class TestTrain:
             # Verify structure
             assert "model_type" in preds_data
             assert "final_mse" in preds_data
+            assert "final_rmse" in preds_data
             assert "num_predictions" in preds_data
             assert "predictions" in preds_data
 
             # Verify content
             assert preds_data["model_type"] == "mlp"
-            assert isinstance(preds_data["final_mse"], float)
+            assert isinstance(preds_data["final_mse"], dict)
+            assert "total" in preds_data["final_mse"]
             assert isinstance(preds_data["num_predictions"], int)
             assert isinstance(preds_data["predictions"], list)
+
+    def test_regu_lam_effect(self, simple_env, training_dataset):
+        """Verify regu_lam=0 makes total equal to reward component."""
+        with tempfile.TemporaryDirectory() as out1:
+            mse_lam0, _ = est_o2.train(
+                env=simple_env,
+                dataset=training_dataset,
+                train_epochs=3,
+                batch_size=16,
+                eval_steps=3,
+                log_episode_frequency=3,
+                regu_lam=0.0,
+                seed=42,
+                model_type="mlp",
+                output_dir=out1,
+            )
+
+        # With lam=0, total loss == reward loss (no regularization contribution)
+        np.testing.assert_allclose(mse_lam0["total"], mse_lam0["reward"], atol=1e-6)
 
 
 class TestEndToEnd:
@@ -1388,6 +1488,8 @@ class TestCommandLine:
             assert args.eval_steps == 20
             assert args.log_episode_frequency == 5
             assert args.num_runs == 1
+            assert args.regu_lam == 1.0
+            assert isinstance(args.local_eager_mode, bool)
 
         finally:
             # Restore original argv
@@ -1426,6 +1528,8 @@ class TestCommandLine:
                 "/tmp/test",
                 "--num-runs",
                 "3",
+                "--regu-lam",
+                "0.5",
             ]
 
             args = est_o2.parse_args()
@@ -1442,6 +1546,7 @@ class TestCommandLine:
             assert args.log_episode_frequency == 10
             assert args.output_dir == "/tmp/test"
             assert args.num_runs == 3
+            assert args.regu_lam == 0.5
 
         finally:
             # Restore original argv
