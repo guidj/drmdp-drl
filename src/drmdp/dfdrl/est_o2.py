@@ -329,7 +329,7 @@ def evaluate_model(
     collect_predictions: bool = True,
     max_batches: Optional[int] = None,
     shuffle: bool = False,
-) -> Tuple[Mapping[str, float], List[Any]]:
+) -> Tuple[Mapping[str, Sequence], List[Any]]:
     """
     Evaluate model using Markovian predictions.
 
@@ -430,7 +430,7 @@ def evaluate_model(
                 break
 
     metrics = {
-        key: torch.mean(torch.stack(errors[key])).item()
+        key: torch.stack(errors[key]).cpu().numpy()
         for key in ("reward", "regu", "total")
     }
     return metrics, predictions_list
@@ -445,6 +445,7 @@ def save_config_and_metrics(
     train_losses: Sequence,
     eval_losses: Sequence,
     final_mse: float,
+    final_rmse: float,
 ):
     """
     Save configuration and training metrics to JSON files.
@@ -458,6 +459,7 @@ def save_config_and_metrics(
         train_losses: List of training losses per epoch
         eval_losses: List of evaluation losses
         final_mse: Final mean squared error on test set
+        final_rmse: Final root mean squared error on test set
     """
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -471,6 +473,7 @@ def save_config_and_metrics(
                 "train_losses": train_losses,
                 "eval_losses": eval_losses,
                 "final_mse": final_mse,
+                "final_rmse": final_rmse,
             },
             writable,
             indent=2,
@@ -581,7 +584,7 @@ def train(
                 epoch_losses["total"].append(loss.item())
 
             # Mean loss for the epoch
-            avg_train_loss = np.mean(epoch_losses["total"])
+            avg_train_loss = np.mean(epoch_losses["total"]).item()
             train_losses.append(avg_train_loss)
             # Epoch results
             for key in ("reward", "regu", "total"):
@@ -605,19 +608,19 @@ def train(
                     max_batches=eval_steps,
                     shuffle=True,
                 )
-                eval_losses.append(eval_mse["total"])
+                eval_losses.append(np.mean(eval_mse["total"]).item())
                 # Epoch results
                 for key in ("reward", "regu", "total"):
                     summary_writer.add_scalar(
-                        f"MSE/eval/{key}", eval_mse[key], global_step=epoch
+                        f"MSE/eval/{key}", np.mean(eval_mse[key]), global_step=epoch
                     )
                     summary_writer.add_scalar(
                         f"RMSE/eval/{key}",
-                        np.sqrt(eval_mse[key]),
+                        np.mean(np.sqrt(eval_mse[key])),
                         global_step=epoch,
                     )
                 train_rmse = np.sqrt(avg_train_loss)
-                eval_rmse = np.sqrt(eval_mse["total"])
+                eval_rmse = np.mean(np.sqrt(eval_mse["total"]))
                 logging.info(
                     "Epoch [%d/%d], Train RMSE: %.8f, Eval RMSE: %.8f",
                     epoch + 1,
@@ -628,13 +631,19 @@ def train(
 
         # Final evaluation and save predictions
         logging.info("Final evaluation...")
-        final_mse, predictions_list = evaluate_model(
+        final_eval_metrics, predictions_list = evaluate_model(
             model,
             test_ds,
             batch_size,
             regu_lam=regu_lam,
         )
-        final_rmse = {key: np.sqrt(final_mse[key]) for key in final_mse}
+        final_mse = {
+            key: np.mean(value).item() for key, value in final_eval_metrics.items()
+        }
+        final_rmse = {
+            key: np.mean(np.sqrt(value)).item()
+            for key, value in final_eval_metrics.items()
+        }
         logging.info("Final Test RMSE: %.8f", final_rmse["total"])
 
         # Save predictions
@@ -644,6 +653,7 @@ def train(
                 {
                     "model_type": model_type,
                     "final_mse": final_mse,
+                    "final_rmse": final_rmse,
                     "num_predictions": len(predictions_list),
                     "predictions": [
                         {
@@ -686,6 +696,7 @@ def train(
             train_losses=train_losses,
             eval_losses=eval_losses,
             final_mse=final_mse,
+            final_rmse=final_rmse,
         )
 
         # Save config and final metrics
