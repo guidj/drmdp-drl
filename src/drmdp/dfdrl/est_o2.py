@@ -442,8 +442,8 @@ def save_config_and_metrics(
     env: gym.Env,
     batch_size: int,
     eval_steps: int,
-    train_losses: list,
-    eval_losses: list,
+    train_losses: Sequence,
+    eval_losses: Sequence,
     final_mse: float,
 ):
     """
@@ -580,6 +580,7 @@ def train(
                 epoch_losses["regu"].append(regu_loss.item())
                 epoch_losses["total"].append(loss.item())
 
+            # Mean loss for the epoch
             avg_train_loss = np.mean(epoch_losses["total"])
             train_losses.append(avg_train_loss)
             # Epoch results
@@ -605,18 +606,18 @@ def train(
                     shuffle=True,
                 )
                 eval_losses.append(eval_mse["total"])
-                train_rmse = np.sqrt(avg_train_loss)
-                eval_rmse = np.sqrt(eval_mse["total"])
                 # Epoch results
                 for key in ("reward", "regu", "total"):
                     summary_writer.add_scalar(
-                        f"MSE/eval/{key}", np.mean(eval_losses), global_step=epoch
+                        f"MSE/eval/{key}", eval_mse[key], global_step=epoch
                     )
                     summary_writer.add_scalar(
                         f"RMSE/eval/{key}",
-                        np.mean(np.sqrt(eval_losses)),
+                        np.sqrt(eval_mse[key]),
                         global_step=epoch,
                     )
+                train_rmse = np.sqrt(avg_train_loss)
+                eval_rmse = np.sqrt(eval_mse["total"])
                 logging.info(
                     "Epoch [%d/%d], Train RMSE: %.8f, Eval RMSE: %.8f",
                     epoch + 1,

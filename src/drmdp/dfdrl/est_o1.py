@@ -395,8 +395,8 @@ def save_config_and_metrics(
     env: gym.Env,
     batch_size: int,
     eval_steps: int,
-    train_losses: list,
-    eval_losses: list,
+    train_losses: Sequence,
+    eval_losses: Sequence,
     final_mse: float,
 ):
     """
