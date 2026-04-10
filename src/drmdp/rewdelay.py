@@ -155,16 +155,7 @@ class DataBuffer:
         """
         Adds data to buffer.
         """
-        if self.max_capacity and self.max_size_bytes:
-            if self._within_byte_limit(element) and self._within_capacity_limit():
-                self._append(element)
-        elif self.max_size_bytes:
-            if self._within_byte_limit(element):
-                self._append(element)
-        elif self.max_capacity:
-            if self._within_capacity_limit():
-                self._append(element)
-        else:
+        if self._within_byte_limit(element) and self._within_capacity_limit():
             self._append(element)
 
     def clear(self):
@@ -187,6 +178,8 @@ class DataBuffer:
 
     def _within_byte_limit(self, element: Any) -> bool:
         """Evict oldest entries if needed; return True if element can be added."""
+        if self.max_size_bytes is None:
+            return True
         if list_size(self.buffer + [element]) < self.max_size_bytes:
             return True
         if self.acc_mode == self.ACC_LASTEST:
@@ -197,6 +190,8 @@ class DataBuffer:
 
     def _within_capacity_limit(self) -> bool:
         """Evict oldest entry if needed; return True if element can be added."""
+        if self.max_capacity is None:
+            return True
         if self.size() < self.max_capacity:
             return True
         if self.acc_mode == self.ACC_LASTEST:
