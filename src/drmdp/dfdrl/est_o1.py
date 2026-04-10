@@ -56,7 +56,7 @@ class TrainingArgs:
     max_episode_steps: int
     delay: int
     train_epochs: int
-    num_steps: int
+    buffer_num_steps: int
     batch_size: int
     eval_steps: int
     log_episode_frequency: int
@@ -74,6 +74,7 @@ class RNetwork(nn.Module):
     def __init__(
         self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
+        """Initialize network layers for the given state and action dimensions."""
         super().__init__()
         self.register_buffer("powers", torch.tensor(range(powers)) + 1)
         self.num_hidden_layers = num_hidden_layers
@@ -119,10 +120,11 @@ class DictDataset(data.Dataset):
         self.length = len(labels)
 
     def __len__(self):
+        """Return number of examples in the dataset."""
         return self.length
 
     def __getitem__(self, idx):
-        # Return raw example without collation
+        """Return example at the given index."""
         return self.inputs[idx], self.labels[idx]
 
 
@@ -189,13 +191,13 @@ def collate_variable_length_sequences(batch):
 
 
 def create_training_buffer(
-    env, delay: rewdelay.RewardDelay, num_steps: int, seed: Optional[int] = None
+    env, delay: rewdelay.RewardDelay, buffer_num_steps: int, seed: Optional[int] = None
 ):
     """
     Collects example of (s,a,s',r,d) from an environment.
     """
     buffer = dataproc.collection_traj_data(
-        env, steps=num_steps, include_term=True, seed=seed
+        env, steps=buffer_num_steps, include_term=True, seed=seed
     )
     return delayed_reward_data(buffer, delay=delay)
 
@@ -225,9 +227,9 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
 
     def create_traj_step(state, action, reward, term):
         return {
-            "state": torch.tensor(state),
-            "action": torch.tensor(action),
-            "term": torch.tensor([float(term)]),
+            "state": torch.tensor(state, dtype=torch.float32),
+            "action": torch.tensor(action, dtype=torch.float32),
+            "term": torch.tensor([float(term)], dtype=torch.float32),
         }, torch.tensor(reward, dtype=torch.float32)
 
     def create_example(traj_steps: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
@@ -246,6 +248,10 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
 
         return data.default_collate(inputs), label_dict
 
+    # Handle empty buffer
+    if len(buffer) == 0:
+        return []
+
     states = np.concatenate(
         [
             np.stack([example[0] for example in buffer]),
@@ -260,24 +266,24 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     n_steps = states.shape[0]
     examples = []
     idx = 0
-    while True:
+    while idx < n_steps:
         example_steps = []
         steps = 0
         reward_delay = delay.sample()
-        while True:
+        while idx < n_steps and steps < reward_delay:
             traj_step = create_traj_step(
                 states[idx][:obs_dim], action[idx], reward[idx], term[idx]
             )
             example_steps.append(traj_step)
+            current_is_terminal = term[idx]
             idx += 1
             steps += 1
-            if steps == reward_delay or (idx >= n_steps):
+            # Stop window at terminal state (episode boundary)
+            if current_is_terminal:
                 break
-        # example is complete:
+        # Keep window only if it has the expected delay length
         if steps == reward_delay:
             examples.append(create_example(example_steps))
-        if idx >= n_steps:
-            break
     return examples
 
 
@@ -391,8 +397,8 @@ def save_config_and_metrics(
     env: gym.Env,
     batch_size: int,
     eval_steps: int,
-    train_losses: list,
-    eval_losses: list,
+    train_losses: Sequence,
+    eval_losses: Sequence,
     final_mse: float,
 ):
     """
@@ -633,6 +639,7 @@ def train(
 
 
 def experiment(args: TrainingArgs):
+    """Run a single training experiment for the given configuration."""
     logging.basicConfig(level=logging.INFO)
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
@@ -642,10 +649,15 @@ def experiment(args: TrainingArgs):
     delay = rewdelay.ClippedPoissonDelay(args.delay, min_delay=2)
     _, max_delay = delay.range()
     logging.info(
-        "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
+        "Collecting %d steps with delay=%d...",
+        args.buffer_num_steps * max_delay,
+        args.delay,
     )
     training_buffer = create_training_buffer(
-        env, delay=delay, num_steps=args.num_steps * max_delay, seed=args.seed
+        env,
+        delay=delay,
+        buffer_num_steps=args.buffer_num_steps * max_delay,
+        seed=args.seed,
     )
     logging.info("Created %d training examples", len(training_buffer))
 
@@ -686,6 +698,7 @@ def run_fn(args: TrainingArgs):
 
 
 def main():
+    """Parse args and launch Ray training runs."""
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
@@ -703,6 +716,7 @@ def main():
 
 
 def parse_args() -> TrainingArgs:
+    """Parse and return command-line training arguments."""
     parser = argparse.ArgumentParser(
         description="Train reward prediction models for delayed feedback"
     )
@@ -738,7 +752,7 @@ def parse_args() -> TrainingArgs:
         help="Number of epochs to train",
     )
     parser.add_argument(
-        "--num-steps",
+        "--buffer-num-steps",
         type=int,
         default=100,
         help="Number of steps to collect",

@@ -117,11 +117,11 @@ def json_from_dict(
         return mapping
 
     def go(data: Any, level: int):
+        """Recursively encode nested dicts to JSON strings at the threshold depth."""
         if isinstance(data, Mapping):
             if level >= dict_encode_level:
                 return json.dumps(data)
-            else:
-                return {key: go(value, level + 1) for key, value in data.items()}
+            return {key: go(value, level + 1) for key, value in data.items()}
         return data
 
     return {key: go(value, level=0) for key, value in mapping.items()}

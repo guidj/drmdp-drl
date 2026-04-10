@@ -6,6 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous Feedback (DAAF)** in MDPs. Implements DFDRL: Deep RL for Delayed Feedback, with reward estimation for policy control in off-policy deep reinforcement learning.
 
+## Workflows
+
+### Planning Mode
+When in planning mode, export the created plan to a `plans/` directory using the filename format `yyyy-mm-dd-{plan-name}.md`.
+
 ## Development Commands
 
 ### Environment Setup
@@ -72,20 +77,15 @@ Three reward estimation approaches with increasing sophistication:
 - Training: sum of predicted rewards = observed aggregate reward
 - Data generation: `delayed_reward_data()` creates windows from trajectories
 
-**O2 - Return-Grounded Dual Prediction** (`est_o2.py`):
-- Dual prediction networks with two-stage training
-- **Networks**:
-  - `RNetwork`, `RNetworkRNN`, `RNetworkTransformer`: Per-step reward prediction
-  - `GNetwork` (Transformer): Episodic return prediction
-- **Training Strategy**:
-  - Stage 1: Train `GNetwork` on returns
-  - Stage 2: Train `RNetwork` with regularizers:
-    - ρ₁: (Ĝ_curr - R_obs) - Ĝ_prev = 0 (grounds predictions on observed aggregate)
-    - ρ₂: (G_curr - R̂_obs) - G_prev = 0 (grounds predictions on actual returns)
-- **Data Generation**: `delayed_reward_data_consecutive_windows()`
-  - Creates consecutive overlapping windows within episodes
-  - **CRITICAL**: Windows NEVER span episode boundaries
-  - Zero-filled previous windows at episode starts
+**O2 - Return-Grounded Reward Prediction** (`est_o2.py`):
+- Single `RNetwork` (MLP) with return-consistency regularization
+- **Training**: Single stage with combined loss:
+  - `reward_loss`: MSE between summed per-step predictions and observed aggregate reward
+  - `regu_loss`: MSE(start_return + aggregate_reward, end_return) — ensures predictions are consistent with episodic return progression
+  - `total_loss = reward_loss + regu_lam * regu_loss`
+- **Data Generation**: `delayed_reward_data()` with `start_return`/`end_return` labels
+  - Each example tracks cumulative return before and after the window
+  - Windows stop at episode boundaries
 
 ### Data Processing & Utilities
 
@@ -99,6 +99,7 @@ Three reward estimation approaches with increasing sophistication:
 ### Local Execution
 ```sh
 sbin/local/rest-o1.sh  # Run O1 via Ray locally
+sbin/local/rest-o2.sh  # Run O2 via Ray locally
 ```
 
 ### Remote/Cluster
@@ -117,19 +118,18 @@ rjobs/rest-o1.sh  # Submit O1 to Ray cluster
 python src/drmdp/dfdrl/est_o1.py --env MountainCarContinuous-v0 --delay 3 --num-steps 10000
 
 # O2 Return-Grounded
-python src/drmdp/dfdrl/est_o2.py --env MountainCarContinuous-v0 --reward-model-type rnn \
-    --delay 3 --num-steps 10000 --lam 0.5 --xi 0.5
+python src/drmdp/dfdrl/est_o2.py --env MountainCarContinuous-v0 \
+    --delay 3 --num-steps 10000 --regu-lam 0.5
 ```
 
 ## Critical Architectural Patterns
 
 ### Episode Boundary Handling
 
-**CRITICAL CONSTRAINT**: Delayed reward windows MUST NEVER span episode boundaries.
+Delayed reward windows MUST NEVER span episode boundaries.
 
-When processing consecutive windows:
+When processing windows:
 - Cumulative returns reset at episode starts (no carryover)
-- Previous window data zero-filled for first window of each episode
 - Window generation stops at episode termination
 - No data leakage across episodes
 
@@ -152,6 +152,53 @@ When processing consecutive windows:
 ## Coding Style
 
 Follow **Google's Python Style Guide** with these specific conventions:
+
+**Code Organization (Newspaper Style)**: Organize code top-down with classes before functions, main routines before subroutines
+```python
+# Good - Classes first, then functions, main before helpers
+class RNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        ...
+
+    def forward(self, state, action):
+        # Main routine
+        out = self._preprocess(state, action)
+        return self._predict(out)
+
+    def _preprocess(self, state, action):
+        # Helper/subroutine
+        ...
+
+    def _predict(self, features):
+        # Helper/subroutine
+        ...
+
+def train_model(model, data):
+    # Main function
+    for batch in data:
+        loss = _compute_loss(model, batch)
+        _update_weights(model, loss)
+
+def _compute_loss(model, batch):
+    # Helper function
+    ...
+
+def _update_weights(model, loss):
+    # Helper function
+    ...
+```
+
+**Comments**: Keep comments focused on explaining why, not what; avoid meta-commentary
+```python
+# Good
+# Reset at episode boundaries to prevent return carryover across episodes
+if term[step_idx]:
+    cumulative_sum = 0.0
+
+# Avoid - don't add meta-commentary about criticality or implementation changes
+# CRITICAL: now we use variable length sequences so we need padding
+# IMPORTANT: this was changed from fixed to dynamic
+```
 
 **Imports**: Only import modules and types, not functions or variables directly
 ```python

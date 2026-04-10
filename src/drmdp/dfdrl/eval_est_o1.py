@@ -171,7 +171,7 @@ def evaluate_interactive(
     total_windows = 0
 
     for episode_idx in range(num_episodes):
-        observation, info = env.reset()
+        observation, _ = env.reset()
         terminated = False
         truncated = False
         window_count = 0
@@ -200,7 +200,7 @@ def evaluate_interactive(
                 sequence_actions.append(action)
                 sequence_terms.append(float(terminated))
 
-                next_observation, reward, terminated, truncated, info = env.step(action)
+                next_observation, reward, terminated, truncated, _ = env.step(action)
                 actual_rewards.append(reward)
 
                 observation = next_observation
@@ -277,6 +277,7 @@ def evaluate_interactive(
 
 
 def main():
+    """Parse args and evaluate O1 delayed aggregate reward prediction models."""
     parser = argparse.ArgumentParser(
         description="Evaluate O1 (delayed aggregate reward prediction) models"
     )
