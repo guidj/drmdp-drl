@@ -30,7 +30,7 @@ class IRCRRewardModel(base.RewardModel):
             guidance reward for each query point.
     """
 
-    def __init__(self, max_buffer_size: int, k_neighbors: int):
+    def __init__(self, max_buffer_size: int = 200, k_neighbors: int = 5):
         self._max_buffer_size = max_buffer_size
         self._k_neighbors = k_neighbors
         self._trajectories: List[base.Trajectory] = []

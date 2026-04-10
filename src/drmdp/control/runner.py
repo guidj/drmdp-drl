@@ -13,11 +13,12 @@ Usage:
 """
 
 import argparse
+import ast
 import dataclasses
 import logging
 import os
 import tempfile
-from typing import List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -42,8 +43,8 @@ class TrainingArgs:
         clear_buffer_on_update: Reset SAC's replay buffer after each reward
             model update. Useful for methods with dramatic reward redistribution
             (e.g. RUDDER).
-        ircr_buffer_size: Maximum number of trajectories in IRCR's database.
-        ircr_k_neighbors: Number of nearest neighbours used by IRCR.
+        reward_model_kwargs: Keyword arguments forwarded to the reward model
+            constructor. Keys and value types depend on the chosen model.
         num_steps: Total environment steps to train for.
         sac_learning_rate: Learning rate for SAC actor and critic networks.
         sac_buffer_size: Capacity of SAC's replay buffer.
@@ -60,8 +61,7 @@ class TrainingArgs:
     reward_model_type: str
     update_every_n_steps: int
     clear_buffer_on_update: bool
-    ircr_buffer_size: int
-    ircr_k_neighbors: int
+    reward_model_kwargs: Mapping[str, Any]
     num_steps: int
     sac_learning_rate: float
     sac_buffer_size: int
@@ -225,10 +225,7 @@ def run(args: TrainingArgs) -> None:
 def _make_reward_model(args: TrainingArgs) -> base.RewardModel:
     """Instantiate the reward model specified in args."""
     if args.reward_model_type == "ircr":
-        return ircr.IRCRRewardModel(
-            max_buffer_size=args.ircr_buffer_size,
-            k_neighbors=args.ircr_k_neighbors,
-        )
+        return ircr.IRCRRewardModel(**args.reward_model_kwargs)
     raise ValueError(f"Unknown reward_model_type: {args.reward_model_type!r}")
 
 
@@ -281,16 +278,14 @@ def parse_args() -> TrainingArgs:
         help="Reset SAC replay buffer after each reward model update",
     )
     parser.add_argument(
-        "--ircr-buffer-size",
-        type=int,
-        default=200,
-        help="Maximum number of trajectories in IRCR's database",
-    )
-    parser.add_argument(
-        "--ircr-k-neighbors",
-        type=int,
-        default=5,
-        help="Number of nearest neighbours for IRCR guidance rewards",
+        "--reward-model-kwarg",
+        action="append",
+        dest="reward_model_kwargs",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Reward-model-specific keyword argument (repeatable). "
+        "Values are parsed via ast.literal_eval; unrecognised literals "
+        "are kept as strings. E.g. --reward-model-kwarg max_buffer_size=200",
     )
     parser.add_argument(
         "--num-steps",
@@ -342,7 +337,31 @@ def parse_args() -> TrainingArgs:
     )
 
     args, _ = parser.parse_known_args()
-    return TrainingArgs(**vars(args))
+    args_dict = vars(args)
+    args_dict["reward_model_kwargs"] = _parse_reward_model_kwargs(
+        args_dict["reward_model_kwargs"]
+    )
+    return TrainingArgs(**args_dict)
+
+
+def _parse_reward_model_kwargs(
+    pairs: Sequence[str],
+) -> Mapping[str, Any]:
+    """Convert a list of 'key=value' strings into a keyword-argument mapping.
+
+    Values are parsed with ast.literal_eval so that integers, floats, and
+    booleans are returned with their native types.  Strings that cannot be
+    parsed as literals are kept as-is.
+    """
+    kwargs: Dict[str, Any] = {}
+    for pair in pairs:
+        key, _, raw = pair.partition("=")
+        try:
+            value: Any = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            value = raw
+        kwargs[key] = value
+    return kwargs
 
 
 if __name__ == "__main__":
