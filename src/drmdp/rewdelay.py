@@ -122,11 +122,16 @@ class ClippedPoissonDelay(RewardDelay):
 
 class DataBuffer:
     """
-    A data buffer, for storing inputs and
-    labels.
+    A fixed-capacity buffer for storing data samples.
 
-    Has a `max_capacity` to limit memory usage.
-    Either accumulates first or last samples.
+    Capacity is controlled by `max_capacity` (number of elements) and/or
+    `max_size_bytes` (total memory). When a limit is reached, behaviour
+    depends on `acc_mode`:
+
+    - ACC_FIRST: keeps the earliest samples; new elements are silently
+      dropped once the buffer is full.
+    - ACC_LASTEST: keeps the most recent samples; the oldest element is
+      evicted to make room before each new element is added.
     """
 
     ACC_FIRST = "FIRST"
@@ -150,47 +155,16 @@ class DataBuffer:
         """
         Adds data to buffer.
         """
-
         if self.max_capacity and self.max_size_bytes:
-            safe_byte_limit = True
-            safe_size_limit = True
-            if list_size(self.buffer + [element]) >= self.max_size_bytes:
-                if self.acc_mode == self.ACC_LASTEST:
-                    while list_size(self.buffer + [element]) >= self.max_size_bytes:
-                        self._pop_earliest()
-                else:
-                    safe_byte_limit = False
-
-            if self.size() >= self.max_capacity:
-                if self.acc_mode == self.ACC_LASTEST:
-                    self._pop_earliest()
-                else:
-                    safe_size_limit = False
-
-            if safe_byte_limit and safe_size_limit:
+            if self._within_byte_limit(element) and self._within_capacity_limit():
                 self._append(element)
-
         elif self.max_size_bytes:
-            if list_size(self.buffer + [element]) >= self.max_size_bytes:
-                if self.acc_mode == self.ACC_LASTEST:
-                    while list_size(self.buffer + [element]) >= self.max_size_bytes:
-                        self._pop_earliest()
-                    self._append(element)
-                # else acc_mode == ACC_FIRST - do not add
-            else:
+            if self._within_byte_limit(element):
                 self._append(element)
-
         elif self.max_capacity:
-            if self.size() >= self.max_capacity:
-                if self.acc_mode == self.ACC_LASTEST:
-                    self._pop_earliest()
-                    self._append(element)
-                # else mode == ACC_FIRST - do not add
-            else:
-                # Add new value
+            if self._within_capacity_limit():
                 self._append(element)
         else:
-            # No limits
             self._append(element)
 
     def clear(self):
@@ -210,6 +184,25 @@ class DataBuffer:
         Current buffer size in bytes.
         """
         return list_size(self.buffer)
+
+    def _within_byte_limit(self, element: Any) -> bool:
+        """Evict oldest entries if needed; return True if element can be added."""
+        if list_size(self.buffer + [element]) < self.max_size_bytes:
+            return True
+        if self.acc_mode == self.ACC_LASTEST:
+            while list_size(self.buffer + [element]) >= self.max_size_bytes:
+                self._pop_earliest()
+            return True
+        return False
+
+    def _within_capacity_limit(self) -> bool:
+        """Evict oldest entry if needed; return True if element can be added."""
+        if self.size() < self.max_capacity:
+            return True
+        if self.acc_mode == self.ACC_LASTEST:
+            self._pop_earliest()
+            return True
+        return False
 
     def _pop_earliest(self):
         """
