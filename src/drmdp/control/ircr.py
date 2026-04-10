@@ -24,6 +24,12 @@ class IRCRRewardModel(base.RewardModel):
     the K nearest stored (s, a) pairs, normalised to [0, 1] using the
     observed return range.
 
+    Before building the KDTree and before each query, all (s, a) vectors are
+    standardised per-dimension (zero mean, unit variance) using statistics
+    computed from the stored trajectories.  This prevents high-variance
+    dimensions (e.g. MuJoCo joint velocities) from dominating the distance
+    computation and makes the lookup meaningful in high-dimensional spaces.
+
     Attributes:
         max_buffer_size: Maximum number of trajectories to retain.
         k_neighbors: Number of nearest neighbours used to compute the
@@ -38,6 +44,9 @@ class IRCRRewardModel(base.RewardModel):
         self._sa_matrix: Optional[np.ndarray] = None  # (N_total, obs_dim + act_dim)
         # Maps each row in _sa_matrix back to its trajectory index.
         self._traj_indices: Optional[np.ndarray] = None  # (N_total,)
+        # Per-dimension mean and std computed from _sa_matrix for standardisation.
+        self._sa_mean: Optional[np.ndarray] = None  # (obs_dim + act_dim,)
+        self._sa_std: Optional[np.ndarray] = None  # (obs_dim + act_dim,)
         self._tree: Optional[spatial.KDTree] = None
         self._r_min: float = 0.0
         self._r_max: float = 1.0
@@ -53,13 +62,20 @@ class IRCRRewardModel(base.RewardModel):
         Returns zeros for all queries when the trajectory database is empty.
         """
         del terminals
-        if self._tree is None or self._sa_matrix is None or self._traj_indices is None:
+        if (
+            self._tree is None
+            or self._sa_matrix is None
+            or self._traj_indices is None
+            or self._sa_mean is None
+            or self._sa_std is None
+        ):
             return np.zeros(len(observations), dtype=np.float32)
 
         query = np.concatenate([observations, actions], axis=-1).astype(np.float64)
+        query_normalised = (query - self._sa_mean) / self._sa_std
         # Clamp k to the number of available (s, a) points.
         k_effective = min(self._k_neighbors, len(self._sa_matrix))
-        _, neighbor_indices = self._tree.query(query, k=k_effective)
+        _, neighbor_indices = self._tree.query(query_normalised, k=k_effective)
 
         # scipy returns shape (T,) when k=1; normalise to (T, k).
         if k_effective == 1:
@@ -96,7 +112,7 @@ class IRCRRewardModel(base.RewardModel):
         }
 
     def _rebuild_index(self) -> None:
-        """Flatten all stored (s, a) pairs into a matrix and build KDTree."""
+        """Flatten all stored (s, a) pairs, standardise, and build KDTree."""
         sa_parts: List[np.ndarray] = []
         traj_idx_parts: List[np.ndarray] = []
         for traj_idx, traj in enumerate(self._trajectories):
@@ -107,6 +123,13 @@ class IRCRRewardModel(base.RewardModel):
             )
         self._sa_matrix = np.concatenate(sa_parts, axis=0).astype(np.float64)
         self._traj_indices = np.concatenate(traj_idx_parts, axis=0)
-        self._tree = spatial.KDTree(self._sa_matrix)
+
+        # Standardise per dimension; clamp near-zero std to 1.0 so constant
+        # dimensions (e.g. unused action channels) do not blow up distances.
+        self._sa_mean = self._sa_matrix.mean(axis=0)
+        std = self._sa_matrix.std(axis=0)
+        self._sa_std = np.where(std > 1e-8, std, 1.0)
+
+        self._tree = spatial.KDTree((self._sa_matrix - self._sa_mean) / self._sa_std)
         self._r_min = float(min(traj.episode_return for traj in self._trajectories))
         self._r_max = float(max(traj.episode_return for traj in self._trajectories))

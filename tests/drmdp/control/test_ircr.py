@@ -163,3 +163,43 @@ class TestIRCRRewardModel:
         result = model.predict(obs, actions, np.zeros(3, dtype=bool))
 
         assert result.dtype == np.float32
+
+    def test_prediction_is_scale_invariant(self):
+        """Scaling state dimensions does not change guidance reward rankings.
+
+        Without per-dimension standardisation, high-variance dimensions (e.g.
+        MuJoCo joint velocities) dominate Euclidean distance and corrupt the
+        nearest-neighbour lookup.  This test verifies that multiplying one
+        dimension by a large constant does not affect the relative ordering of
+        guidance rewards.
+        """
+        rng = np.random.default_rng(0)
+        obs = rng.uniform(size=(5, 2)).astype(np.float32)
+        actions = rng.uniform(size=(5, 1)).astype(np.float32)
+
+        # Build two models: one on unit-scale data, one with the first obs
+        # dimension scaled by 1000 (simulating a high-variance MuJoCo state).
+        model_unit = ircr.IRCRRewardModel(max_buffer_size=10, k_neighbors=1)
+        model_scaled = ircr.IRCRRewardModel(max_buffer_size=10, k_neighbors=1)
+        for episode_return in [0.0, 5.0]:
+            model_unit.update([_make_trajectory(obs, actions, episode_return)])
+            obs_scaled = obs.copy()
+            obs_scaled[:, 0] *= 1000.0
+            model_scaled.update([_make_trajectory(obs_scaled, actions, episode_return)])
+
+        query_obs = rng.uniform(size=(4, 2)).astype(np.float32)
+        query_actions = rng.uniform(size=(4, 1)).astype(np.float32)
+        query_obs_scaled = query_obs.copy()
+        query_obs_scaled[:, 0] *= 1000.0
+
+        result_unit = model_unit.predict(
+            query_obs, query_actions, np.zeros(4, dtype=bool)
+        )
+        result_scaled = model_scaled.predict(
+            query_obs_scaled, query_actions, np.zeros(4, dtype=bool)
+        )
+
+        # Rankings (argsort) must be identical even though absolute scales differ.
+        np.testing.assert_array_equal(
+            np.argsort(result_unit), np.argsort(result_scaled)
+        )
