@@ -77,6 +77,45 @@ testpaths = [
     "tests",
 ]
 
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "I",
+    "E",
+]
+ignore = [
+    "E501",  # line-too-long
+]
+
+[tool.pylint.main]
+source-roots = ["src"]
+
+[tool.pylint.format]
+max-line-length = 88
+
+[tool.pylint.design]
+max-args = 8
+max-attributes = 10
+max-bool-expr = 5
+max-branches = 12
+max-locals = 15
+max-returns = 6
+max-statements = 50
+min-public-methods = 1
+
+[tool.pylint."messages control"]
+disable = [
+    "E1101",  # generated-members: false positives with PyTorch/numpy/gymnasium
+    "W0511",  # fixme: TODO comments are acceptable in research code
+    "R0801",  # similar lines are also acceptable
+    "C0301",  # line too long
+]
+
 [tool.mypy]
 warn_return_any = true
 warn_unused_configs = true
@@ -123,6 +162,7 @@ dev = [
     "platformdirs==4.0.0",
     "pluggy==1.5.0",
     "pylint>=4.0.5",
+    "pylint-to-ruff>=0.3.0",
     "pytest>=8.3.1",
     "pytest-cov>=6.0.0",
     "python-dateutil==2.8.2",
