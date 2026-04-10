@@ -56,7 +56,7 @@ class TrainingArgs:
     max_episode_steps: int
     delay: int
     train_epochs: int
-    num_steps: int
+    buffer_num_steps: int
     batch_size: int
     eval_steps: int
     log_episode_frequency: int
@@ -189,13 +189,13 @@ def collate_variable_length_sequences(batch):
 
 
 def create_training_buffer(
-    env, delay: rewdelay.RewardDelay, num_steps: int, seed: Optional[int] = None
+    env, delay: rewdelay.RewardDelay, buffer_num_steps: int, seed: Optional[int] = None
 ):
     """
     Collects example of (s,a,s',r,d) from an environment.
     """
     buffer = dataproc.collection_traj_data(
-        env, steps=num_steps, include_term=True, seed=seed
+        env, steps=buffer_num_steps, include_term=True, seed=seed
     )
     return delayed_reward_data(buffer, delay=delay)
 
@@ -646,10 +646,15 @@ def experiment(args: TrainingArgs):
     delay = rewdelay.ClippedPoissonDelay(args.delay, min_delay=2)
     _, max_delay = delay.range()
     logging.info(
-        "Collecting %d steps with delay=%d...", args.num_steps * max_delay, args.delay
+        "Collecting %d steps with delay=%d...",
+        args.buffer_num_steps * max_delay,
+        args.delay,
     )
     training_buffer = create_training_buffer(
-        env, delay=delay, num_steps=args.num_steps * max_delay, seed=args.seed
+        env,
+        delay=delay,
+        buffer_num_steps=args.buffer_num_steps * max_delay,
+        seed=args.seed,
     )
     logging.info("Created %d training examples", len(training_buffer))
 
@@ -742,7 +747,7 @@ def parse_args() -> TrainingArgs:
         help="Number of epochs to train",
     )
     parser.add_argument(
-        "--num-steps",
+        "--buffer-num-steps",
         type=int,
         default=100,
         help="Number of steps to collect",

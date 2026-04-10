@@ -1383,7 +1383,7 @@ class TestEndToEnd:
         delay = rewdelay.FixedDelay(3)
 
         examples = est_o2.create_training_buffer(
-            env, delay=delay, num_steps=50, seed=111
+            env, delay=delay, buffer_num_steps=50, seed=111
         )
 
         assert len(examples) > 0, "Should create at least one example"
@@ -1416,7 +1416,7 @@ class TestEndToEnd:
         delay = rewdelay.FixedDelay(3)
 
         examples = est_o2.create_training_buffer(
-            env, delay=delay, num_steps=50, seed=222
+            env, delay=delay, buffer_num_steps=50, seed=222
         )
 
         inputs_list, labels_list = zip(*examples)
@@ -1483,7 +1483,7 @@ class TestCommandLine:
             assert args.max_episode_steps == 2500
             assert args.delay == 3
             assert args.train_epochs == 100
-            assert args.num_steps == 100
+            assert args.buffer_num_steps == 100
             assert args.batch_size == 64
             assert args.eval_steps == 20
             assert args.log_episode_frequency == 5
@@ -1516,7 +1516,7 @@ class TestCommandLine:
                 "5",
                 "--train-epochs",
                 "50",
-                "--num-steps",
+                "--buffer-num-steps",
                 "200",
                 "--batch-size",
                 "32",
@@ -1540,7 +1540,7 @@ class TestCommandLine:
             assert args.max_episode_steps == 1000
             assert args.delay == 5
             assert args.train_epochs == 50
-            assert args.num_steps == 200
+            assert args.buffer_num_steps == 200
             assert args.batch_size == 32
             assert args.eval_steps == 10
             assert args.log_episode_frequency == 10

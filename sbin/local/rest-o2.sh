@@ -14,7 +14,7 @@ ray job submit \
     -- \
     python $PARENT_DIR/src/$BASE/dfdrl/est_o2.py \
         --delay=3 \
-        --num-steps=100 \
+        --buffer-num-steps=100 \
         --train-epochs=10 \
         --output-dir=$HOME/fs/$BASE/dfdrl-rest/o2/$TIMESTAMP \
         --task-prefix $TIMESTAMP \

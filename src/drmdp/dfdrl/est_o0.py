@@ -10,10 +10,10 @@ models in est_o1.py (o=1).
 
 Usage Example:
     # Train model on immediate reward prediction
-    python est_o0.py --env MountainCarContinuous-v0 --num-steps 100000
+    python est_o0.py --env MountainCarContinuous-v0 --buffer-num-steps 100000
 
     # Customize training
-    python est_o0.py --env Pendulum-v1 --num-steps 50000 --batch-size 128
+    python est_o0.py --env Pendulum-v1 --buffer-num-steps 50000 --batch-size 128
 """
 
 import argparse
@@ -99,19 +99,21 @@ class DictDataset(data.Dataset):
         return {key: self.inputs[key][idx] for key in self.inputs}, self.labels[idx]
 
 
-def create_training_buffer(env, num_steps: int):
+def create_training_buffer(env, buffer_num_steps: int):
     """
     Collects individual (s, a, d, r) tuples from an environment.
 
     Args:
         env: Gymnasium environment
-        num_steps: Number of steps to collect
+        buffer_num_steps: Number of steps to collect
 
     Returns:
         List of tuples (inputs_dict, reward) where inputs_dict contains
         "state", "action", and "term" tensors
     """
-    buffer = dataproc.collection_traj_data(env, steps=num_steps, include_term=True)
+    buffer = dataproc.collection_traj_data(
+        env, steps=buffer_num_steps, include_term=True
+    )
     return immediate_reward_data(buffer)
 
 
@@ -392,7 +394,7 @@ def main():
         help="Maximum steps per episode (default: 2500)",
     )
     parser.add_argument(
-        "--num-steps",
+        "--buffer-num-steps",
         type=int,
         default=100_000,
         help="Number of steps to collect (default: 100000)",
@@ -422,8 +424,10 @@ def main():
     print(f"Action space: {env.action_space}")
 
     # Create training buffer
-    print(f"\nCollecting {args.num_steps} steps...")
-    training_buffer = create_training_buffer(env, num_steps=args.num_steps)
+    print(f"\nCollecting {args.buffer_num_steps} steps...")
+    training_buffer = create_training_buffer(
+        env, buffer_num_steps=args.buffer_num_steps
+    )
     print(f"Created {len(training_buffer)} training examples")
 
     # Create dataset
