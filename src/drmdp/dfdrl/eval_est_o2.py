@@ -125,11 +125,7 @@ def evaluate_from_predictions_file(
     print(f"Showing {num_to_show}/{len(predictions)} examples")
     print("=" * 100)
     print(
-        f"{'Window':>8s} | "
-        f"{'Length':>8s} | "
-        f"{'Actual Reward':>15s} | "
-        f"{'Predicted Reward':>15s} | "
-        f"{'Error':>15s}"
+        f"{'Window':>8s} | {'Length':>8s} | {'Actual Reward':>15s} | {'Predicted Reward':>15s} | {'Error':>15s}"
     )
     print("=" * 100)
 
@@ -145,11 +141,7 @@ def evaluate_from_predictions_file(
         reward_errors.append(reward_error)
 
         print(
-            f"{idx:8d} | "
-            f"{window_len:8d} | "
-            f"{actual_reward:15.8f} | "
-            f"{predicted_reward:15.8f} | "
-            f"{reward_error:15.8f}"
+            f"{idx:8d} | {window_len:8d} | {actual_reward:15.8f} | {predicted_reward:15.8f} | {reward_error:15.8f}"
         )
 
     print("=" * 100)
@@ -194,11 +186,7 @@ def evaluate_interactive(
         print(f"\nEpisode {episode_idx + 1}/{num_episodes}")
         print("-" * 100)
         print(
-            f"{'Window':>8s} | "
-            f"{'Length':>8s} | "
-            f"{'Actual Reward':>15s} | "
-            f"{'Predicted Reward':>15s} | "
-            f"{'Error':>15s}"
+            f"{'Window':>8s} | {'Length':>8s} | {'Actual Reward':>15s} | {'Predicted Reward':>15s} | {'Error':>15s}"
         )
         print("-" * 100)
 
