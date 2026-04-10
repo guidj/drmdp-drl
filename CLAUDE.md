@@ -9,7 +9,7 @@ Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous
 ## Workflows
 
 ### Planning Mode
-When in planning mode, export the created plan to a `plans/` directory using the filename format `yyyy-mm-dd-{plan-name}.md`.
+When in planning mode, export the created plan to a `agents/plans/` directory using the filename format `yyyy-mm-dd-{plan-name}.md`.
 
 ## Development Commands
 
