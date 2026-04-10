@@ -87,6 +87,25 @@ Three reward estimation approaches with increasing sophistication:
   - Each example tracks cumulative return before and after the window
   - Windows stop at episode boundaries
 
+### Control: Off-Policy RL with Reward Model Interleaving (`src/drmdp/control/`)
+
+Online policy learning via SB3 SAC with pluggable reward estimation. The policy trains on *estimated* per-step rewards rather than the delayed aggregate rewards emitted by the environment.
+
+**Core abstractions** (`base.py`):
+- `Trajectory`: Frozen dataclass for a completed episode — `(observations, actions, env_rewards, terminals, episode_return)`
+- `RewardModel`: ABC with `predict(obs, actions, terminals) -> rewards` and `update(trajectories) -> metrics`
+- `RelabelingReplayBuffer(ReplayBuffer)`: SB3 subclass that calls `reward_model.predict()` inside `sample()` — reward relabeling is transparent to SAC; stored rewards are never modified
+
+**IRCR reward model** (`ircr.py`):
+- `IRCRRewardModel`: Non-parametric guidance rewards via KNN lookup over a trajectory database
+- For each (s, a), averages the episode returns of the K nearest stored (s, a) pairs, normalised to [0, 1]
+- No neural network; validates the control loop before parametric models are added
+
+**Control loop** (`runner.py`):
+- `TrainingArgs`: Frozen configuration dataclass
+- `RewardModelUpdateCallback(BaseCallback)`: Tracks episode trajectories, calls `reward_model.update()` at a fixed step interval, logs to `ExperimentLogger`
+- `run(args)`: Wraps env with `DelayedRewardWrapper` + `ImputeMissingRewardWrapper`, creates SAC with `RelabelingReplayBuffer`, then calls `sac.learn()`
+
 ### Data Processing & Utilities
 
 - `dataproc.py`: `collection_traj_data()` collects trajectories with episode boundary handling
@@ -98,8 +117,9 @@ Three reward estimation approaches with increasing sophistication:
 
 ### Local Execution
 ```sh
-sbin/local/rest-o1.sh  # Run O1 via Ray locally
-sbin/local/rest-o2.sh  # Run O2 via Ray locally
+sbin/local/rest-o1.sh     # Run O1 via Ray locally
+sbin/local/rest-o2.sh     # Run O2 via Ray locally
+sbin/local/control-ircr.sh  # Run IRCR + SAC control loop locally
 ```
 
 ### Remote/Cluster
@@ -120,6 +140,11 @@ python src/drmdp/dfdrl/est_o1.py --env MountainCarContinuous-v0 --delay 3 --num-
 # O2 Return-Grounded
 python src/drmdp/dfdrl/est_o2.py --env MountainCarContinuous-v0 \
     --delay 3 --num-steps 10000 --regu-lam 0.5
+
+# IRCR + SAC Control Loop
+python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
+    --delay 3 --num-steps 50000 --reward-model-type ircr \
+    --update-every-n-steps 1000 --output-dir /tmp/control-ircr
 ```
 
 ## Critical Architectural Patterns
@@ -148,6 +173,14 @@ When processing windows:
 3. **Training**: Model predicts per-step rewards summing to aggregate
    - O1: Direct window supervision
    - O2: Stage 1 return prediction → Stage 2 reward prediction with regularization
+
+### Reward Relabeling at Sample Time
+
+Rather than replacing rewards at collection time (env wrapper), `RelabelingReplayBuffer.sample()` calls `reward_model.predict()` on each drawn batch. This means:
+- The policy always trains on up-to-date estimates — when the reward model improves, the next sample reflects it
+- No modifications to stored buffer data
+- Reward models have no direct buffer access; control stays in the runner
+- Buffer can be explicitly cleared via `replay_buffer.reset()` when needed (configurable via `clear_buffer_on_update`)
 
 ## Coding Style
 
@@ -310,10 +343,15 @@ src/drmdp/
 ├── core.py, rewdelay.py, optsol.py  # Core abstractions
 ├── dataproc.py, mathutils.py        # Data & utilities
 ├── logger.py, metrics.py, ray_utils.py
-└── dfdrl/
-    ├── est_o0.py, est_o1.py, est_o2.py       # Reward estimation
-    └── eval_est_o0.py, eval_est_o1.py, eval_est_o2.py
+├── dfdrl/
+│   ├── est_o0.py, est_o1.py, est_o2.py       # Reward estimation (offline)
+│   └── eval_est_o0.py, eval_est_o1.py, eval_est_o2.py
+└── control/
+    ├── base.py    # Trajectory, RewardModel ABC, RelabelingReplayBuffer
+    ├── ircr.py    # IRCRRewardModel (non-parametric KNN guidance rewards)
+    └── runner.py  # TrainingArgs, RewardModelUpdateCallback, run(), CLI
 
-tests/drmdp/  # Mirrors src/ structure
-sbin/         # Experiment scripts (local/, rconfig/, rjobs/)
+tests/drmdp/         # Mirrors src/ structure
+sbin/                # Experiment scripts (local/, rconfig/, rjobs/)
+agents/plans/        # Implementation plans (yyyy-mm-dd-{name}.md)
 ```
