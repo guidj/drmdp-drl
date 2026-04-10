@@ -191,8 +191,9 @@ def _update_weights(model, loss):
 **Comments**: Keep comments focused on explaining why, not what; avoid meta-commentary
 ```python
 # Good
-# Use polynomial features to capture non-linear reward patterns
-out = torch.pow(torch.unsqueeze(out, -1), self.powers)
+# Reset at episode boundaries to prevent return carryover across episodes
+if term[step_idx]:
+    cumulative_sum = 0.0
 
 # Avoid - don't add meta-commentary about criticality or implementation changes
 # CRITICAL: now we use variable length sequences so we need padding
