@@ -178,7 +178,7 @@ def evaluate_interactive(
     total_windows = 0
 
     for episode_idx in range(num_episodes):
-        observation, info = env.reset()
+        observation, _ = env.reset()
         terminated = False
         truncated = False
         window_count = 0
@@ -207,7 +207,7 @@ def evaluate_interactive(
                 curr_actions.append(action)
                 curr_terms.append(float(terminated))
 
-                next_observation, reward, terminated, truncated, info = env.step(action)
+                next_observation, reward, terminated, truncated, _ = env.step(action)
                 curr_actual_rewards.append(reward)
 
                 observation = next_observation
@@ -284,6 +284,7 @@ def evaluate_interactive(
 
 
 def main():
+    """Parse args and evaluate O2 return-grounded reward estimation models."""
     parser = argparse.ArgumentParser(
         description="Evaluate O2 reward estimation models (MLP only)"
     )

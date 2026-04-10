@@ -151,7 +151,7 @@ def evaluate_interactive(model: nn.Module, env: gym.Env, num_episodes: int = 5) 
     print("=" * 80)
 
     for episode_idx in range(num_episodes):
-        observation, info = env.reset()
+        observation, _ = env.reset()
         episode_errors = []
         step_count = 0
         terminated = False
@@ -185,9 +185,7 @@ def evaluate_interactive(model: nn.Module, env: gym.Env, num_episodes: int = 5) 
                 )
 
             # Take step in environment
-            next_observation, actual_reward, terminated, truncated, info = env.step(
-                action
-            )
+            next_observation, actual_reward, terminated, truncated, _ = env.step(action)
 
             # Compute error
             error = abs(actual_reward - predicted_reward)
@@ -218,6 +216,7 @@ def evaluate_interactive(model: nn.Module, env: gym.Env, num_episodes: int = 5) 
 
 
 def main():
+    """Parse args and evaluate O0 immediate reward prediction models."""
     parser = argparse.ArgumentParser(
         description="Evaluate O0 (immediate reward prediction) models"
     )

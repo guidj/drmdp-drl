@@ -1,3 +1,5 @@
+"""Reward delay mechanisms and replay buffer for delayed feedback RL."""
+
 import abc
 import random
 import sys
@@ -33,14 +35,17 @@ class RewardDelay(abc.ABC):
     """
 
     @abc.abstractmethod
-    def sample(self) -> int: ...
+    def sample(self) -> int:
+        """Sample a delay value."""
 
     @abc.abstractmethod
-    def range(self) -> Tuple[int, int]: ...
+    def range(self) -> Tuple[int, int]:
+        """Return the (min, max) range of possible delay values."""
 
     @classmethod
     @abc.abstractmethod
-    def id(cls) -> str: ...
+    def id(cls) -> str:
+        """Return a string identifier for this delay type."""
 
 
 class FixedDelay(RewardDelay):
@@ -75,6 +80,7 @@ class UniformDelay(RewardDelay):
         self.max_delay = max_delay
 
     def sample(self):
+        """Sample a delay value uniformly at random from the configured range."""
         return random.randint(self.min_delay, self.max_delay)
 
     def range(self) -> Tuple[int, int]:

@@ -1,3 +1,5 @@
+"""Optimization and Bayesian linear regression utilities."""
+
 import abc
 import dataclasses
 from typing import Callable, Optional, Sequence
@@ -19,6 +21,7 @@ class MultivariateNormal:
 
     @staticmethod
     def perturb_covariance_matrix(cov, noise: float = 1e-6):
+        """Perturb covariance matrix eigenvalues to ensure positive definiteness."""
         eig_values, eig_matrix = np.linalg.eig(cov)
         perturbed_eig_values = np.maximum(
             eig_values, np.array([noise] * len(eig_values))
@@ -123,14 +126,17 @@ class LearningRateSchedule(abc.ABC):
 
     @abc.abstractmethod
     def schedule(self, episode: Optional[int] = None, step: Optional[int] = None):
-        pass
+        """Return the learning rate for the given episode and step."""
 
     def __call__(self, episode: int, step: int):
         return self.schedule(episode, step)
 
 
 class ConstantLRSchedule(LearningRateSchedule):
+    """Learning rate schedule that returns a constant value."""
+
     def schedule(self, episode=None, step=None):
+        """Return the constant initial learning rate regardless of episode or step."""
         del episode
         del step
         return self.initial_lr

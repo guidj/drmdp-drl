@@ -51,6 +51,7 @@ class RNetwork(nn.Module):
     def __init__(
         self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
+        """Initialize network layers for the given state and action dimensions."""
         super().__init__()
         self.layers = []
         self.powers = torch.tensor(range(powers)) + 1
@@ -378,6 +379,7 @@ def train(
 
 
 def main():
+    """Parse args and train the immediate reward prediction model."""
     parser = argparse.ArgumentParser(
         description="Train immediate reward prediction model (Markovian baseline)"
     )

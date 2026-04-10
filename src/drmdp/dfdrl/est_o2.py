@@ -94,6 +94,7 @@ class RNetwork(nn.Module):
     def __init__(
         self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
+        """Initialize network layers for the given state and action dimensions."""
         super().__init__()
         self.register_buffer("powers", torch.tensor(range(powers)) + 1)
         self.num_hidden_layers = num_hidden_layers
@@ -139,10 +140,11 @@ class DictDataset(data.Dataset):
         self.length = len(labels)
 
     def __len__(self):
+        """Return number of examples in the dataset."""
         return self.length
 
     def __getitem__(self, idx):
-        # Return raw example without collation
+        """Return example at the given index."""
         return self.inputs[idx], self.labels[idx]
 
 
@@ -731,10 +733,10 @@ def train(
         # Save config and final metrics
         summary_writer.add_hparams(
             hparam_dict=hparams,
-            metric_dict=dict(
+            metric_dict={
                 **{f"mse.{key}": value for key, value in final_mse.items()},
                 **{f"rmse.{key}": value for key, value in final_rmse.items()},
-            ),
+            },
         )
         # Create sample input for graph tracing
         sample_input = (

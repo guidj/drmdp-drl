@@ -1,3 +1,5 @@
+"""Trajectory data collection utilities for RL environments."""
+
 import copy
 import uuid
 from typing import Any, Mapping, Optional, Sequence
@@ -61,7 +63,7 @@ def process_data(df_raw):
     """
 
     def simplify_meta(meta):
-        new_meta = dict(**meta, **meta["experiment"])
+        new_meta = {**meta, **meta["experiment"]}
         new_meta["reward_mapper"] = MAPPERS_NAMES[
             new_meta["problem_spec"]["reward_mapper"]["name"]
         ]
@@ -72,8 +74,7 @@ def process_data(df_raw):
     def get_method(meta: Mapping[str, Any]):
         if meta["policy_type"] != "PP":
             return meta["policy_type"]
-        else:
-            return meta["reward_mapper"]
+        return meta["reward_mapper"]
 
     def filter_method(method):
         return method not in (["L-TDD[CV]", "L-TDD[CV-R]", "LEAST", "OP-S"])

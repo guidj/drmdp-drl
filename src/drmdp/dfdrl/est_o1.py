@@ -74,6 +74,7 @@ class RNetwork(nn.Module):
     def __init__(
         self, state_dim, action_dim, powers=1, num_hidden_layers=4, hidden_dim=256
     ):
+        """Initialize network layers for the given state and action dimensions."""
         super().__init__()
         self.register_buffer("powers", torch.tensor(range(powers)) + 1)
         self.num_hidden_layers = num_hidden_layers
@@ -119,10 +120,11 @@ class DictDataset(data.Dataset):
         self.length = len(labels)
 
     def __len__(self):
+        """Return number of examples in the dataset."""
         return self.length
 
     def __getitem__(self, idx):
-        # Return raw example without collation
+        """Return example at the given index."""
         return self.inputs[idx], self.labels[idx]
 
 
@@ -637,6 +639,7 @@ def train(
 
 
 def experiment(args: TrainingArgs):
+    """Run a single training experiment for the given configuration."""
     logging.basicConfig(level=logging.INFO)
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
@@ -695,6 +698,7 @@ def run_fn(args: TrainingArgs):
 
 
 def main():
+    """Parse args and launch Ray training runs."""
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
@@ -712,6 +716,7 @@ def main():
 
 
 def parse_args() -> TrainingArgs:
+    """Parse and return command-line training arguments."""
     parser = argparse.ArgumentParser(
         description="Train reward prediction models for delayed feedback"
     )

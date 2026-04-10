@@ -53,6 +53,7 @@ def interger_to_sequence(
 
 
 def hashtrick(xs, dim: int):
+    """Hash a sparse feature vector to a dense vector of the given dimension."""
     if dim <= 0:
         raise ValueError("`dim` must be positive")
     # Get indices of non-zero elements directly
@@ -67,6 +68,7 @@ def hashtrick(xs, dim: int):
 
 
 def poisson_exact_confidence_interval(observed_value: int, confidence: float = 0.95):
+    """Compute an exact confidence interval for a Poisson-distributed observed value."""
     # Calculate alpha (the complement of the confidence level)
     alpha = 1 - confidence
 
