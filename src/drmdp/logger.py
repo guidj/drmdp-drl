@@ -19,8 +19,6 @@ from typing import (
 import numpy as np
 import tensorflow as tf
 
-from drmdp import core
-
 
 class ExperimentLogger(contextlib.AbstractContextManager):
     """
@@ -33,15 +31,20 @@ class ExperimentLogger(contextlib.AbstractContextManager):
     def __init__(
         self,
         log_dir: str,
-        experiment_instance: core.ExperimentInstance,
+        params: Any,
     ):
         self.log_file = os.path.join(log_dir, self.LOG_FILE_NAME)
         self.param_file = os.path.join(log_dir, self.PARAM_FILE_NAME)
         if not tf.io.gfile.exists(log_dir):
             tf.io.gfile.makedirs(log_dir)
 
+        serialisable = (
+            dataclasses.asdict(params)
+            if dataclasses.is_dataclass(params) and not isinstance(params, type)
+            else params
+        )
         with tf.io.gfile.GFile(self.param_file, "w") as writer:
-            writer.write(json.dumps(dataclasses.asdict(experiment_instance)))
+            writer.write(json.dumps(serialisable))
 
         self._writer: Optional[tf.io.gfile.GFile] = None
 
