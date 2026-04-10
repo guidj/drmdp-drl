@@ -338,13 +338,13 @@ def parse_args() -> TrainingArgs:
 
     args, _ = parser.parse_known_args()
     args_dict = vars(args)
-    args_dict["reward_model_kwargs"] = _parse_reward_model_kwargs(
+    args_dict["reward_model_kwargs"] = parse_reward_model_kwargs(
         args_dict["reward_model_kwargs"]
     )
     return TrainingArgs(**args_dict)
 
 
-def _parse_reward_model_kwargs(
+def parse_reward_model_kwargs(
     pairs: Sequence[str],
 ) -> Mapping[str, Any]:
     """Convert a list of 'key=value' strings into a keyword-argument mapping.

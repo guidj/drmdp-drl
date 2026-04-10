@@ -317,35 +317,35 @@ class TestRun:
 class TestParseRewardModelKwargs:
     def test_empty_list_returns_empty_mapping(self):
         """An empty input list produces an empty mapping."""
-        result = runner._parse_reward_model_kwargs([])
+        result = runner.parse_reward_model_kwargs([])
         assert result == {}
 
     def test_int_value_parsed(self):
         """Integer strings are coerced to int."""
-        result = runner._parse_reward_model_kwargs(["max_buffer_size=200"])
+        result = runner.parse_reward_model_kwargs(["max_buffer_size=200"])
         assert result["max_buffer_size"] == 200
         assert isinstance(result["max_buffer_size"], int)
 
     def test_float_value_parsed(self):
         """Float strings are coerced to float."""
-        result = runner._parse_reward_model_kwargs(["alpha=0.5"])
+        result = runner.parse_reward_model_kwargs(["alpha=0.5"])
         assert result["alpha"] == pytest.approx(0.5)
         assert isinstance(result["alpha"], float)
 
     def test_bool_value_parsed(self):
         """Boolean literals True/False are coerced to bool."""
-        result = runner._parse_reward_model_kwargs(["flag=True"])
+        result = runner.parse_reward_model_kwargs(["flag=True"])
         assert result["flag"] is True
 
     def test_string_fallback_for_non_literal(self):
         """Values that are not valid Python literals are kept as plain strings."""
-        result = runner._parse_reward_model_kwargs(["mode=cosine"])
+        result = runner.parse_reward_model_kwargs(["mode=cosine"])
         assert result["mode"] == "cosine"
         assert isinstance(result["mode"], str)
 
     def test_multiple_pairs(self):
         """Multiple key=value pairs are all parsed into the same mapping."""
-        result = runner._parse_reward_model_kwargs(
+        result = runner.parse_reward_model_kwargs(
             ["max_buffer_size=200", "k_neighbors=5"]
         )
         assert result == {"max_buffer_size": 200, "k_neighbors": 5}

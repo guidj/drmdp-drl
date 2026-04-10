@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
-from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common import buffers
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 
 
@@ -68,7 +68,7 @@ class RewardModel(ABC):
         """
 
 
-class RelabelingReplayBuffer(ReplayBuffer):
+class RelabelingReplayBuffer(buffers.ReplayBuffer):
     """Replay buffer that relabels rewards at sample time via a reward model.
 
     Rewards stored in the buffer are never modified. The reward model is
