@@ -109,6 +109,9 @@ class IRCRRewardModel(base.RewardModel):
             "buffer_size": float(len(self._trajectories)),
             "r_min": self._r_min,
             "r_max": self._r_max,
+            "training_steps": float(
+                sum(len(traj.observations) for traj in trajectories)
+            ),
         }
 
     def _rebuild_index(self) -> None:

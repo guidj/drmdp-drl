@@ -25,7 +25,7 @@ import numpy as np
 import stable_baselines3
 from stable_baselines3.common import callbacks
 
-from drmdp import logger, rewdelay
+from drmdp import core, logger, rewdelay
 from drmdp.control import base, ircr
 
 
@@ -108,6 +108,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         # Completed trajectories not yet passed to the reward model.
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
+        self._reward_model_total_steps: int = 0
 
     def _on_step(self) -> bool:
         # model._last_obs has shape (n_envs, obs_dim); index 0 for single env.
@@ -151,6 +152,9 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._episode_count += 1
 
         if self._episode_count % self._log_episode_frequency == 0:
+            true_episode_return = float(
+                self.locals["infos"][0].get("true_episode_return", 0.0)
+            )
             est_rewards = self._reward_model.predict(
                 trajectory.observations,
                 trajectory.actions,
@@ -159,8 +163,11 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             self._exp_logger.log(
                 episode=self._episode_count,
                 steps=self._episode_steps,
-                returns=trajectory.episode_return,
+                returns=true_episode_return,
                 info={
+                    "sac_total_steps": self.num_timesteps,
+                    "reward_model_total_steps": self._reward_model_total_steps,
+                    "delayed_returns": trajectory.episode_return,
                     "estimated_return": float(est_rewards.sum()),
                     "reward_model": dict(self._last_model_metrics),
                 },
@@ -175,6 +182,9 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
     def _flush_pending_trajectories(self) -> None:
         """Pass pending trajectories to the reward model and optionally clear the buffer."""
         self._last_model_metrics = self._reward_model.update(self._pending_trajectories)
+        self._reward_model_total_steps += int(
+            self._last_model_metrics.get("training_steps", 0)
+        )
         self._pending_trajectories = []
         if self._clear_buffer_on_update:
             self.model.replay_buffer.reset()
@@ -191,6 +201,7 @@ def run(args: TrainingArgs) -> None:
     logging.info("Training args: %s", args)
 
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
+    env = core.EnvMonitorWrapper(env)
     env = rewdelay.DelayedRewardWrapper(env, rewdelay.FixedDelay(args.delay))
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
 
