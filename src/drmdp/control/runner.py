@@ -270,7 +270,7 @@ def parse_args() -> TrainingArgs:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=None,
+        default=2500,
         help="Maximum steps per episode (None = environment default)",
     )
     parser.add_argument(
