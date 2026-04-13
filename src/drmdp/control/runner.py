@@ -206,7 +206,6 @@ def run(args: TrainingArgs) -> None:
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
 
     reward_model = _make_reward_model(args)
-
     with logger.ExperimentLogger(args.output_dir, params=args) as exp_logger:
         sac = stable_baselines3.SAC(
             "MlpPolicy",
@@ -227,7 +226,12 @@ def run(args: TrainingArgs) -> None:
             log_episode_frequency=args.log_episode_frequency,
             exp_logger=exp_logger,
         )
-        sac.learn(total_timesteps=args.num_steps, callback=callback)
+        sac.learn(
+            total_timesteps=args.num_steps,
+            log_interval=args.log_episode_frequency,
+            callback=callback,
+            progress_bar=True,
+        )
 
     sac.save(os.path.join(args.output_dir, "sac_model"))
     logging.info("Model saved to %s/sac_model", args.output_dir)
