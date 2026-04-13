@@ -419,7 +419,7 @@ def evaluate_model(
             aggregate_rewards = labels["aggregate_reward"].float()
             reward_mse = eval_criterion(pred_window_reward, aggregate_rewards)
             regu_mse = regu_criterion(
-                labels["start_return"] + aggregate_rewards, labels["end_return"]
+                labels["start_return"] + pred_window_reward, labels["end_return"]
             )
             mean_squared_error = reward_mse + (regu_lam * regu_mse)
             errors["reward"].append(reward_mse)
@@ -600,7 +600,7 @@ def train(
                 # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
                 aggregate_rewards = labels["aggregate_reward"].float()
                 regu_loss = regu_criterion(
-                    labels["start_return"] + aggregate_rewards, labels["end_return"]
+                    labels["start_return"] + window_reward, labels["end_return"]
                 )
                 reward_loss = criterion(window_reward, aggregate_rewards)
                 loss = reward_loss + (regu_lam * regu_loss)

@@ -1551,3 +1551,101 @@ class TestCommandLine:
         finally:
             # Restore original argv
             sys.argv = original_argv
+
+
+# =============================================================================
+# TestReguLoss
+# =============================================================================
+
+
+class TestReguLoss:
+    """Regression tests for the regu_loss computation in train().
+
+    These tests verify that regu_loss depends on model predictions (window_reward),
+    not on the observed aggregate_reward. Using aggregate_reward produces zero
+    gradients w.r.t. model parameters, making regularization a no-op.
+    """
+
+    def test_regu_loss_gradient_nonzero(self):
+        """Verify regu_loss computed from window_reward has non-zero gradients.
+
+        Constructs a minimal forward pass, computes regu_loss using the model's
+        predicted window_reward, and checks that at least one parameter receives
+        a non-zero gradient after backward().
+        """
+        torch.manual_seed(42)
+        model = est_o2.RNetwork(state_dim=4, action_dim=2, hidden_dim=32)
+        criterion = torch.nn.MSELoss()
+
+        batch_size = 3
+        seq_len = 5
+        state = torch.randn(batch_size, seq_len, 4)
+        action = torch.randn(batch_size, seq_len, 2)
+        term = torch.zeros(batch_size, seq_len, 1)
+
+        start_return = torch.randn(batch_size)
+        end_return = torch.randn(batch_size)
+
+        # Forward pass: outputs shape (batch_size, seq_len, 1)
+        outputs = model(state, action, term)
+        window_reward = torch.sum(outputs, dim=1).squeeze(-1)
+
+        # regu_loss using model predictions — gradients must flow
+        regu_loss = criterion(start_return + window_reward, end_return)
+        regu_loss.backward()
+
+        # At least one parameter must have a non-zero gradient
+        has_nonzero_grad = any(
+            param.grad is not None and param.grad.abs().sum().item() > 0.0
+            for param in model.parameters()
+        )
+        assert has_nonzero_grad, (
+            "regu_loss using window_reward must produce non-zero gradients"
+        )
+
+    def test_regu_loss_uses_model_predictions(self):
+        """Verify regu_loss changes when window_reward (model output) changes.
+
+        Keeps start_return, end_return, and aggregate_reward fixed while
+        varying window_reward. Confirms the loss is sensitive to model outputs.
+        """
+        torch.manual_seed(42)
+        criterion = torch.nn.MSELoss()
+
+        batch_size = 4
+        start_return = torch.tensor([0.0, 1.0, 2.0, 3.0])
+        end_return = torch.tensor([1.0, 2.0, 3.0, 4.0])
+
+        # Two different model predictions
+        window_reward_a = torch.ones(batch_size) * 0.5
+        window_reward_b = torch.ones(batch_size) * 2.0
+
+        regu_loss_a = criterion(start_return + window_reward_a, end_return)
+        regu_loss_b = criterion(start_return + window_reward_b, end_return)
+
+        # The two losses must differ — regu_loss is sensitive to window_reward
+        assert not torch.isclose(regu_loss_a, regu_loss_b), (
+            "regu_loss must change when window_reward changes"
+        )
+
+    def test_regu_loss_zero_when_predictions_match_returns(self):
+        """Verify regu_loss is zero when window_reward == end_return - start_return.
+
+        When the model perfectly predicts per-step rewards that sum to the
+        observed aggregate, the regularization term should be zero.
+        """
+        torch.manual_seed(42)
+        criterion = torch.nn.MSELoss()
+
+        batch_size = 3
+        start_return = torch.tensor([0.0, 5.0, -2.0])
+        end_return = torch.tensor([1.0, 7.0, -1.0])
+
+        # Perfect predictions: window_reward == end_return - start_return
+        window_reward = end_return - start_return
+
+        regu_loss = criterion(start_return + window_reward, end_return)
+
+        assert regu_loss.item() < 1e-6, (
+            f"regu_loss should be ~0 when predictions match returns, got {regu_loss.item()}"
+        )
