@@ -338,3 +338,93 @@ def test_data_buffer_max_capacity_max_size_bytes_with_latest_acc_mode():
     assert buffer.buffer == [1]
     assert buffer.size() == 1
     assert buffer.size_bytes() == 32
+
+
+# ---------------------------------------------------------------------------
+# TestImputeMissingRewardWrapper
+# ---------------------------------------------------------------------------
+
+
+class TestImputeMissingRewardWrapper:
+    """Tests for ImputeMissingRewardWrapper.
+
+    Focuses on the info["interval_end"] flag introduced to let downstream
+    components identify interval boundaries without relying on reward != 0.
+    """
+
+    def _make_env(self, delay: int = 3) -> rewdelay.ImputeMissingRewardWrapper:
+        """Build a DelayedRewardWrapper + ImputeMissingRewardWrapper stack."""
+        env = DummyEnv(term_steps=100)
+        env = rewdelay.DelayedRewardWrapper(
+            env, reward_delay=rewdelay.FixedDelay(delay)
+        )
+        return rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
+
+    def test_interval_end_false_on_non_boundary_step(self):
+        """info["interval_end"] is False on steps where no reward is emitted."""
+        env = self._make_env(delay=3)
+        env.reset()
+        _, _, _, _, info = env.step(0)
+        assert info["interval_end"] is False
+
+    def test_interval_end_true_on_boundary_step(self):
+        """info["interval_end"] is True on the final step of a signal interval."""
+        env = self._make_env(delay=3)
+        env.reset()
+        # Steps 1 and 2 are non-boundary; step 3 (index 2) ends the interval.
+        env.step(0)
+        env.step(0)
+        _, _, _, _, info = env.step(0)
+        assert info["interval_end"] is True
+
+    def test_interval_end_true_when_aggregate_reward_is_zero(self):
+        """interval_end is True even when the aggregate reward sums to 0.
+
+        This is the key case that motivated using info["interval_end"] instead
+        of checking reward != 0: per-step rewards that cancel out would produce
+        a non-zero interval_end flag but a zero imputed reward.
+        """
+
+        class ZeroRewardEnv(gym.Env):
+            """All per-step rewards are 0.0."""
+
+            def __init__(self) -> None:
+                self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(2,))
+                self.action_space = spaces.Discrete(2)
+
+            def step(self, action):
+                del action
+                return np.zeros(2), 0.0, False, False, {}
+
+            def reset(self, seed=None, options=None):
+                del seed, options
+                return np.zeros(2), {}
+
+        env: gym.Env = ZeroRewardEnv()
+        env = rewdelay.DelayedRewardWrapper(env, reward_delay=rewdelay.FixedDelay(2))
+        env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
+        env.reset()
+        env.step(0)
+        _, reward, _, _, info = env.step(0)
+        # Aggregate reward is 0.0 + 0.0 = 0.0, but interval_end must be True.
+        assert reward == 0.0
+        assert info["interval_end"] is True
+
+    def test_non_boundary_reward_is_imputed_to_zero(self):
+        """Non-boundary steps return the configured impute_value (0.0)."""
+        env = self._make_env(delay=3)
+        env.reset()
+        _, reward, _, _, info = env.step(0)
+        assert reward == 0.0
+        assert info["interval_end"] is False
+
+    def test_boundary_reward_passes_through(self):
+        """The aggregate reward on a boundary step is not altered."""
+        env = self._make_env(delay=3)
+        env.reset()
+        env.step(0)
+        env.step(0)
+        _, reward, _, _, info = env.step(0)
+        # DummyEnv always returns 1.0; aggregate over 3 steps = 3.0.
+        assert reward == 3.0
+        assert info["interval_end"] is True

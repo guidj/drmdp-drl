@@ -372,19 +372,31 @@ class DelayedRewardWrapper(gym.Wrapper, SupportsName):
         }
 
 
-class ImputeMissingRewardWrapper(gym.RewardWrapper, SupportsName):
-    """
-    Missing rewards (`None`) are replaced with zero.
+class ImputeMissingRewardWrapper(gym.Wrapper, SupportsName):
+    """Missing rewards (``None``) are replaced with ``impute_value``.
+
+    Also injects ``info["interval_end"]`` — a boolean indicating whether the
+    underlying environment emitted a real reward signal on this step.  This
+    flag is set to ``True`` even when the aggregate reward is zero, making it
+    robust to signal intervals whose per-step rewards cancel out.
     """
 
     def __init__(self, env: gym.Env, impute_value: float):
         super().__init__(env)
         self.impute_value = float(impute_value)
 
-    def reward(self, reward):
+    def step(self, action):  # type: ignore[override]
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        interval_end = reward is not None
         if reward is None:
-            return self.impute_value
-        return reward
+            reward = self.impute_value
+        return (
+            obs,
+            reward,
+            terminated,
+            truncated,
+            {**info, "interval_end": interval_end},
+        )
 
 
 def list_size(xs: List[Any]) -> int:
