@@ -11,6 +11,37 @@ Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous
 ### Planning Mode
 When in planning mode, export the created plan to a `agents/plans/` directory using the filename format `yyyy-mm-dd-{plan-name}.md`.
 
+### Verification After Changes
+
+After completing any non-trivial implementation — new source files, refactors, or new/modified test files — spawn a dedicated subagent to audit the touched files. Do **not** rely on your own review of changes you just wrote; a fresh subagent catches violations the authoring agent overlooks.
+
+The subagent must check every file that was touched or created across four areas, and make corrections directly rather than just reporting issues:
+
+**Style compliance** (`src/` and `tests/`):
+- Newspaper order: classes before module-level functions; within each class, `__init__` first, then public methods, then `_`-prefixed helpers last
+- All imports at module level — no inline imports inside functions or methods
+- Only modules/types imported, never bare functions or variables (`from module import function` is forbidden)
+- No single-letter variable names; no what-comments (comments must explain *why*, not *what*)
+- Fully-parameterised `typing` module annotations; mutable types (`List`, `Dict`) only when mutation is required
+
+**Test file structure** (`tests/`):
+- Every test is a method inside a class (`class TestFoo`) — no bare module-level `def test_*` functions
+- Helper functions and fixtures appear **after** all test classes, never before them
+- No inline imports; all imports at module top
+
+**Logical correctness and consistency**:
+- Tests must exercise the actual production code under test — not reimplement its logic independently. A test that rebuilds the formula it's supposed to verify is testing nothing. If a function's internals are untestable, refactor the function (e.g. add a callback, return intermediate values) rather than testing a copy of it.
+- Check for dead or unreachable code paths introduced by the change
+- Verify that related components affected by a refactor remain consistent (e.g. callers updated, related tests still valid)
+- Flag any new public API without a corresponding test
+
+**Testability and maintainability**:
+- If any logic is only testable by reimplementing it in the test, propose a refactor to expose it (callback pattern, intermediate return value, etc.)
+- Flag overly large functions that mix concerns; suggest decomposition if it improves testability
+- Identify duplicated logic across source or test files that should be extracted
+
+Run `make check` and the affected test file(s) after the subagent finishes to confirm nothing was missed.
+
 ## Development Commands
 
 ### Environment Setup
