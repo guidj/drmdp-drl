@@ -167,14 +167,6 @@ class HCSAC(SAC):
         # λ for H_φ regularisation loss (Eq. 9). Default 5.0 per paper for RNN variant.
         self._reg_lambda = reg_lambda
 
-    def _setup_model(self) -> None:
-        super()._setup_model()
-        # Convenience aliases mirroring SAC's actor/critic aliases.
-        self.head_net = self.policy.head_net
-        self.head_net_target = self.policy.head_net_target
-        self.history_encoder = self.policy.history_encoder
-        self.history_encoder_target = self.policy.history_encoder_target
-
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:  # noqa: PLR0915
         """HC training loop.
 
@@ -342,6 +334,14 @@ class HCSAC(SAC):
         if ent_coef_losses:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
+    def _setup_model(self) -> None:
+        super()._setup_model()
+        # Convenience aliases mirroring SAC's actor/critic aliases.
+        self.head_net = self.policy.head_net
+        self.head_net_target = self.policy.head_net_target
+        self.history_encoder = self.policy.history_encoder
+        self.history_encoder_target = self.policy.history_encoder_target
+
 
 # ---------------------------------------------------------------------------
 # HCSACPolicy
@@ -368,6 +368,18 @@ class HCSACPolicy(SACPolicy):
         self._history_hidden_size = history_hidden_size
         super().__init__(*args, **kwargs)
 
+    def set_training_mode(self, mode: bool) -> None:
+        super().set_training_mode(mode)
+        if hasattr(self, "history_encoder"):
+            self.history_encoder.train(mode)
+        if hasattr(self, "head_net"):
+            self.head_net.train(mode)
+        # Target networks must always be in eval mode.
+        if hasattr(self, "history_encoder_target"):
+            self.history_encoder_target.eval()
+        if hasattr(self, "head_net_target"):
+            self.head_net_target.eval()
+
     def _build(self, lr_schedule: Any) -> None:  # type: ignore[override]
         super()._build(lr_schedule)
         obs_dim = int(np.prod(self.observation_space.shape))
@@ -390,18 +402,6 @@ class HCSACPolicy(SACPolicy):
             lr=lr_schedule(1),
             **self.optimizer_kwargs,
         )
-
-    def set_training_mode(self, mode: bool) -> None:
-        super().set_training_mode(mode)
-        if hasattr(self, "history_encoder"):
-            self.history_encoder.train(mode)
-        if hasattr(self, "head_net"):
-            self.head_net.train(mode)
-        # Target networks must always be in eval mode.
-        if hasattr(self, "history_encoder_target"):
-            self.history_encoder_target.eval()
-        if hasattr(self, "head_net_target"):
-            self.head_net_target.eval()
 
 
 # ---------------------------------------------------------------------------

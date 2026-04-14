@@ -14,70 +14,6 @@ from drmdp import rewdelay
 from drmdp.control import hc
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_box_env(obs_dim: int = 3, act_dim: int = 2) -> gym.Env:
-    """Minimal Box env — used for buffer / policy construction, not rollouts."""
-
-    class _BoxEnv(gym.Env):
-        def __init__(self) -> None:
-            self.observation_space = spaces.Box(
-                low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32
-            )
-            self.action_space = spaces.Box(
-                low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32
-            )
-
-        def step(self, action):
-            del action
-            return (
-                self.observation_space.sample(),
-                0.0,
-                False,
-                False,
-                {"interval_end": False},
-            )
-
-        def reset(self, seed=None, options=None):
-            del seed, options
-            return self.observation_space.sample(), {}
-
-    return _BoxEnv()
-
-
-def _make_hc_buffer(
-    obs_dim: int = 3,
-    act_dim: int = 2,
-    max_delay: int = 4,
-    capacity: int = 200,
-) -> hc.HCReplayBuffer:
-    obs_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
-    act_space = spaces.Box(low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
-    return hc.HCReplayBuffer(
-        buffer_size=capacity,
-        observation_space=obs_space,
-        action_space=act_space,
-        max_delay=max_delay,
-    )
-
-
-def _add_transition(
-    buf: hc.HCReplayBuffer,
-    obs_dim: int,
-    act_dim: int,
-    interval_end: bool = False,
-    done: bool = False,
-    reward: float = 0.0,
-) -> None:
-    obs = np.zeros((1, obs_dim), dtype=np.float32)
-    act = np.zeros((1, act_dim), dtype=np.float32)
-    infos: List[Dict[str, Any]] = [{"interval_end": interval_end}]
-    buf.add(obs, obs, act, np.array([reward]), np.array([done]), infos)
-
-
-# ---------------------------------------------------------------------------
 # TestIntervalPositionWrapper
 # ---------------------------------------------------------------------------
 
@@ -334,3 +270,67 @@ class TestHCSAC:
             learning_starts=50,
         )
         agent.learn(total_timesteps=200)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_box_env(obs_dim: int = 3, act_dim: int = 2) -> gym.Env:
+    """Minimal Box env — used for buffer / policy construction, not rollouts."""
+
+    class _BoxEnv(gym.Env):
+        def __init__(self) -> None:
+            self.observation_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32
+            )
+            self.action_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32
+            )
+
+        def step(self, action):
+            del action
+            return (
+                self.observation_space.sample(),
+                0.0,
+                False,
+                False,
+                {"interval_end": False},
+            )
+
+        def reset(self, seed=None, options=None):
+            del seed, options
+            return self.observation_space.sample(), {}
+
+    return _BoxEnv()
+
+
+def _make_hc_buffer(
+    obs_dim: int = 3,
+    act_dim: int = 2,
+    max_delay: int = 4,
+    capacity: int = 200,
+) -> hc.HCReplayBuffer:
+    obs_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
+    act_space = spaces.Box(low=-1.0, high=1.0, shape=(act_dim,), dtype=np.float32)
+    return hc.HCReplayBuffer(
+        buffer_size=capacity,
+        observation_space=obs_space,
+        action_space=act_space,
+        max_delay=max_delay,
+    )
+
+
+def _add_transition(
+    buf: hc.HCReplayBuffer,
+    obs_dim: int,
+    act_dim: int,
+    interval_end: bool = False,
+    done: bool = False,
+    reward: float = 0.0,
+) -> None:
+    obs = np.zeros((1, obs_dim), dtype=np.float32)
+    act = np.zeros((1, act_dim), dtype=np.float32)
+    infos: List[Dict[str, Any]] = [{"interval_end": interval_end}]
+    buf.add(obs, obs, act, np.array([reward]), np.array([done]), infos)

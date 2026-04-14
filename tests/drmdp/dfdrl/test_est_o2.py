@@ -12,13 +12,15 @@ Critical tests focus on:
 
 import json
 import os
+import sys
 import tempfile
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import gymnasium as gym
 import numpy as np
 import pytest
 import torch
+from torch.utils import data as torch_data
 
 from drmdp import dataproc, rewdelay
 from drmdp.dfdrl import est_o2
@@ -28,9 +30,8 @@ from drmdp.dfdrl import est_o2
 # =============================================================================
 
 
-def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple]:
-    """
-    Create a mock buffer from episode rewards.
+def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple[Any, ...]]:
+    """Create a mock buffer from episode rewards.
 
     Args:
         episodes: List of reward sequences, one per episode
@@ -41,11 +42,10 @@ def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple]:
     buffer = []
     for ep_idx, rewards in enumerate(episodes):
         for step_idx, reward in enumerate(rewards):
-            # Create dummy state/action (just use indices for debugging)
             state = np.array([float(ep_idx), float(step_idx)])
             action = np.array([float(ep_idx * 10 + step_idx)])
             next_state = np.array([float(ep_idx), float(step_idx + 1)])
-            term = step_idx == len(rewards) - 1  # Terminal at last step
+            term = step_idx == len(rewards) - 1
 
             buffer.append((state, action, next_state, reward, term))
 
@@ -1463,9 +1463,7 @@ class TestEndToEnd:
         dataset = est_o2.DictDataset(inputs=list(inputs_list), labels=list(labels_list))
 
         # Create dataloader
-        from torch.utils.data import DataLoader
-
-        dataloader = DataLoader(
+        dataloader = torch_data.DataLoader(
             dataset,
             batch_size=4,
             shuffle=False,
@@ -1506,8 +1504,6 @@ class TestCommandLine:
 
     def test_parse_args_defaults(self):
         """Mock sys.argv, verify default values."""
-        import sys
-
         # Save original argv
         original_argv = sys.argv
 
@@ -1537,8 +1533,6 @@ class TestCommandLine:
 
     def test_parse_args_custom_values(self):
         """Mock sys.argv with all args, verify parsing."""
-        import sys
-
         # Save original argv
         original_argv = sys.argv
 

@@ -12,7 +12,7 @@ Critical tests focus on:
 
 import os
 import tempfile
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -21,6 +21,76 @@ import torch
 
 from drmdp import dataproc, rewdelay
 from drmdp.dfdrl import est_o1
+
+# =============================================================================
+# Module-level helper functions
+# =============================================================================
+
+
+def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple[Any, ...]]:
+    """Create a mock buffer from episode rewards.
+
+    Args:
+        episodes: List of reward sequences, one per episode
+
+    Returns:
+        Buffer in format: List[(state, action, next_state, reward, term)]
+    """
+    buffer = []
+    for ep_idx, rewards in enumerate(episodes):
+        for step_idx, reward in enumerate(rewards):
+            state = np.array([float(ep_idx), float(step_idx)])
+            action = np.array([float(ep_idx * 10 + step_idx)])
+            next_state = np.array([float(ep_idx), float(step_idx + 1)])
+            term = step_idx == len(rewards) - 1
+
+            buffer.append((state, action, next_state, reward, term))
+
+    return buffer
+
+
+# =============================================================================
+# Module-level fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def simple_env():
+    """Create a simple environment for testing."""
+    return gym.make("MountainCarContinuous-v0")
+
+
+@pytest.fixture
+def simple_model_and_dataset():
+    """Create a simple model and dataset for evaluation tests."""
+    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    delay = rewdelay.FixedDelay(3)
+    examples = est_o1.delayed_reward_data(buffer, delay)
+
+    inputs, labels = zip(*examples)
+    dataset = est_o1.DictDataset(inputs=list(inputs), labels=list(labels))
+
+    torch.manual_seed(42)
+    model = est_o1.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
+
+    return model, dataset
+
+
+@pytest.fixture(scope="module")
+def training_dataset():
+    """Create a realistic training dataset for integration tests."""
+    env = gym.make("MountainCarContinuous-v0")
+
+    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
+
+    delay = rewdelay.FixedDelay(3)
+    examples = est_o1.delayed_reward_data(buffer, delay)
+
+    inputs, labels = zip(*examples)
+    dataset = est_o1.DictDataset(inputs=list(inputs), labels=list(labels))
+
+    return dataset
+
 
 # =============================================================================
 # TestRNetwork
@@ -834,80 +904,3 @@ class TestTrain:
             # Training should complete successfully
             assert isinstance(final_mse, float)
             assert final_mse >= 0
-
-
-# =============================================================================
-# Module-level helper functions
-# =============================================================================
-
-
-def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple]:
-    """
-    Create a mock buffer from episode rewards.
-
-    Args:
-        episodes: List of reward sequences, one per episode
-
-    Returns:
-        Buffer in format: List[(state, action, next_state, reward, term)]
-    """
-    buffer = []
-    for ep_idx, rewards in enumerate(episodes):
-        for step_idx, reward in enumerate(rewards):
-            # Create dummy state/action (just use indices for debugging)
-            state = np.array([float(ep_idx), float(step_idx)])
-            action = np.array([float(ep_idx * 10 + step_idx)])
-            next_state = np.array([float(ep_idx), float(step_idx + 1)])
-            term = step_idx == len(rewards) - 1  # Terminal at last step
-
-            buffer.append((state, action, next_state, reward, term))
-
-    return buffer
-
-
-# =============================================================================
-# Module-level fixtures
-# =============================================================================
-
-
-@pytest.fixture
-def simple_env():
-    """Create a simple environment for testing."""
-    return gym.make("MountainCarContinuous-v0")
-
-
-@pytest.fixture
-def simple_model_and_dataset():
-    """Create a simple model and dataset for evaluation tests."""
-    # Create small dataset
-    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    delay = rewdelay.FixedDelay(3)
-    examples = est_o1.delayed_reward_data(buffer, delay)
-
-    inputs, labels = zip(*examples)
-    dataset = est_o1.DictDataset(inputs=list(inputs), labels=list(labels))
-
-    # Create model
-    torch.manual_seed(42)
-    model = est_o1.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
-
-    return model, dataset
-
-
-@pytest.fixture(scope="module")
-def training_dataset():
-    """Create a realistic training dataset for integration tests."""
-    # Create environment
-    env = gym.make("MountainCarContinuous-v0")
-
-    # Collect small amount of data
-    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
-
-    # Create delayed reward data
-    delay = rewdelay.FixedDelay(3)
-    examples = est_o1.delayed_reward_data(buffer, delay)
-
-    inputs, labels = zip(*examples)
-    dataset = est_o1.DictDataset(inputs=list(inputs), labels=list(labels))
-
-    return dataset

@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from drmdp.control import base, runner
+from drmdp.control import base, ircr, runner
 
 # ---------------------------------------------------------------------------
 # Stubs
@@ -319,7 +319,7 @@ class TestHCLoggingCallback:
         exp_logger = _MockLogger()
         return runner._HCLoggingCallback(
             log_episode_frequency=log_freq,
-            exp_logger=exp_logger,
+            exp_logger=exp_logger,  # type: ignore[arg-type]
         )
 
     def _step_hc(
@@ -389,8 +389,6 @@ class TestMakeRewardModel:
             seed=None,
         )
         model = runner._make_reward_model(args)
-        from drmdp.control import ircr
-
         assert isinstance(model, ircr.IRCRRewardModel)
 
     def test_unknown_type_raises_value_error(self, tmp_path):
