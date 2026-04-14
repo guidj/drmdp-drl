@@ -95,3 +95,54 @@ def test_sequence_to_integer_leading_zeros():
     # Test with leading zeros
     result = mathutils.sequence_to_integer(10, [0, 1, 2])
     assert result == 12
+
+
+class TestIntergerToSequence:
+    def test_single_digit_base10(self):
+        result = mathutils.interger_to_sequence(10, 1, 5)
+        assert result == (5,)
+
+    def test_multiple_digits_base10(self):
+        # 123 in base 10 with length 3 → [1, 2, 3]
+        result = mathutils.interger_to_sequence(10, 3, 123)
+        assert result == (1, 2, 3)
+
+    def test_binary_roundtrip(self):
+        # [1, 0, 1] in base 2 = 5; recover [1, 0, 1]
+        integer = mathutils.sequence_to_integer(2, [1, 0, 1])
+        result = mathutils.interger_to_sequence(2, 3, integer)
+        assert result == (1, 0, 1)
+
+    def test_base3_roundtrip(self):
+        sequence = [1, 2, 0]
+        integer = mathutils.sequence_to_integer(3, sequence)
+        result = mathutils.interger_to_sequence(3, 3, integer)
+        assert tuple(result) == tuple(sequence)
+
+    def test_zero_index(self):
+        result = mathutils.interger_to_sequence(10, 3, 0)
+        assert result == (0, 0, 0)
+
+
+class TestPoissonExactConfidenceInterval:
+    def test_returns_lower_and_upper_bounds(self):
+        lower, upper = mathutils.poisson_exact_confidence_interval(5)
+        assert isinstance(lower, int)
+        assert isinstance(upper, int)
+
+    def test_lower_bound_leq_observed_value(self):
+        lower, upper = mathutils.poisson_exact_confidence_interval(10)
+        assert lower <= 10
+        assert upper >= 10
+
+    def test_lower_while_loop_executes_for_large_observed_value(self):
+        # For observed_value >= 4, CDF(0, observed_value) < 0.025, so lower_bound increases
+        lower, upper = mathutils.poisson_exact_confidence_interval(10)
+        assert lower > 0  # lower_bound was incremented in the while loop
+
+    def test_confidence_interval_contains_observed_value(self):
+        observed = 7
+        lower, upper = mathutils.poisson_exact_confidence_interval(
+            observed, confidence=0.95
+        )
+        assert lower <= observed <= upper

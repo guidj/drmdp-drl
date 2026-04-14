@@ -6,7 +6,7 @@ import dataclasses
 import os
 import tempfile
 from typing import Any, Mapping, Optional, Sequence
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -312,6 +312,163 @@ class TestRun:
 # ---------------------------------------------------------------------------
 # TestParseRewardModelKwargs
 # ---------------------------------------------------------------------------
+
+
+class TestHCLoggingCallback:
+    def _build_hc_callback(self, log_freq: int = 1) -> runner._HCLoggingCallback:
+        exp_logger = _MockLogger()
+        return runner._HCLoggingCallback(
+            log_episode_frequency=log_freq,
+            exp_logger=exp_logger,
+        )
+
+    def _step_hc(
+        self,
+        callback: runner._HCLoggingCallback,
+        done: bool,
+        timestep: int,
+        return_val: float = 1.0,
+    ) -> bool:
+        callback.num_timesteps = timestep
+        callback.locals = {
+            "dones": np.array([done]),
+            "infos": [{"true_episode_return": return_val}],
+        }
+        return callback._on_step()
+
+    def test_on_step_returns_true(self):
+        callback = self._build_hc_callback()
+        result = self._step_hc(callback, done=False, timestep=1)
+        assert result is True
+
+    def test_episode_count_increments_on_done(self):
+        callback = self._build_hc_callback()
+        self._step_hc(callback, done=True, timestep=1)
+        assert callback._episode_count == 1
+
+    def test_episode_steps_reset_after_done(self):
+        callback = self._build_hc_callback()
+        self._step_hc(callback, done=False, timestep=1)
+        self._step_hc(callback, done=True, timestep=2)
+        assert callback._episode_steps == 0
+
+    def test_logger_called_at_log_frequency(self):
+        log_mock = _MockLogger()
+        callback = runner._HCLoggingCallback(
+            log_episode_frequency=2, exp_logger=log_mock
+        )
+        for timestep in range(1, 5):
+            done = timestep % 2 == 0
+            callback.num_timesteps = timestep
+            callback.locals = {
+                "dones": np.array([done]),
+                "infos": [{"true_episode_return": 1.0}],
+            }
+            callback._on_step()
+        # Episodes 1 and 2 done; log at every 2 → only episode 2 logged
+        assert len(log_mock.log_calls) == 1
+
+
+class TestMakeRewardModel:
+    def test_ircr_type_returns_ircr_instance(self, tmp_path):
+        args = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            max_episode_steps=50,
+            reward_model_type="ircr",
+            reward_model_kwargs={"max_buffer_size": 10, "k_neighbors": 1},
+            update_every_n_steps=100,
+            clear_buffer_on_update=False,
+            num_steps=100,
+            sac_learning_rate=3e-4,
+            sac_buffer_size=100,
+            sac_batch_size=32,
+            sac_gradient_steps=1,
+            log_episode_frequency=1,
+            output_dir=str(tmp_path),
+            seed=None,
+        )
+        model = runner._make_reward_model(args)
+        from drmdp.control import ircr
+
+        assert isinstance(model, ircr.IRCRRewardModel)
+
+    def test_unknown_type_raises_value_error(self, tmp_path):
+        args = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            max_episode_steps=50,
+            reward_model_type="unknown_model",
+            reward_model_kwargs={},
+            update_every_n_steps=100,
+            clear_buffer_on_update=False,
+            num_steps=100,
+            sac_learning_rate=3e-4,
+            sac_buffer_size=100,
+            sac_batch_size=32,
+            sac_gradient_steps=1,
+            log_episode_frequency=1,
+            output_dir=str(tmp_path),
+            seed=None,
+        )
+        with pytest.raises(ValueError):
+            runner._make_reward_model(args)
+
+
+class TestParseArgs:
+    def test_defaults_are_valid_training_args(self, tmp_path):
+        with patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
+            args = runner.parse_args()
+        assert isinstance(args, runner.TrainingArgs)
+        assert args.env == "MountainCarContinuous-v0"
+        assert args.delay == 3
+
+    def test_custom_env_and_delay(self, tmp_path):
+        with patch(
+            "sys.argv",
+            [
+                "prog",
+                "--env",
+                "Pendulum-v1",
+                "--delay",
+                "5",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            args = runner.parse_args()
+        assert args.env == "Pendulum-v1"
+        assert args.delay == 5
+
+    def test_reward_model_kwarg_parsed(self, tmp_path):
+        with patch(
+            "sys.argv",
+            [
+                "prog",
+                "--reward-model-kwarg",
+                "max_buffer_size=50",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            args = runner.parse_args()
+        assert args.reward_model_kwargs["max_buffer_size"] == 50
+
+    def test_agent_type_hc(self, tmp_path):
+        with patch(
+            "sys.argv",
+            ["prog", "--agent-type", "hc", "--output-dir", str(tmp_path)],
+        ):
+            args = runner.parse_args()
+        assert args.agent_type == "hc"
+
+    def test_clear_buffer_flag(self, tmp_path):
+        with patch(
+            "sys.argv",
+            ["prog", "--clear-buffer-on-update", "--output-dir", str(tmp_path)],
+        ):
+            args = runner.parse_args()
+        assert args.clear_buffer_on_update is True
 
 
 class TestParseRewardModelKwargs:

@@ -324,7 +324,7 @@ class TestDelayedRewardDataReturns:
         # Verify that end_return values match cumulative returns
         # (We can't verify all timesteps since only windows are created,
         # but we can verify the relationship holds)
-        for inputs, labels in examples:
+        for _, labels in examples:
             start_return = labels["start_return"].item()
             end_return = labels["end_return"].item()
             aggregate_reward = labels["aggregate_reward"].item()
@@ -352,7 +352,7 @@ class TestDelayedRewardDataReturns:
         examples = est_o2.delayed_reward_data(buffer, delay=delay)
 
         # Verify the critical relationship holds for all windows
-        for inputs, labels in examples:
+        for _, labels in examples:
             start_return = labels["start_return"].item()
             end_return = labels["end_return"].item()
             aggregate_reward = labels["aggregate_reward"].item()
@@ -389,7 +389,7 @@ class TestDelayedRewardDataReturns:
         examples = est_o2.delayed_reward_data(buffer, delay=delay)
 
         # All end_returns should be valid
-        for inputs, labels in examples:
+        for _, labels in examples:
             end_return = labels["end_return"].item()
             start_return = labels["start_return"].item()
             # end_return should be >= start_return (or both negative)

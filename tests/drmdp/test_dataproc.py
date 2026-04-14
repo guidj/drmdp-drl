@@ -323,3 +323,86 @@ def test_collection_traj_data_term_flag_values():
 def arr(value: float) -> np.ndarray:
     """Helper to create float32 array with single value."""
     return np.array([value], dtype=np.float32)
+
+
+import pandas as pd  # noqa: E402 — placed here to keep existing tests unchanged
+
+
+class TestWideMetrics:
+    def test_drops_metrics_column(self):
+        df = pd.DataFrame(
+            {
+                "name": ["a", "b"],
+                "metrics": [{"x": 1}, {"x": 2}],
+                "returns": [[1.0, 2.0], [3.0]],
+            }
+        )
+        result = dataproc.wide_metrics(df)
+        assert "metrics" not in result.columns
+
+    def test_explodes_returns_column(self):
+        df = pd.DataFrame(
+            {
+                "name": ["a"],
+                "metrics": [{}],
+                "returns": [[1.0, 2.0, 3.0]],
+            }
+        )
+        result = dataproc.wide_metrics(df)
+        assert len(result) == 3
+        assert list(result["returns"]) == [1.0, 2.0, 3.0]
+
+    def test_preserves_other_columns(self):
+        df = pd.DataFrame(
+            {
+                "name": ["run1", "run1"],
+                "metrics": [{}, {}],
+                "returns": [[10.0], [20.0]],
+            }
+        )
+        result = dataproc.wide_metrics(df)
+        assert "name" in result.columns
+
+
+class TestGetDistinctEnvs:
+    def test_returns_unique_env_names(self):
+        df = pd.DataFrame(
+            {
+                "meta": [
+                    {"env_spec": {"name": "CartPole-v1", "args": None}},
+                    {"env_spec": {"name": "CartPole-v1", "args": None}},
+                    {"env_spec": {"name": "Pendulum-v1", "args": {"n": 1}}},
+                ]
+            }
+        )
+        result = dataproc.get_distinct_envs(df)
+        assert set(result.keys()) == {"CartPole-v1", "Pendulum-v1"}
+
+    def test_env_args_preserved(self):
+        env_args = {"max_steps": 500}
+        df = pd.DataFrame({"meta": [{"env_spec": {"name": "MyEnv", "args": env_args}}]})
+        result = dataproc.get_distinct_envs(df)
+        assert result["MyEnv"] == env_args
+
+
+class TestDropDuplicateSets:
+    def test_drops_rows_with_identical_key_sets(self):
+        df = pd.DataFrame(
+            {
+                "a": [1, 2, 1],
+                "b": [3, 4, 3],
+                "c": [5, 6, 7],
+            }
+        )
+        result = dataproc.drop_duplicate_sets(df, keys=["a", "b"])
+        assert len(result) == 2
+
+    def test_preserves_all_columns(self):
+        df = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+        result = dataproc.drop_duplicate_sets(df, keys=["x"])
+        assert set(result.columns) == {"x", "y"}
+
+    def test_no_duplicates_returns_all_rows(self):
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        result = dataproc.drop_duplicate_sets(df, keys=["a"])
+        assert len(result) == 3
