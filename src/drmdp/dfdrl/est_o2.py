@@ -32,7 +32,7 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -535,6 +535,7 @@ def train(
     seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
+    on_batch_end: Optional[Callable[[Mapping[str, float]], None]] = None,
 ):
     """
     Train a reward prediction model.
@@ -613,6 +614,14 @@ def train(
                 epoch_losses["reward"].append(reward_loss.item())
                 epoch_losses["regu"].append(regu_loss.item())
                 epoch_losses["total"].append(loss.item())
+                if on_batch_end is not None:
+                    on_batch_end(
+                        {
+                            "reward": reward_loss.item(),
+                            "regu": regu_loss.item(),
+                            "total": loss.item(),
+                        }
+                    )
 
             # Mean loss for the epoch
             avg_train_loss = np.mean(epoch_losses["total"]).item()

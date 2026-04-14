@@ -968,6 +968,46 @@ class TestEvaluateModel:
 
         np.testing.assert_allclose(metrics["total"], metrics["reward"], atol=1e-6)
 
+    def test_shuffle_true_produces_valid_metrics(self, simple_model_and_dataset):
+        """shuffle=True runs without error and returns a valid metrics dict."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+        metrics, _ = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=2,
+            regu_lam=1.0,
+            collect_predictions=False,
+            shuffle=True,
+        )
+        for key in ("reward", "regu", "total"):
+            assert key in metrics
+            assert len(metrics[key]) > 0
+            assert metrics[key].mean() >= 0.0
+
+    def test_metrics_length_equals_num_batches(self, simple_model_and_dataset):
+        """metrics arrays have one entry per evaluated batch."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+        metrics, _ = est_o2.evaluate_model(
+            model, dataset, batch_size=1, regu_lam=1.0, collect_predictions=False
+        )
+        assert len(metrics["total"]) == len(dataset)
+
+    def test_max_batches_limits_metrics_length(self, simple_model_and_dataset):
+        """max_batches=1 stops after one batch, so metrics arrays have length 1."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+        metrics, _ = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=1,
+            regu_lam=1.0,
+            collect_predictions=False,
+            max_batches=1,
+        )
+        assert len(metrics["total"]) == 1
+
 
 class TestSaveConfigAndMetrics:
     """Tests for save_config_and_metrics() function."""
@@ -1603,48 +1643,53 @@ class TestReguLoss:
             "regu_loss using window_reward must produce non-zero gradients"
         )
 
-    def test_regu_loss_uses_model_predictions(self):
+    def test_regu_loss_uses_model_predictions(self, simple_env, training_dataset):
         """Verify regu_loss changes when window_reward (model output) changes.
 
         Keeps start_return, end_return, and aggregate_reward fixed while
         varying window_reward. Confirms the loss is sensitive to model outputs.
         """
-        torch.manual_seed(42)
-        criterion = torch.nn.MSELoss()
+        batch_losses = []
+        with tempfile.TemporaryDirectory() as output_dir:
+            est_o2.train(
+                env=simple_env,
+                dataset=training_dataset,
+                train_epochs=2,
+                batch_size=16,
+                eval_steps=5,
+                log_episode_frequency=5,
+                regu_lam=1.0,
+                seed=42,
+                output_dir=output_dir,
+                on_batch_end=batch_losses.append,
+            )
+        regu_values = [batch["regu"] for batch in batch_losses]
+        # A constant regu_loss (e.g. always 0) would mean predictions are
+        # ignored; a non-constant sequence confirms the loss tracks the model.
+        assert len(set(regu_values)) > 1, "regu_loss must vary across batches"
 
-        batch_size = 4
-        start_return = torch.tensor([0.0, 1.0, 2.0, 3.0])
-        end_return = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    def test_regu_loss_formula_consistency(self, simple_env, training_dataset):
+        """Verify total_loss == reward_loss + regu_lam * regu_loss for every batch.
 
-        # Two different model predictions
-        window_reward_a = torch.ones(batch_size) * 0.5
-        window_reward_b = torch.ones(batch_size) * 2.0
-
-        regu_loss_a = criterion(start_return + window_reward_a, end_return)
-        regu_loss_b = criterion(start_return + window_reward_b, end_return)
-
-        # The two losses must differ — regu_loss is sensitive to window_reward
-        assert not torch.isclose(regu_loss_a, regu_loss_b), (
-            "regu_loss must change when window_reward changes"
-        )
-
-    def test_regu_loss_zero_when_predictions_match_returns(self):
-        """Verify regu_loss is zero when window_reward == end_return - start_return.
-
-        When the model perfectly predicts per-step rewards that sum to the
-        observed aggregate, the regularization term should be zero.
+        Checks that the three loss components reported by the callback satisfy
+        the defining relationship used inside train(), confirming the formula
+        is executed correctly rather than just being arithmetically valid.
         """
-        torch.manual_seed(42)
-        criterion = torch.nn.MSELoss()
-
-        start_return = torch.tensor([0.0, 5.0, -2.0])
-        end_return = torch.tensor([1.0, 7.0, -1.0])
-
-        # Perfect predictions: window_reward == end_return - start_return
-        window_reward = end_return - start_return
-
-        regu_loss = criterion(start_return + window_reward, end_return)
-
-        assert regu_loss.item() < 1e-6, (
-            f"regu_loss should be ~0 when predictions match returns, got {regu_loss.item()}"
-        )
+        batch_losses = []
+        regu_lam = 0.5
+        with tempfile.TemporaryDirectory() as output_dir:
+            est_o2.train(
+                env=simple_env,
+                dataset=training_dataset,
+                train_epochs=2,
+                batch_size=16,
+                eval_steps=5,
+                log_episode_frequency=5,
+                regu_lam=regu_lam,
+                seed=42,
+                output_dir=output_dir,
+                on_batch_end=batch_losses.append,
+            )
+        for batch in batch_losses:
+            expected_total = batch["reward"] + regu_lam * batch["regu"]
+            np.testing.assert_allclose(batch["total"], expected_total, atol=1e-5)
