@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 
 import gymnasium as gym
 import numpy as np
-import torch as th
+import torch
 from gymnasium import spaces
 
 from drmdp import rewdelay
@@ -256,17 +256,17 @@ class TestHCSACPolicy:
     def test_policy_has_history_encoder(self):
         agent = self._make_agent()
         assert hasattr(agent.policy, "history_encoder")
-        assert isinstance(agent.policy.history_encoder, th.nn.Module)
+        assert isinstance(agent.policy.history_encoder, torch.nn.Module)
 
     def test_policy_has_head_net(self):
         agent = self._make_agent()
         assert hasattr(agent.policy, "head_net")
-        assert isinstance(agent.policy.head_net, th.nn.Module)
+        assert isinstance(agent.policy.head_net, torch.nn.Module)
 
     def test_head_optimizer_exists(self):
         agent = self._make_agent()
         assert hasattr(agent.policy, "head_optimizer")
-        assert isinstance(agent.policy.head_optimizer, th.optim.Optimizer)
+        assert isinstance(agent.policy.head_optimizer, torch.optim.Optimizer)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +314,7 @@ class TestHCSAC:
         agent.learn(total_timesteps=300)
         # At least one parameter must have changed.
         any_changed = any(
-            not th.allclose(before, after)
+            not torch.allclose(before, after)
             for before, after in zip(
                 head_target_before, agent.head_net_target.parameters()
             )

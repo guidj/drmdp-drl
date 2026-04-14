@@ -30,7 +30,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
-import torch as th
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from stable_baselines3 import SAC
@@ -105,14 +105,14 @@ class HCReplayBufferSamples(NamedTuple):
       interval boundary (reward was emitted), 0.0 otherwise
     """
 
-    observations: th.Tensor
-    actions: th.Tensor
-    next_observations: th.Tensor
-    dones: th.Tensor
-    rewards: th.Tensor
-    history: th.Tensor  # (batch, max_delay, obs_dim + act_dim)
-    interval_ends: th.Tensor  # (batch, 1) float32
-    discounts: Optional[th.Tensor] = None
+    observations: torch.Tensor
+    actions: torch.Tensor
+    next_observations: torch.Tensor
+    dones: torch.Tensor
+    rewards: torch.Tensor
+    history: torch.Tensor  # (batch, max_delay, obs_dim + act_dim)
+    interval_ends: torch.Tensor  # (batch, 1) float32
+    discounts: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ class HCSAC(SAC):
 
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                ent_coef = th.exp(self.log_ent_coef.detach())
+                ent_coef = torch.exp(self.log_ent_coef.detach())
                 ent_coef_loss = -(
                     self.log_ent_coef * (log_prob + self.target_entropy).detach()
                 ).mean()
@@ -235,19 +235,19 @@ class HCSAC(SAC):
 
             # Use interval_ends stored in the replay buffer rather than reward != 0
             # so that zero-sum signal intervals are handled correctly.
-            current_sa = th.cat(
+            current_sa = torch.cat(
                 [replay_data.observations, replay_data.actions], dim=-1
             ).unsqueeze(1)  # (B, 1, sa_dim)
             history = replay_data.history  # (B, max_delay, sa_dim)
-            shifted = th.cat([history[:, 1:, :], current_sa], dim=1)
+            shifted = torch.cat([history[:, 1:, :], current_sa], dim=1)
             interval_end = replay_data.interval_ends.bool()  # (B, 1)
-            next_history = th.where(
+            next_history = torch.where(
                 interval_end.unsqueeze(-1).expand_as(shifted),
-                th.zeros_like(shifted),
+                torch.zeros_like(shifted),
                 shifted,
             )  # (B, max_delay, sa_dim)
 
-            with th.no_grad():
+            with torch.no_grad():
                 next_actions, next_log_prob = self.actor.action_log_prob(
                     replay_data.next_observations
                 )
@@ -256,11 +256,11 @@ class HCSAC(SAC):
                 h_next = h_next_enc.squeeze(0)  # (B, hidden)
                 qh_next = self.head_net_target(h_next)  # (B, 1)
 
-                next_qc = th.cat(
+                next_qc = torch.cat(
                     self.critic_target(replay_data.next_observations, next_actions),
                     dim=1,
                 )
-                next_qc_min, _ = th.min(next_qc, dim=1, keepdim=True)
+                next_qc_min, _ = torch.min(next_qc, dim=1, keepdim=True)
                 next_qc_min = next_qc_min - ent_coef * next_log_prob.reshape(-1, 1)
 
                 target_q = replay_data.rewards + (1 - replay_data.dones) * discounts * (
@@ -270,13 +270,13 @@ class HCSAC(SAC):
             _, h_t_enc = self.history_encoder(history)
             h_t = h_t_enc.squeeze(0)  # (B, hidden)
             qh_pred = self.head_net(h_t)  # (B, 1)
-            head_loss: th.Tensor = F.mse_loss(qh_pred, target_q.detach())
+            head_loss: torch.Tensor = F.mse_loss(qh_pred, target_q.detach())
 
             # Regularisation (Eq. 9): at interval-end steps force H_φ ≈ R_t.
             # Prevents H_φ from absorbing credit that C_φ needs for the actor.
             if self._reg_lambda > 0.0 and interval_end.any():
                 reg_mask = interval_end.squeeze(-1)  # (B,)
-                reg_loss: th.Tensor = F.mse_loss(
+                reg_loss: torch.Tensor = F.mse_loss(
                     qh_pred[reg_mask],
                     replay_data.rewards[reg_mask].detach(),
                 )
@@ -286,19 +286,19 @@ class HCSAC(SAC):
             # critic learns only the action-specific value Q^C.
             current_qc = self.critic(replay_data.observations, replay_data.actions)
             critic_target_val = (target_q - qh_next).detach()
-            critic_loss: th.Tensor = 0.5 * sum(
+            critic_loss: torch.Tensor = 0.5 * sum(
                 F.mse_loss(qc_val, critic_target_val) for qc_val in current_qc
             )
 
             self.policy.head_optimizer.zero_grad()
             self.critic.optimizer.zero_grad()
             (head_loss + critic_loss).backward()
-            th.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 list(self.history_encoder.parameters())
                 + list(self.head_net.parameters()),
                 max_norm=1.0,
             )
-            th.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
             self.policy.head_optimizer.step()
             self.critic.optimizer.step()
 
@@ -306,8 +306,8 @@ class HCSAC(SAC):
             critic_losses.append(critic_loss.item())
 
             # Actor update: gradient through Q^C only (not Q^H).
-            qc_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
-            min_qc_pi, _ = th.min(qc_pi, dim=1, keepdim=True)
+            qc_pi = torch.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+            min_qc_pi, _ = torch.min(qc_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qc_pi).mean()
             actor_losses.append(actor_loss.item())
 
@@ -422,7 +422,7 @@ class HCReplayBuffer(buffers.ReplayBuffer):
 
     Args:
         *args: Forwarded to ``ReplayBuffer``.
-        max_delay: Maximum signal interval length.  Determines history window
+        max_delay: Maximum signal interval lengtorch.  Determines history window
             size.  Should match the delay in ``DelayedRewardWrapper``.
         **kwargs: Forwarded to ``ReplayBuffer``.
     """
@@ -552,7 +552,7 @@ class _HistoryEncoder(nn.Module):
         super().__init__()
         self._gru = nn.GRU(input_size=sa_dim, hidden_size=hidden_size, batch_first=True)
 
-    def forward(self, history: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+    def forward(self, history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             history: (batch, max_delay, sa_dim) — left-zero-padded.
@@ -575,7 +575,7 @@ class _HeadNetwork(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, hidden: th.Tensor) -> th.Tensor:
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """
         Args:
             hidden: (batch, hidden_size)

@@ -26,9 +26,11 @@ class ConstantRewardModel(base.RewardModel):
         actions: np.ndarray,
         terminals: np.ndarray,
     ) -> np.ndarray:
+        del actions, terminals
         return np.full(len(observations), self._constant, dtype=np.float32)
 
     def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
+        del trajectories
         return {}
 
 
