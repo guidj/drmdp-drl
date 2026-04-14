@@ -271,3 +271,19 @@ class TestTrain:
         assert config["state_dim"] == 3
         assert config["action_dim"] == 2
         assert config["spec"] == "o0"
+
+
+class TestCreateTrainingBuffer:
+    def test_returns_dict_dataset_of_correct_length(self):
+        env = _FakeEnv(obs_dim=2, act_dim=1)
+        dataset = est_o0.create_training_buffer(env, buffer_num_steps=15)
+        assert len(dataset) == 15
+
+    def test_returned_items_have_required_keys(self):
+        env = _FakeEnv(obs_dim=2, act_dim=1)
+        dataset = est_o0.create_training_buffer(env, buffer_num_steps=10)
+        inputs_dict, reward = dataset[0]
+        assert "state" in inputs_dict
+        assert "action" in inputs_dict
+        assert "term" in inputs_dict
+        assert isinstance(reward, torch.Tensor)

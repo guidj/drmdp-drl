@@ -1,5 +1,6 @@
 import gymnasium as gym
 import numpy as np
+import pytest
 from gymnasium import spaces
 
 from drmdp import rewdelay
@@ -315,6 +316,112 @@ def test_data_buffer_max_size_bytes_with_first_acc_mode():
     assert buffer.buffer == [1]
     assert buffer.size() == 1
     assert buffer.size_bytes() == 32
+
+
+class TestFixedDelayMethods:
+    def test_range_returns_delay_pair(self):
+        delay = rewdelay.FixedDelay(5)
+        assert delay.range() == (5, 5)
+
+    def test_id_returns_fixed(self):
+        assert rewdelay.FixedDelay.id() == "fixed"
+
+
+class TestUniformDelayMethods:
+    def test_range_returns_min_max(self):
+        delay = rewdelay.UniformDelay(2, 6)
+        assert delay.range() == (2, 6)
+
+    def test_id_returns_uniform(self):
+        assert rewdelay.UniformDelay.id() == "uniform"
+
+    def test_sample_within_range(self):
+        delay = rewdelay.UniformDelay(3, 7)
+        for _ in range(20):
+            sample = delay.sample()
+            assert 3 <= sample <= 7
+
+
+class TestClippedPoissonDelayMethods:
+    def test_range_uses_provided_bounds(self):
+        delay = rewdelay.ClippedPoissonDelay(5, min_delay=2, max_delay=10)
+        assert delay.range() == (2, 10)
+
+    def test_id_returns_clipped_poisson(self):
+        assert rewdelay.ClippedPoissonDelay.id() == "clipped-poisson"
+
+    def test_sample_within_clipped_range(self):
+        delay = rewdelay.ClippedPoissonDelay(3, min_delay=1, max_delay=5)
+        for _ in range(20):
+            sample = delay.sample()
+            assert 1 <= int(sample) <= 5
+
+
+class TestWindowedTaskSchedule:
+    def test_fixed_mode_next_update_ep(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        assert schedule.next_update_ep == 20  # curr(10) + init(10)
+
+    def test_double_mode_next_update_ep(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="double", init_update_ep=5)
+        assert schedule.next_update_ep == 10  # curr(5) * 2
+
+    def test_invalid_mode_raises_value_error(self):
+        with pytest.raises(ValueError):
+            rewdelay.WindowedTaskSchedule(mode="invalid", init_update_ep=10)
+
+    def test_step_advances_at_boundary_fixed(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        schedule.step(20)
+        assert schedule.curr_update_ep == 20
+        assert schedule.next_update_ep == 30
+
+    def test_step_advances_at_boundary_double(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="double", init_update_ep=5)
+        schedule.step(10)  # next_update_ep was 10
+        assert schedule.curr_update_ep == 10
+        assert schedule.next_update_ep == 20  # 10 * 2
+
+    def test_step_no_change_before_boundary(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        schedule.step(5)
+        assert schedule.curr_update_ep == 10
+        assert schedule.next_update_ep == 20
+
+    def test_set_state_and_current_window_done(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        assert not schedule.current_window_done
+        schedule.set_state(True)
+        assert schedule.current_window_done
+        schedule.set_state(False)
+        assert not schedule.current_window_done
+
+    def test_step_resets_done_state(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="double", init_update_ep=5)
+        schedule.set_state(True)
+        assert schedule.current_window_done
+        schedule.step(10)  # triggers boundary advancement
+        assert not schedule.current_window_done
+
+
+class TestSupportsName:
+    def test_get_name_contains_class_name(self):
+        env = DummyEnv()
+        wrapped = rewdelay.DelayedRewardWrapper(
+            env, reward_delay=rewdelay.FixedDelay(2)
+        )
+        wrapped.reset()
+        name = wrapped.get_name()
+        assert "DelayedRewardWrapper" in name
+
+    def test_get_env_name_contains_underlying_class(self):
+        env = DummyEnv()
+        wrapped = rewdelay.DelayedRewardWrapper(
+            env, reward_delay=rewdelay.FixedDelay(2)
+        )
+        wrapped.reset()
+        env_name = wrapped.get_env_name()
+        assert "DummyEnv" in env_name
 
 
 def test_data_buffer_max_capacity_max_size_bytes_with_latest_acc_mode():

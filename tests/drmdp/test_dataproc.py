@@ -1,5 +1,6 @@
 import gymnasium as gym
 import numpy as np
+import pytest
 from gymnasium import spaces
 
 from drmdp import dataproc
@@ -406,3 +407,57 @@ class TestDropDuplicateSets:
         df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
         result = dataproc.drop_duplicate_sets(df, keys=["a"])
         assert len(result) == 3
+
+
+class TestProcessData:
+    def _make_meta(self, policy_type: str, mapper_name: str) -> dict:
+        return {
+            "experiment": {"run_id": "x"},
+            "problem_spec": {
+                "reward_mapper": {"name": mapper_name},
+                "policy_type": policy_type,
+            },
+        }
+
+    def test_non_pp_policy_type_used_as_method(self, monkeypatch):
+        monkeypatch.setattr(dataproc, "MAPPERS_NAMES", {"mapper_a": "MapperA"})
+        monkeypatch.setattr(dataproc, "POLICY_TYPES", {"IRCR": "IRCR", "PP": "PP"})
+        df = pd.DataFrame({"meta": [self._make_meta("IRCR", "mapper_a")]})
+        result = dataproc.process_data(df)
+        assert list(result["method"]) == ["IRCR"]
+
+    def test_pp_policy_type_uses_reward_mapper_as_method(self, monkeypatch):
+        monkeypatch.setattr(dataproc, "MAPPERS_NAMES", {"mapper_b": "MapperB"})
+        monkeypatch.setattr(dataproc, "POLICY_TYPES", {"PP": "PP"})
+        df = pd.DataFrame({"meta": [self._make_meta("PP", "mapper_b")]})
+        result = dataproc.process_data(df)
+        assert list(result["method"]) == ["MapperB"]
+
+    def test_filtered_methods_removed(self, monkeypatch):
+        monkeypatch.setattr(dataproc, "MAPPERS_NAMES", {"m": "L-TDD[CV]"})
+        monkeypatch.setattr(dataproc, "POLICY_TYPES", {"PP": "PP", "KEEP": "KEEP"})
+        df = pd.DataFrame(
+            {
+                "meta": [
+                    self._make_meta("PP", "m"),  # maps to "L-TDD[CV]" → filtered
+                    self._make_meta("KEEP", "m"),  # maps to "KEEP" → kept
+                ]
+            }
+        )
+        result = dataproc.process_data(df)
+        assert len(result) == 1
+        assert list(result["method"]) == ["KEEP"]
+
+    def test_experiment_key_merged_into_meta(self, monkeypatch):
+        monkeypatch.setattr(dataproc, "MAPPERS_NAMES", {"m": "M"})
+        monkeypatch.setattr(dataproc, "POLICY_TYPES", {"T": "T"})
+        df = pd.DataFrame({"meta": [self._make_meta("T", "m")]})
+        result = dataproc.process_data(df)
+        # "run_id" from experiment dict should appear in meta after merging
+        assert result.iloc[0]["meta"]["run_id"] == "x"
+
+
+class TestReadData:
+    def test_invalid_reader_raises_value_error(self):
+        with pytest.raises(ValueError):
+            dataproc.read_data([], reader="unknown")

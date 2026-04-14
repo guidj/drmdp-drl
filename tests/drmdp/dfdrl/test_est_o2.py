@@ -534,7 +534,7 @@ class TestDelayedRewardDataReturns:
         # Windows starting at indices 3 and 5 should have start_return=0
 
         # Just verify the critical relationship holds for all windows
-        for inputs, labels in examples:
+        for _, labels in examples:
             start_return = labels["start_return"].item()
             end_return = labels["end_return"].item()
             aggregate_reward = labels["aggregate_reward"].item()

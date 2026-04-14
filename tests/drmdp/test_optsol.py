@@ -160,6 +160,100 @@ class TestConstantLRSchedule:
         assert schedule(episode=10, step=50) == 0.001
 
 
+class TestMultivariateNormalLeastSquaresSingular:
+    def test_singular_exact_inverse_returns_none(self):
+        from unittest.mock import patch
+
+        from scipy import linalg as scipy_linalg
+
+        matrix = np.eye(2)
+        rhs = np.array([1.0, 1.0])
+        # Patch linalg.inv to raise LinAlgError with capital-S message matching the source check
+        with patch(
+            "drmdp.optsol.linalg.inv",
+            side_effect=scipy_linalg.LinAlgError("Singular matrix"),
+        ):
+            result = optsol.MultivariateNormal.least_squares(
+                matrix, rhs, inverse="exact"
+            )
+        assert result is None
+
+    def test_singular_exact_inverse_reraises_other_errors(self):
+        from unittest.mock import patch
+
+        from scipy import linalg as scipy_linalg
+
+        matrix = np.eye(2)
+        rhs = np.array([1.0, 1.0])
+        with pytest.raises(scipy_linalg.LinAlgError):
+            with patch(
+                "drmdp.optsol.linalg.inv",
+                side_effect=scipy_linalg.LinAlgError("other error"),
+            ):
+                optsol.MultivariateNormal.least_squares(matrix, rhs, inverse="exact")
+
+    def test_singular_convex_exact_inverse_returns_none(self):
+        from unittest.mock import patch
+
+        from scipy import linalg as scipy_linalg
+
+        matrix = np.eye(2)
+        rhs = np.array([1.0, 1.0])
+        with patch(
+            "drmdp.optsol.linalg.inv",
+            side_effect=scipy_linalg.LinAlgError("Singular matrix"),
+        ):
+            result = optsol.MultivariateNormal.convex_least_squares(
+                matrix, rhs, constraint_fn=lambda x: [], inverse="exact"
+            )
+        assert result is None
+
+    def test_bayes_linear_regression_linalg_error_raises_value_error(self):
+        from unittest.mock import patch
+
+        from scipy import linalg as scipy_linalg
+
+        prior = optsol.MultivariateNormal(
+            mean=np.zeros(2, dtype=np.float64),
+            cov=np.eye(2, dtype=np.float64),
+        )
+        matrix = np.eye(2)
+        rhs = np.array([1.0, 1.0])
+        with patch(
+            "drmdp.optsol.linalg.pinv", side_effect=scipy_linalg.LinAlgError("error")
+        ):
+            with pytest.raises(ValueError, match="Failed Bayesian estimation"):
+                optsol.MultivariateNormal.bayes_linear_regression(matrix, rhs, prior)
+
+
+class TestSolveLeastSquaresError:
+    def test_linalg_error_raises_value_error(self):
+        from unittest.mock import patch
+
+        matrix = np.eye(2)
+        rhs = np.array([1.0, 1.0])
+        with patch.object(
+            np.linalg, "lstsq", side_effect=np.linalg.LinAlgError("fail")
+        ):
+            with pytest.raises(ValueError, match="Failed to solve linear system"):
+                optsol.solve_least_squares(matrix, rhs)
+
+
+class TestSolveConvexLeastSquaresError:
+    def test_solver_error_raises_value_error(self):
+        from unittest.mock import patch
+
+        import cvxpy.error
+
+        matrix = np.eye(2)
+        rhs = np.array([1.0, 1.0])
+        with patch("cvxpy.Problem.solve", side_effect=cvxpy.error.SolverError("fail")):
+            with pytest.raises(ValueError):
+                optsol.solve_convex_least_squares(
+                    matrix, rhs, constraint_fn=lambda x: []
+                )
+
+
 class TestMultivariateNormalConvexLeastSquares:
     def test_basic_solution_pseudo_inverse(self):
         matrix = np.eye(2, dtype=np.float64)
