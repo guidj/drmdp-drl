@@ -1637,7 +1637,6 @@ class TestReguLoss:
         torch.manual_seed(42)
         criterion = torch.nn.MSELoss()
 
-        batch_size = 3
         start_return = torch.tensor([0.0, 5.0, -2.0])
         end_return = torch.tensor([1.0, 7.0, -1.0])
 

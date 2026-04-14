@@ -311,8 +311,8 @@ def _run_hc(
     exp_logger: logger.ExperimentLogger,
 ) -> None:
     """Train HC-decomposition SAC."""
-    # Augment observations with normalised interval position (t - t_i) / max_delay.
-    # Must be applied after ImputeMissingRewardWrapper (which provides info["interval_end"]).
+    # IntervalPositionWrapper depends on info["interval_end"] from ImputeMissingRewardWrapper,
+    # so it must be applied after that wrapper.
     max_delay = int(args.agent_kwargs.get("max_delay", args.delay))
     env = hc.IntervalPositionWrapper(env, max_delay=max_delay)
     agent = hc.HCSAC(

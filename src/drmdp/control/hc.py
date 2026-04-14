@@ -34,8 +34,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from stable_baselines3 import SAC
-from stable_baselines3.common import buffers
-from stable_baselines3.common.utils import polyak_update
+from stable_baselines3.common import buffers, utils
 from stable_baselines3.sac.policies import SACPolicy
 
 # ---------------------------------------------------------------------------
@@ -80,7 +79,6 @@ class IntervalPositionWrapper(gym.Wrapper):
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs, reward, terminated, truncated, info = self.env.step(action)
-        # The returned obs is s_{t+1}; update position for the next step.
         if info.get("interval_end", False) or terminated or truncated:
             self._position = 0
         else:
@@ -219,7 +217,6 @@ class HCSAC(SAC):
             actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
             log_prob = log_prob.reshape(-1, 1)
 
-            # Entropy coefficient (same as standard SAC).
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
                 ent_coef = th.exp(self.log_ent_coef.detach())
@@ -236,9 +233,8 @@ class HCSAC(SAC):
                 ent_coef_loss.backward()
                 self.ent_coef_optimizer.step()
 
-            # Build h_{t+1}: history for the next step.
-            # Use interval_ends stored in the replay buffer (set by
-            # ImputeMissingRewardWrapper) — robust to zero-sum intervals.
+            # Use interval_ends stored in the replay buffer rather than reward != 0
+            # so that zero-sum signal intervals are handled correctly.
             current_sa = th.cat(
                 [replay_data.observations, replay_data.actions], dim=-1
             ).unsqueeze(1)  # (B, 1, sa_dim)
@@ -256,12 +252,10 @@ class HCSAC(SAC):
                     replay_data.next_observations
                 )
 
-                # Encode next-step history with target encoder.
                 _, h_next_enc = self.history_encoder_target(next_history)
                 h_next = h_next_enc.squeeze(0)  # (B, hidden)
                 qh_next = self.head_net_target(h_next)  # (B, 1)
 
-                # Q^C_target(s', a') — minimum over twin critics.
                 next_qc = th.cat(
                     self.critic_target(replay_data.next_observations, next_actions),
                     dim=1,
@@ -269,12 +263,10 @@ class HCSAC(SAC):
                 next_qc_min, _ = th.min(next_qc, dim=1, keepdim=True)
                 next_qc_min = next_qc_min - ent_coef * next_log_prob.reshape(-1, 1)
 
-                # Full HC target combines both components.
                 target_q = replay_data.rewards + (1 - replay_data.dones) * discounts * (
                     qh_next + next_qc_min
                 )
 
-            # Head update: Q^H(h_t) vs. full target.
             _, h_t_enc = self.history_encoder(history)
             h_t = h_t_enc.squeeze(0)  # (B, hidden)
             qh_pred = self.head_net(h_t)  # (B, 1)
@@ -323,22 +315,23 @@ class HCSAC(SAC):
             actor_loss.backward()
             self.actor.optimizer.step()
 
-            # Soft-update all target networks.
             if gradient_step % self.target_update_interval == 0:
-                polyak_update(
+                utils.polyak_update(
                     self.critic.parameters(), self.critic_target.parameters(), self.tau
                 )
-                polyak_update(
+                utils.polyak_update(
                     self.head_net.parameters(),
                     self.head_net_target.parameters(),
                     self.tau,
                 )
-                polyak_update(
+                utils.polyak_update(
                     self.history_encoder.parameters(),
                     self.history_encoder_target.parameters(),
                     self.tau,
                 )
-                polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+                utils.polyak_update(
+                    self.batch_norm_stats, self.batch_norm_stats_target, 1.0
+                )
 
         self._n_updates += gradient_steps
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
@@ -391,7 +384,7 @@ class HCSACPolicy(SACPolicy):
         self.head_net_target = copy.deepcopy(self.head_net)
         self.head_net_target.eval()
 
-        # Single optimizer for both history encoder and head network.
+        # Share an optimizer so both networks train together on the head loss.
         self.head_optimizer = self.optimizer_class(
             list(self.history_encoder.parameters()) + list(self.head_net.parameters()),
             lr=lr_schedule(1),
@@ -489,9 +482,8 @@ class HCReplayBuffer(buffers.ReplayBuffer):
 
         super().add(obs, next_obs, action, reward, done, infos)
 
-        # Update rolling deques for the *next* add() call.
-        # Use info["interval_end"] from ImputeMissingRewardWrapper — robust to
-        # signal intervals whose aggregate reward sums to zero.
+        # Use info["interval_end"] rather than reward != 0 so that
+        # zero-sum signal intervals reset the deques correctly.
         for env_idx in range(self.n_envs):
             if infos[env_idx].get("interval_end", False) or bool(done_arr[env_idx]):
                 self._recent_sa[env_idx].clear()
