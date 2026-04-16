@@ -6,7 +6,7 @@ from drmdp import ray_utils
 
 @pytest.fixture(scope="module", autouse=True)
 def ray_cluster():
-    with ray.init(ignore_reinit_error=True):
+    with ray.init(address="local", num_cpus=1, ignore_reinit_error=True):
         yield
 
 

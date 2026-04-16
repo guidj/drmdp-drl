@@ -34,7 +34,7 @@ import stable_baselines3
 from stable_baselines3.common import callbacks
 
 from drmdp import core, logger, rewdelay
-from drmdp.control import base, hc, ircr
+from drmdp.control import base, dgra, hc, ircr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,7 +46,7 @@ class TrainingArgs:
         delay: Fixed reward delay (number of steps).
         max_episode_steps: Maximum steps per episode before truncation.
             None uses the environment's default.
-        reward_model_type: Reward model identifier. Supports "ircr".
+        reward_model_type: Reward model identifier. Supports "ircr" and "dgra".
             Only used when ``agent_type="sac"``.
         update_every_n_steps: Call reward_model.update() every N env steps.
             Only used when ``agent_type="sac"``.
@@ -275,7 +275,7 @@ def _run_sac(
     exp_logger: logger.ExperimentLogger,
 ) -> None:
     """Train standard SAC with a pluggable reward model."""
-    reward_model = _make_reward_model(args)
+    reward_model = _make_reward_model(args, env)
     sac = stable_baselines3.SAC(
         "MlpPolicy",
         env,
@@ -339,10 +339,24 @@ def _run_hc(
     logging.info("Model saved to %s/hc_model", args.output_dir)
 
 
-def _make_reward_model(args: TrainingArgs) -> base.RewardModel:
-    """Instantiate the reward model specified in args."""
+def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
+    """Instantiate the reward model specified in args.
+
+    Args:
+        args: Training configuration.
+        env: Wrapped Gymnasium environment; used to extract obs_dim and
+            action_dim for parametric models such as DGRA.
+    """
     if args.reward_model_type == "ircr":
         return ircr.IRCRRewardModel(**args.reward_model_kwargs)
+    if args.reward_model_type == "dgra":
+        obs_dim = int(np.prod(env.observation_space.shape))
+        action_dim = int(np.prod(env.action_space.shape))
+        return dgra.DGRARewardModel(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            **args.reward_model_kwargs,
+        )
     raise ValueError(f"Unknown reward_model_type: {args.reward_model_type!r}")
 
 
@@ -379,7 +393,7 @@ def parse_args() -> TrainingArgs:
         "--reward-model-type",
         type=str,
         default="ircr",
-        choices=["ircr"],
+        choices=["ircr", "dgra"],
         help="Reward model to use",
     )
     parser.add_argument(

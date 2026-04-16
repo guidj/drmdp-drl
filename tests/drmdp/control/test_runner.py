@@ -8,110 +8,11 @@ import tempfile
 from typing import Any, Mapping, Optional, Sequence
 from unittest.mock import MagicMock, patch
 
+import gymnasium as gym
 import numpy as np
 import pytest
 
-from drmdp.control import base, ircr, runner
-
-# ---------------------------------------------------------------------------
-# Stubs
-# ---------------------------------------------------------------------------
-
-
-class _TrackingRewardModel(base.RewardModel):
-    """Reward model that tracks update calls and returns a fixed constant."""
-
-    def __init__(self, constant: float = 0.0):
-        self._constant = constant
-        self.update_calls: int = 0
-        self.trajectories_received: list = []
-
-    def predict(
-        self,
-        observations: np.ndarray,
-        actions: np.ndarray,
-        terminals: np.ndarray,
-    ) -> np.ndarray:
-        return np.full(len(observations), self._constant, dtype=np.float32)
-
-    def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
-        self.update_calls += 1
-        self.trajectories_received.extend(trajectories)
-        return {"buffer_size": float(len(self.trajectories_received))}
-
-
-class _MockReplayBuffer:
-    """Minimal replay buffer stub that records reset() calls."""
-
-    def __init__(self):
-        self.reset_count = 0
-
-    def reset(self) -> None:
-        self.reset_count += 1
-
-
-class _MockLogger:
-    """Minimal ExperimentLogger stub."""
-
-    def __init__(self):
-        self.log_calls: list = []
-
-    def log(self, episode, steps, returns, info=None):
-        self.log_calls.append(
-            {"episode": episode, "steps": steps, "returns": returns, "info": info}
-        )
-
-
-def _build_callback(
-    reward_model: Optional[base.RewardModel] = None,
-    update_every: int = 100,
-    clear_buffer: bool = False,
-    log_freq: int = 1,
-    exp_logger: Any = None,
-) -> runner.RewardModelUpdateCallback:
-    """Construct a callback with sensible defaults for unit testing."""
-    if reward_model is None:
-        reward_model = _TrackingRewardModel()
-    if exp_logger is None:
-        exp_logger = _MockLogger()
-    return runner.RewardModelUpdateCallback(
-        reward_model=reward_model,
-        update_every_n_steps=update_every,
-        clear_buffer_on_update=clear_buffer,
-        log_episode_frequency=log_freq,
-        exp_logger=exp_logger,
-    )
-
-
-def _make_mock_sac(obs_dim: int = 3, act_dim: int = 1) -> MagicMock:
-    """Return a minimal SAC mock with _last_obs and replay_buffer."""
-    sac = MagicMock()
-    sac._last_obs = np.zeros((1, obs_dim), dtype=np.float32)
-    sac.replay_buffer = _MockReplayBuffer()
-    return sac
-
-
-def _step_callback(
-    callback: runner.RewardModelUpdateCallback,
-    sac_model: Any,
-    obs_before: np.ndarray,
-    action: np.ndarray,
-    reward: float,
-    done: bool,
-    num_timesteps: int,
-) -> bool:
-    """Simulate one SB3 callback step by setting required attributes/locals."""
-    sac_model._last_obs = obs_before[np.newaxis]  # (1, obs_dim)
-    callback.model = sac_model
-    callback.locals = {
-        "actions": action[np.newaxis],  # (1, act_dim)
-        "rewards": np.array([reward]),
-        "dones": np.array([done]),
-        "infos": [{}],
-    }
-    callback.num_timesteps = num_timesteps
-    return callback._on_step()
-
+from drmdp.control import base, dgra, ircr, runner
 
 # ---------------------------------------------------------------------------
 # TestRewardModelUpdateCallback
@@ -310,7 +211,7 @@ class TestRun:
 
 
 # ---------------------------------------------------------------------------
-# TestParseRewardModelKwargs
+# TestHCLoggingCallback
 # ---------------------------------------------------------------------------
 
 
@@ -370,7 +271,13 @@ class TestHCLoggingCallback:
 
 
 class TestMakeRewardModel:
-    def test_ircr_type_returns_ircr_instance(self, tmp_path):
+    @pytest.fixture()
+    def pendulum_env(self):
+        env = gym.make("Pendulum-v1")
+        yield env
+        env.close()
+
+    def test_ircr_type_returns_ircr_instance(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
             env="Pendulum-v1",
             delay=1,
@@ -388,10 +295,10 @@ class TestMakeRewardModel:
             output_dir=str(tmp_path),
             seed=None,
         )
-        model = runner._make_reward_model(args)
+        model = runner._make_reward_model(args, pendulum_env)
         assert isinstance(model, ircr.IRCRRewardModel)
 
-    def test_unknown_type_raises_value_error(self, tmp_path):
+    def test_unknown_type_raises_value_error(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
             env="Pendulum-v1",
             delay=1,
@@ -410,7 +317,56 @@ class TestMakeRewardModel:
             seed=None,
         )
         with pytest.raises(ValueError):
-            runner._make_reward_model(args)
+            runner._make_reward_model(args, pendulum_env)
+
+    def test_dgra_type_returns_dgra_instance(self, tmp_path, pendulum_env):
+        args = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            max_episode_steps=50,
+            reward_model_type="dgra",
+            reward_model_kwargs={},
+            update_every_n_steps=100,
+            clear_buffer_on_update=False,
+            num_steps=100,
+            sac_learning_rate=3e-4,
+            sac_buffer_size=100,
+            sac_batch_size=32,
+            sac_gradient_steps=1,
+            log_episode_frequency=1,
+            output_dir=str(tmp_path),
+            seed=None,
+        )
+        model = runner._make_reward_model(args, pendulum_env)
+        assert isinstance(model, dgra.DGRARewardModel)
+
+    def test_dgra_predicts_with_pendulum_dimensions(self, tmp_path, pendulum_env):
+        """DGRARewardModel constructed from Pendulum env accepts its obs/action dims."""
+        args = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            max_episode_steps=50,
+            reward_model_type="dgra",
+            reward_model_kwargs={},
+            update_every_n_steps=100,
+            clear_buffer_on_update=False,
+            num_steps=100,
+            sac_learning_rate=3e-4,
+            sac_buffer_size=100,
+            sac_batch_size=32,
+            sac_gradient_steps=1,
+            log_episode_frequency=1,
+            output_dir=str(tmp_path),
+            seed=None,
+        )
+        model = runner._make_reward_model(args, pendulum_env)
+        obs = np.zeros((4, 3), dtype=np.float32)  # Pendulum obs_dim=3
+        actions = np.zeros((4, 1), dtype=np.float32)  # Pendulum action_dim=1
+        terminals = np.zeros(4, dtype=bool)
+
+        result = model.predict(obs, actions, terminals)
+
+        assert result.shape == (4,)
 
 
 class TestParseArgs:
@@ -504,3 +460,103 @@ class TestParseRewardModelKwargs:
             ["max_buffer_size=200", "k_neighbors=5"]
         )
         assert result == {"max_buffer_size": 200, "k_neighbors": 5}
+
+
+# ---------------------------------------------------------------------------
+# Stubs and helpers
+# ---------------------------------------------------------------------------
+
+
+class _TrackingRewardModel(base.RewardModel):
+    """Reward model that tracks update calls and returns a fixed constant."""
+
+    def __init__(self, constant: float = 0.0):
+        self._constant = constant
+        self.update_calls: int = 0
+        self.trajectories_received: list = []
+
+    def predict(
+        self,
+        observations: np.ndarray,
+        actions: np.ndarray,
+        terminals: np.ndarray,
+    ) -> np.ndarray:
+        return np.full(len(observations), self._constant, dtype=np.float32)
+
+    def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
+        self.update_calls += 1
+        self.trajectories_received.extend(trajectories)
+        return {"buffer_size": float(len(self.trajectories_received))}
+
+
+class _MockReplayBuffer:
+    """Minimal replay buffer stub that records reset() calls."""
+
+    def __init__(self):
+        self.reset_count = 0
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+
+class _MockLogger:
+    """Minimal ExperimentLogger stub."""
+
+    def __init__(self):
+        self.log_calls: list = []
+
+    def log(self, episode, steps, returns, info=None):
+        self.log_calls.append(
+            {"episode": episode, "steps": steps, "returns": returns, "info": info}
+        )
+
+
+def _build_callback(
+    reward_model: Optional[base.RewardModel] = None,
+    update_every: int = 100,
+    clear_buffer: bool = False,
+    log_freq: int = 1,
+    exp_logger: Any = None,
+) -> runner.RewardModelUpdateCallback:
+    """Construct a callback with sensible defaults for unit testing."""
+    if reward_model is None:
+        reward_model = _TrackingRewardModel()
+    if exp_logger is None:
+        exp_logger = _MockLogger()
+    return runner.RewardModelUpdateCallback(
+        reward_model=reward_model,
+        update_every_n_steps=update_every,
+        clear_buffer_on_update=clear_buffer,
+        log_episode_frequency=log_freq,
+        exp_logger=exp_logger,
+    )
+
+
+def _make_mock_sac(obs_dim: int = 3, act_dim: int = 1) -> MagicMock:
+    """Return a minimal SAC mock with _last_obs and replay_buffer."""
+    sac = MagicMock()
+    sac._last_obs = np.zeros((1, obs_dim), dtype=np.float32)
+    sac.replay_buffer = _MockReplayBuffer()
+    return sac
+
+
+def _step_callback(
+    callback: runner.RewardModelUpdateCallback,
+    sac_model: Any,
+    obs_before: np.ndarray,
+    action: np.ndarray,
+    reward: float,
+    done: bool,
+    num_timesteps: int,
+) -> bool:
+    """Simulate one SB3 callback step by setting required attributes/locals."""
+    sac_model._last_obs = obs_before[np.newaxis]  # (1, obs_dim)
+    callback.model = sac_model
+    callback.locals = {
+        "actions": action[np.newaxis],  # (1, act_dim)
+        "rewards": np.array([reward]),
+        "dones": np.array([done]),
+        "infos": [{}],
+    }
+    callback.num_timesteps = num_timesteps
+    return callback._on_step()
