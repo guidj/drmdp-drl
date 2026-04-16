@@ -11,7 +11,7 @@ import io
 import json
 import os
 import typing
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -48,7 +48,7 @@ def load_model(
     model_type: str,
     state_dim: int,
     action_dim: int,
-    hidden_dim: int = 256,
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> nn.Module:
     """
     Load O1 model from checkpoint.
@@ -58,7 +58,7 @@ def load_model(
         model_type: Type of model ("mlp",)
         state_dim: State dimension
         action_dim: Action dimension
-        hidden_dim: Hidden layer dimension (default: 256)
+        reward_model_kwargs: Keyword arguments forwarded to RNetwork (e.g. powers, hidden_dim)
 
     Returns:
         Loaded model in eval mode
@@ -69,7 +69,9 @@ def load_model(
     model: nn.Module
     if model_type == "mlp":
         model = est_o1.RNetwork(
-            state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim
+            state_dim=state_dim,
+            action_dim=action_dim,
+            **(reward_model_kwargs or {}),
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
@@ -363,7 +365,7 @@ def main():
             model_type=args.model_type,
             state_dim=config["state_dim"],
             action_dim=config["action_dim"],
-            hidden_dim=config.get("hidden_dim", 256),
+            reward_model_kwargs=config.get("reward_model_kwargs", {}),
         )
         print(f"Loaded {args.model_type.upper()} model from {model_path}")
 

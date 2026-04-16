@@ -1062,7 +1062,7 @@ class TestSaveConfigAndMetrics:
                 "action_dim",
                 "batch_size",
                 "eval_steps",
-                "hidden_dim",
+                "reward_model_kwargs",
             ]
 
             for field in required_fields:

@@ -27,7 +27,7 @@ import argparse
 import json
 import pathlib
 import typing
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -62,7 +62,7 @@ def load_model(
     model_path: str,
     state_dim: int,
     action_dim: int,
-    hidden_dim: int = 256,
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> nn.Module:
     """
     Load reward model from checkpoint.
@@ -71,7 +71,7 @@ def load_model(
         model_path: Path to model file (model_mlp.pt)
         state_dim: State dimension
         action_dim: Action dimension
-        hidden_dim: Hidden layer dimension (default: 256)
+        reward_model_kwargs: Keyword arguments forwarded to RNetwork (e.g. powers, hidden_dim)
 
     Returns:
         Loaded reward model (MLP only)
@@ -82,7 +82,7 @@ def load_model(
     r_model = est_o3.RNetwork(
         state_dim=state_dim,
         action_dim=action_dim,
-        hidden_dim=hidden_dim,
+        **(reward_model_kwargs or {}),
     )
 
     # Load checkpoint
@@ -359,7 +359,7 @@ def main():
             str(model_path),
             state_dim=config["state_dim"],
             action_dim=config["action_dim"],
-            hidden_dim=config.get("hidden_dim", 256),
+            reward_model_kwargs=config.get("reward_model_kwargs", {}),
         )
         print(f"Loaded MLP model from {model_path}")
 

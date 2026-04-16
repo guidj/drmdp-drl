@@ -24,6 +24,7 @@ provides per-step gradient signal rather than one aggregate residual per window.
 """
 
 import argparse
+import ast
 import collections
 import dataclasses
 import io
@@ -82,6 +83,7 @@ class TrainingArgs:
     num_runs: int
     regu_lam: float
     local_eager_mode: bool
+    reward_model_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     seed: Optional[int] = None
 
 
@@ -467,6 +469,7 @@ def save_config_and_metrics(
     eval_losses: Sequence,
     final_mse: Mapping[str, float],
     final_rmse: Mapping[str, float],
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
 ):
     """
     Save configuration and training metrics to JSON files.
@@ -503,7 +506,7 @@ def save_config_and_metrics(
 
     # Save config
     config_file = os.path.join(output_dir, "config.json")
-    hparams = {
+    config = {
         "spec": SPEC,
         "model_type": model_type,
         "env_name": env.spec.id if hasattr(env, "spec") and env.spec else "unknown",
@@ -511,15 +514,22 @@ def save_config_and_metrics(
         "action_dim": act_dim,
         "batch_size": batch_size,
         "eval_steps": eval_steps,
-        "hidden_dim": 256,
+        "reward_model_kwargs": reward_model_kwargs or {},
     }
     with tf.io.gfile.GFile(config_file, "w") as writable:
         json.dump(
-            hparams,
+            config,
             writable,
             indent=2,
         )
     logging.info("Config saved to %s", config_file)
+
+    # TensorBoard add_hparams only accepts scalar types; expand reward_model_kwargs as flat entries
+    hparams = {
+        key: value for key, value in config.items() if key != "reward_model_kwargs"
+    }
+    for key, value in (reward_model_kwargs or {}).items():
+        hparams[f"reward_model_kwargs.{key}"] = value
     return hparams
 
 
@@ -531,6 +541,7 @@ def train(
     eval_steps: int,
     log_episode_frequency: int,
     regu_lam: float,
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
     seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
@@ -570,7 +581,9 @@ def train(
 
     # Select model architecture
     if model_type == "mlp":
-        model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
+        model = RNetwork(
+            state_dim=obs_dim, action_dim=act_dim, **(reward_model_kwargs or {})
+        )
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
@@ -748,6 +761,7 @@ def train(
             eval_losses=eval_losses,
             final_mse=final_mse,
             final_rmse=final_rmse,
+            reward_model_kwargs=reward_model_kwargs,
         )
 
         summary_writer.add_hparams(
@@ -861,6 +875,7 @@ def experiment(args: TrainingArgs):
             eval_steps=args.eval_steps,
             model_type=args.model_type,
             regu_lam=args.regu_lam,
+            reward_model_kwargs=args.reward_model_kwargs,
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
             seed=args.seed,
@@ -878,6 +893,19 @@ def run_fn(args: TrainingArgs):
     except Exception as err:
         logging.error("Error in task %s: %s", args.seed, err)
         sys.exit(1)
+
+
+def _parse_kwargs(pairs: Optional[List[str]]) -> Dict[str, Any]:
+    if not pairs:
+        return {}
+    result: Dict[str, Any] = {}
+    for pair in pairs:
+        key, _, raw_value = pair.partition("=")
+        try:
+            result[key] = ast.literal_eval(raw_value)
+        except (ValueError, SyntaxError):
+            result[key] = raw_value
+    return result
 
 
 def main():
@@ -979,9 +1007,17 @@ def parse_args() -> TrainingArgs:
         help="Weight of regularisation. lam in [0, 1]",
     )
     parser.add_argument("--local-eager-mode", action="store_true", default=False)
+    parser.add_argument(
+        "--reward-model-kwargs",
+        nargs="*",
+        default=None,
+        help="Keyword arguments for RNetwork (e.g. powers=2 hidden_dim=512)",
+    )
 
     args, _ = parser.parse_known_args()
-    return TrainingArgs(**vars(args))
+    arg_dict = vars(args)
+    arg_dict["reward_model_kwargs"] = _parse_kwargs(arg_dict.get("reward_model_kwargs"))
+    return TrainingArgs(**arg_dict)
 
 
 if __name__ == "__main__":
