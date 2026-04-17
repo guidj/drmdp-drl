@@ -26,74 +26,6 @@ from drmdp import dataproc, rewdelay
 from drmdp.dfdrl import est_o2
 
 # =============================================================================
-# Module-level helper functions
-# =============================================================================
-
-
-def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple[Any, ...]]:
-    """Create a mock buffer from episode rewards.
-
-    Args:
-        episodes: List of reward sequences, one per episode
-
-    Returns:
-        Buffer in format: List[(state, action, next_state, reward, term)]
-    """
-    buffer = []
-    for ep_idx, rewards in enumerate(episodes):
-        for step_idx, reward in enumerate(rewards):
-            state = np.array([float(ep_idx), float(step_idx)])
-            action = np.array([float(ep_idx * 10 + step_idx)])
-            next_state = np.array([float(ep_idx), float(step_idx + 1)])
-            term = step_idx == len(rewards) - 1
-
-            buffer.append((state, action, next_state, reward, term))
-
-    return buffer
-
-
-# =============================================================================
-# Module-level fixtures
-# =============================================================================
-
-
-@pytest.fixture
-def simple_env():
-    """Create a simple environment for testing."""
-    return gym.make("MountainCarContinuous-v0")
-
-
-@pytest.fixture
-def simple_model_and_dataset():
-    """Create a simple model and dataset for evaluation tests."""
-    # Create small dataset
-    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    delay = rewdelay.FixedDelay(3)
-    examples = est_o2.delayed_reward_data(buffer, delay)
-
-    inputs, labels = zip(*examples)
-    dataset = est_o2.DictDataset(inputs=list(inputs), labels=list(labels))
-
-    # Create model
-    torch.manual_seed(42)
-    model = est_o2.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
-
-    return model, dataset
-
-
-@pytest.fixture(scope="module")
-def training_dataset():
-    """Create a realistic training dataset for integration tests."""
-    env = gym.make("MountainCarContinuous-v0", max_episode_steps=50)
-    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
-    delay = rewdelay.FixedDelay(5)
-    examples = est_o2.delayed_reward_data(buffer, delay)
-
-    inputs, labels = zip(*examples)
-    return est_o2.DictDataset(inputs=list(inputs), labels=list(labels))
-
-
-# =============================================================================
 # TestRNetwork
 # =============================================================================
 
@@ -1022,7 +954,11 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5, 0.4, 0.3],
-                eval_losses=[0.6, 0.5],
+                eval_losses={
+                    "reward": [0.6, 0.5],
+                    "regu": [0.1, 0.1],
+                    "total": [0.7, 0.6],
+                },
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1044,7 +980,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5, 0.4],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1072,7 +1008,11 @@ class TestSaveConfigAndMetrics:
         """Validate metrics JSON has required fields."""
         with tempfile.TemporaryDirectory() as output_dir:
             train_losses = [0.5, 0.4, 0.3]
-            eval_losses = [0.6, 0.5]
+            eval_losses = {
+                "reward": [0.6, 0.5],
+                "regu": [0.1, 0.1],
+                "total": [0.7, 0.6],
+            }
             final_mse = 0.25
             final_rmse = 0.5
 
@@ -1115,7 +1055,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1136,7 +1076,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1158,7 +1098,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1334,7 +1274,7 @@ class TestTrain:
                 metrics = json.load(readable)
 
             # With 15 epochs and log_episode_frequency=5, should have 3 eval points
-            assert len(metrics["eval_losses"]) == 3
+            assert len(metrics["eval_losses"]["total"]) == 3
 
     def test_tensorboard_logging(self, simple_env, training_dataset):
         """Verify tensorboard events file exists in output_dir."""
@@ -1687,3 +1627,64 @@ class TestReguLoss:
         for batch in batch_losses:
             expected_total = batch["reward"] + regu_lam * batch["regu"]
             np.testing.assert_allclose(batch["total"], expected_total, atol=1e-5)
+
+
+# =============================================================================
+# Module-level helper functions and fixtures
+# =============================================================================
+
+
+def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple[Any, ...]]:
+    """Create a mock buffer from episode rewards.
+
+    Args:
+        episodes: List of reward sequences, one per episode
+
+    Returns:
+        Buffer in format: List[(state, action, next_state, reward, term)]
+    """
+    buffer = []
+    for ep_idx, rewards in enumerate(episodes):
+        for step_idx, reward in enumerate(rewards):
+            state = np.array([float(ep_idx), float(step_idx)])
+            action = np.array([float(ep_idx * 10 + step_idx)])
+            next_state = np.array([float(ep_idx), float(step_idx + 1)])
+            term = step_idx == len(rewards) - 1
+
+            buffer.append((state, action, next_state, reward, term))
+
+    return buffer
+
+
+@pytest.fixture
+def simple_env():
+    """Create a simple environment for testing."""
+    return gym.make("MountainCarContinuous-v0")
+
+
+@pytest.fixture
+def simple_model_and_dataset():
+    """Create a simple model and dataset for evaluation tests."""
+    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    delay = rewdelay.FixedDelay(3)
+    examples = est_o2.delayed_reward_data(buffer, delay)
+
+    inputs, labels = zip(*examples)
+    dataset = est_o2.DictDataset(inputs=list(inputs), labels=list(labels))
+
+    torch.manual_seed(42)
+    model = est_o2.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
+
+    return model, dataset
+
+
+@pytest.fixture(scope="module")
+def training_dataset():
+    """Create a realistic training dataset for integration tests."""
+    env = gym.make("MountainCarContinuous-v0", max_episode_steps=50)
+    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
+    delay = rewdelay.FixedDelay(5)
+    examples = est_o2.delayed_reward_data(buffer, delay)
+
+    inputs, labels = zip(*examples)
+    return est_o2.DictDataset(inputs=list(inputs), labels=list(labels))

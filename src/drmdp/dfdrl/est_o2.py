@@ -467,7 +467,7 @@ def save_config_and_metrics(
     batch_size: int,
     eval_steps: int,
     train_losses: Sequence,
-    eval_losses: Sequence,
+    eval_losses: Mapping[str, Sequence],
     final_mse: Mapping[str, float],
     final_rmse: Mapping[str, float],
     reward_model_kwargs: Optional[Mapping[str, Any]] = None,
@@ -482,7 +482,7 @@ def save_config_and_metrics(
         batch_size: Batch size used in training
         eval_steps: Number of evaluation steps
         train_losses: List of training losses per epoch
-        eval_losses: List of evaluation losses
+        eval_losses: Dict mapping "reward", "regu", "total" to lists of per-eval-run mean losses
         final_mse: Final mean squared error on test set
         final_rmse: Final root mean squared error on test set
     """
@@ -589,7 +589,7 @@ def train(
 
     # Training Loop
     train_losses = []
-    eval_losses = []
+    eval_losses: Dict[str, List[float]] = collections.defaultdict(list)
 
     with tensorboard.SummaryWriter(log_dir=output_dir) as summary_writer:
         for epoch in range(train_epochs):
@@ -661,19 +661,20 @@ def train(
                     max_batches=eval_steps,
                     shuffle=True,
                 )
-                eval_losses.append(np.mean(eval_mse["total"]).item())
-                # Epoch results
+                for key in ("reward", "regu", "total"):
+                    eval_losses[key].append(np.mean(eval_mse[key]).item())
+                # Epoch results — log running mean across all eval runs for smoothing
                 for key in ("reward", "regu", "total"):
                     summary_writer.add_scalar(
-                        f"MSE/eval/{key}", np.mean(eval_mse[key]), global_step=epoch
+                        f"MSE/eval/{key}", np.mean(eval_losses[key]), global_step=epoch
                     )
                     summary_writer.add_scalar(
                         f"RMSE/eval/{key}",
-                        np.mean(np.sqrt(eval_mse[key])),
+                        np.mean(np.sqrt(eval_losses[key])),
                         global_step=epoch,
                     )
                 train_rmse = np.sqrt(avg_train_loss)
-                eval_rmse = np.mean(np.sqrt(eval_mse["total"]))
+                eval_rmse = np.mean(np.sqrt(eval_losses["total"]))
                 logging.info(
                     "Epoch [%d/%d], Train RMSE: %.8f, Eval RMSE: %.8f",
                     epoch + 1,
@@ -747,7 +748,7 @@ def train(
             batch_size=batch_size,
             eval_steps=eval_steps,
             train_losses=train_losses,
-            eval_losses=eval_losses,
+            eval_losses=dict(eval_losses),
             final_mse=final_mse,
             final_rmse=final_rmse,
             reward_model_kwargs=reward_model_kwargs,

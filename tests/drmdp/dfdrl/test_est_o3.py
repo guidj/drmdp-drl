@@ -8,6 +8,7 @@ Tests focus on the components that differ from est_o2:
 5. End-to-end pipeline integration
 """
 
+import json
 import os
 import tempfile
 from typing import List, Tuple
@@ -19,65 +20,6 @@ import torch
 
 from drmdp import dataproc, rewdelay
 from drmdp.dfdrl import est_o3
-
-# =============================================================================
-# Module-level helpers
-# =============================================================================
-
-
-def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple]:
-    """
-    Create a mock buffer from episode reward sequences.
-
-    Args:
-        episodes: List of reward sequences, one per episode.
-
-    Returns:
-        Buffer in format: List[(state, action, next_state, reward, term)]
-    """
-    buffer = []
-    for ep_idx, rewards in enumerate(episodes):
-        for step_idx, reward in enumerate(rewards):
-            state = np.array([float(ep_idx), float(step_idx)])
-            action = np.array([float(ep_idx * 10 + step_idx)])
-            next_state = np.array([float(ep_idx), float(step_idx + 1)])
-            term = step_idx == len(rewards) - 1
-            buffer.append((state, action, next_state, reward, term))
-    return buffer
-
-
-# =============================================================================
-# Fixtures
-# =============================================================================
-
-
-@pytest.fixture
-def simple_model_and_dataset():
-    """Create a small model and dataset for E-step and mask tests."""
-    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    delay = rewdelay.FixedDelay(3)
-    examples = est_o3.delayed_reward_data(buffer, delay)
-
-    inputs_list, labels_list = zip(*examples)
-    dataset = est_o3.DictDataset(inputs=list(inputs_list), labels=list(labels_list))
-
-    torch.manual_seed(42)
-    model = est_o3.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
-
-    return model, dataset
-
-
-@pytest.fixture(scope="module")
-def training_dataset():
-    """Create a dataset from an actual environment for integration tests."""
-    env = gym.make("MountainCarContinuous-v0", max_episode_steps=50)
-    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
-    delay = rewdelay.FixedDelay(5)
-    examples = est_o3.delayed_reward_data(buffer, delay)
-
-    inputs_list, labels_list = zip(*examples)
-    return est_o3.DictDataset(inputs=list(inputs_list), labels=list(labels_list))
-
 
 # =============================================================================
 # TestCollateVariableLengthSequences
@@ -619,3 +561,90 @@ class TestReguLoss:
                 atol=1e-5,
                 err_msg=f"Batch {idx}: total != reward + lam * regu",
             )
+
+    def test_eval_losses_per_component_saved(self, training_dataset):
+        """Saved metrics JSON has eval_losses with reward/regu/total lists of correct length.
+
+        Verifies that the new per-component accumulation lands in the JSON output,
+        not just the total.
+        """
+        env = gym.make("MountainCarContinuous-v0")
+        with tempfile.TemporaryDirectory() as output_dir:
+            est_o3.train(
+                env,
+                dataset=training_dataset,
+                train_epochs=10,
+                batch_size=8,
+                eval_steps=5,
+                log_episode_frequency=5,
+                regu_lam=1.0,
+                seed=42,
+                output_dir=output_dir,
+            )
+
+            metrics_file = os.path.join(output_dir, "metrics_mlp.json")
+            with open(metrics_file, "r", encoding="utf-8") as readable:
+                metrics = json.load(readable)
+
+        eval_losses = metrics["eval_losses"]
+        assert set(eval_losses.keys()) == {"reward", "regu", "total"}, (
+            "eval_losses must have exactly the keys reward, regu, total"
+        )
+        # 10 epochs, log every 5 → 2 eval runs
+        for key in ("reward", "regu", "total"):
+            assert len(eval_losses[key]) == 2, (
+                f"eval_losses[{key!r}] should have 2 entries (one per eval run)"
+            )
+
+
+# =============================================================================
+# Module-level helper functions and fixtures
+# =============================================================================
+
+
+def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple]:
+    """Create a mock buffer from episode reward sequences.
+
+    Args:
+        episodes: List of reward sequences, one per episode.
+
+    Returns:
+        Buffer in format: List[(state, action, next_state, reward, term)]
+    """
+    buffer = []
+    for ep_idx, rewards in enumerate(episodes):
+        for step_idx, reward in enumerate(rewards):
+            state = np.array([float(ep_idx), float(step_idx)])
+            action = np.array([float(ep_idx * 10 + step_idx)])
+            next_state = np.array([float(ep_idx), float(step_idx + 1)])
+            term = step_idx == len(rewards) - 1
+            buffer.append((state, action, next_state, reward, term))
+    return buffer
+
+
+@pytest.fixture
+def simple_model_and_dataset():
+    """Create a small model and dataset for E-step and mask tests."""
+    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    delay = rewdelay.FixedDelay(3)
+    examples = est_o3.delayed_reward_data(buffer, delay)
+
+    inputs_list, labels_list = zip(*examples)
+    dataset = est_o3.DictDataset(inputs=list(inputs_list), labels=list(labels_list))
+
+    torch.manual_seed(42)
+    model = est_o3.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
+
+    return model, dataset
+
+
+@pytest.fixture(scope="module")
+def training_dataset():
+    """Create a dataset from an actual environment for integration tests."""
+    env = gym.make("MountainCarContinuous-v0", max_episode_steps=50)
+    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
+    delay = rewdelay.FixedDelay(5)
+    examples = est_o3.delayed_reward_data(buffer, delay)
+
+    inputs_list, labels_list = zip(*examples)
+    return est_o3.DictDataset(inputs=list(inputs_list), labels=list(labels_list))
