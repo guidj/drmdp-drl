@@ -67,6 +67,17 @@ class RewardModel(ABC):
             Mapping of metric names to scalar values (e.g. buffer_size, loss).
         """
 
+    @property
+    def obs_mask(self) -> Optional[np.ndarray]:
+        """Binary observation mask applied at sample time, or None.
+
+        When not None, RelabelingReplayBuffer multiplies sampled observations
+        and next_observations element-wise by this mask, zeroing non-causal
+        dimensions before they reach the policy network. Shape (obs_dim,).
+        Default: None (no masking; existing models are unaffected).
+        """
+        return None
+
 
 class RelabelingReplayBuffer(buffers.ReplayBuffer):
     """Replay buffer that relabels rewards at sample time via a reward model.
@@ -90,9 +101,14 @@ class RelabelingReplayBuffer(buffers.ReplayBuffer):
         batch_size: int,
         env: Optional[Any] = None,
     ) -> ReplayBufferSamples:
-        """Sample a batch, relabeling rewards with the current reward model.
+        """Sample a batch, relabeling rewards and optionally masking observations.
 
-        If no reward model is set, returns stored rewards unchanged.
+        Rewards are replaced by the reward model's predictions. If the reward
+        model exposes a non-None obs_mask, both observations and next_observations
+        are multiplied element-wise by that mask, zeroing non-causal dimensions
+        before they reach the policy network.
+
+        If no reward model is set, returns stored data unchanged.
         """
         batch = super().sample(batch_size, env)
         if self.reward_model is None:
@@ -107,4 +123,14 @@ class RelabelingReplayBuffer(buffers.ReplayBuffer):
             dtype=batch.rewards.dtype,
             device=batch.rewards.device,
         )
-        return batch._replace(rewards=relabeled)
+        batch = batch._replace(rewards=relabeled)
+        mask = self.reward_model.obs_mask
+        if mask is not None:
+            mask_t = torch.as_tensor(
+                mask, dtype=batch.observations.dtype, device=batch.observations.device
+            )
+            batch = batch._replace(
+                observations=batch.observations * mask_t,
+                next_observations=batch.next_observations * mask_t,
+            )
+        return batch

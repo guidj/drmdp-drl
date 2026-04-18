@@ -34,7 +34,7 @@ import stable_baselines3
 from stable_baselines3.common import callbacks
 
 from drmdp import core, logger, rewdelay
-from drmdp.control import base, dgra, hc, ircr
+from drmdp.control import base, dgra, grd, hc, ircr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,7 +46,7 @@ class TrainingArgs:
         delay: Fixed reward delay (number of steps).
         max_episode_steps: Maximum steps per episode before truncation.
             None uses the environment's default.
-        reward_model_type: Reward model identifier. Supports "ircr" and "dgra".
+        reward_model_type: Reward model identifier. Supports "ircr", "dgra", and "grd".
             Only used when ``agent_type="sac"``.
         update_every_n_steps: Call reward_model.update() every N env steps.
             Only used when ``agent_type="sac"``.
@@ -357,6 +357,14 @@ def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
             action_dim=action_dim,
             **args.reward_model_kwargs,
         )
+    if args.reward_model_type == "grd":
+        obs_dim = int(np.prod(env.observation_space.shape))
+        action_dim = int(np.prod(env.action_space.shape))
+        return grd.GRDRewardModel(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            **args.reward_model_kwargs,
+        )
     raise ValueError(f"Unknown reward_model_type: {args.reward_model_type!r}")
 
 
@@ -393,7 +401,7 @@ def parse_args() -> TrainingArgs:
         "--reward-model-type",
         type=str,
         default="ircr",
-        choices=["ircr", "dgra"],
+        choices=["ircr", "dgra", "grd"],
         help="Reward model to use",
     )
     parser.add_argument(

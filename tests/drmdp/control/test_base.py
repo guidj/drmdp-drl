@@ -6,6 +6,7 @@ from typing import Mapping, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
+import torch
 
 from drmdp.control import base
 
@@ -32,6 +33,31 @@ class ConstantRewardModel(base.RewardModel):
     def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
         del trajectories
         return {}
+
+
+class MaskingRewardModel(base.RewardModel):
+    """Reward model that also exposes a binary obs_mask."""
+
+    def __init__(self, constant: float, obs_mask: np.ndarray):
+        self._constant = constant
+        self._obs_mask = obs_mask
+
+    def predict(
+        self,
+        observations: np.ndarray,
+        actions: np.ndarray,
+        terminals: np.ndarray,
+    ) -> np.ndarray:
+        del actions, terminals
+        return np.full(len(observations), self._constant, dtype=np.float32)
+
+    def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
+        del trajectories
+        return {}
+
+    @property
+    def obs_mask(self) -> Optional[np.ndarray]:
+        return self._obs_mask
 
 
 def _make_buffer(
@@ -162,3 +188,66 @@ class TestRelabelingReplayBuffer:
         _fill_buffer(buf, n_transitions=20, obs_dim=2, act_dim=1, reward_value=3.0)
         batch = buf.sample(batch_size=8)
         assert batch.rewards.shape == (8, 1)
+
+
+class TestRelabelingReplayBufferWithMask:
+    def test_obs_masked_when_model_has_obs_mask(self):
+        """Non-causal dimensions are zeroed in both obs and next_obs when obs_mask is set."""
+        obs_dim, act_dim = 4, 1
+        # Mask that keeps only dims 0 and 2.
+        obs_mask = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+        model = MaskingRewardModel(constant=0.0, obs_mask=obs_mask)
+        buf = _make_buffer(obs_dim, act_dim, capacity=100, reward_model=model)
+
+        rng = np.random.default_rng(1)
+        for _ in range(50):
+            obs = rng.uniform(0.5, 1.0, (obs_dim,)).astype(np.float32)
+            next_obs = rng.uniform(0.5, 1.0, (obs_dim,)).astype(np.float32)
+            action = rng.uniform(-1, 1, (act_dim,)).astype(np.float32)
+            buf.add(
+                obs=obs,
+                next_obs=next_obs,
+                action=action,
+                reward=np.array([1.0]),
+                done=np.array([False]),
+                infos=[{}],
+            )
+
+        batch = buf.sample(batch_size=32)
+        obs_np = batch.observations.cpu().numpy()
+        next_obs_np = batch.next_observations.cpu().numpy()
+
+        # Masked dims (1 and 3) must be zero.
+        np.testing.assert_array_equal(obs_np[:, 1], np.zeros(32))
+        np.testing.assert_array_equal(obs_np[:, 3], np.zeros(32))
+        np.testing.assert_array_equal(next_obs_np[:, 1], np.zeros(32))
+        np.testing.assert_array_equal(next_obs_np[:, 3], np.zeros(32))
+
+        # Kept dims (0 and 2) must be non-zero (original values in [0.5, 1.0]).
+        assert obs_np[:, 0].any()
+        assert obs_np[:, 2].any()
+
+    def test_obs_unmasked_when_model_has_no_obs_mask(self):
+        """Default RewardModel (obs_mask=None) leaves observations untouched."""
+        obs_dim, act_dim = 3, 1
+        model = ConstantRewardModel(constant=0.5)
+        buf = _make_buffer(obs_dim, act_dim, capacity=100, reward_model=model)
+
+        rng = np.random.default_rng(2)
+        for _ in range(50):
+            obs = rng.uniform(0.5, 1.0, (obs_dim,)).astype(np.float32)
+            next_obs = rng.uniform(0.5, 1.0, (obs_dim,)).astype(np.float32)
+            action = rng.uniform(-1, 1, (act_dim,)).astype(np.float32)
+            buf.add(
+                obs=obs,
+                next_obs=next_obs,
+                action=action,
+                reward=np.array([1.0]),
+                done=np.array([False]),
+                infos=[{}],
+            )
+
+        batch = buf.sample(batch_size=16)
+        # All dims should be non-zero (stored values were in [0.5, 1.0]).
+        obs_np = batch.observations.cpu().numpy()
+        assert (obs_np != 0).any(axis=0).all()
