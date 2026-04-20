@@ -583,7 +583,7 @@ def train(
         raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
     logging.info("Training with %s model", model_type.upper())
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     regu_criterion = nn.MSELoss()
 
