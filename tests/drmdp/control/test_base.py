@@ -6,7 +6,6 @@ from typing import Mapping, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
-import torch
 
 from drmdp.control import base
 

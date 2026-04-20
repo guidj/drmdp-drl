@@ -6,21 +6,25 @@ estimation from delayed aggregate feedback.
 
 At each training iteration the loop performs two steps per batch:
 
-  E-step (no gradient): Compute per-step soft targets
-      t̃ₜ = μₜ + (Yᵥ - Σⱼ μⱼ) / D
-  where μₜ = f_θ(sₜ, aₜ) are current predictions, Yᵥ is the observed aggregate
-  reward, and D is the actual (unpadded) window length.
+  E-step (no gradient): Compute per-step soft targets with inverse-variance weights
+      t̃ₜ = μₜ + (Yᵥ - Σⱼ μⱼ) · wₜ,  wₜ = (1/σ̂ₜ²) / Σⱼ (1/σ̂ⱼ²)
+  where μₜ = f_θ(sₜ, aₜ) and σ̂ₜ² is a running per-position variance estimate.
+  Under equal variance this reduces to the uniform correction (Yᵥ - Σⱼ μⱼ) / D.
 
-  M-step (backward pass): Minimise per-step MSE against soft targets, masked to
-  exclude zero-padded positions:
+  M-step for σ² (no gradient): EMA update of per-position noise variance
+      σ̂ₜ² ← (1 − α) σ̂ₜ² + α · mean_batch((f_θ(sₜ, aₜ) − t̃ₜ)²)
+  Initialised to 1 (equal variance). α = noise_ema_alpha.
+
+  M-step for θ (backward pass): Minimise per-step MSE against soft targets, masked
+  to exclude zero-padded positions:
       L_reward = (1 / D) · Σₜ maskₜ · (f_θ(sₜ, aₜ) - t̃ₜ)²
 
 The return-consistency regularisation from est_o2 is preserved:
   L_regu = MSE(start_return + Σₜ maskₜ · f̂(sₜ, aₜ), end_return)
 
-Both est_o2 and est_o3 share the same fixed points (Σₜ f̂(sₜ,aₜ) = Yᵥ); EM
-additionally guarantees monotone marginal likelihood increase per iteration and
-provides per-step gradient signal rather than one aggregate residual per window.
+Both est_o2 and est_o3 share the same fixed points (Σₜ f̂(sₜ,aₜ) = Yᵥ); the
+per-position variance M-step lets the E-step correction reflect heteroscedastic
+noise rather than assuming every position has equal variance.
 """
 
 import argparse
@@ -66,6 +70,9 @@ class TrainingArgs:
         output_dir: Directory for model checkpoints and metrics.
         num_runs: Number of independent runs (one seed per run).
         regu_lam: Weight for the return-consistency regularization term (λ ∈ [0, 1]).
+        noise_ema_alpha: EMA decay for the per-position variance M-step (α ∈ (0, 1]).
+            Larger values track recent residuals more aggressively; smaller values
+            smooth more slowly. Set to 0 to disable variance updates (equal-variance).
         local_eager_mode: If True, run experiments in-process; otherwise submit via Ray.
         seed: Random seed for reproducibility. None uses a default.
     """
@@ -82,6 +89,7 @@ class TrainingArgs:
     output_dir: str
     num_runs: int
     regu_lam: float
+    noise_ema_alpha: float
     local_eager_mode: bool
     reward_model_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     seed: Optional[int] = None
@@ -545,13 +553,19 @@ def train(
     seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
+    max_seq_len: Optional[int] = None,
+    noise_ema_alpha: float = 0.1,
     on_batch_end: Optional[Callable[[Mapping[str, float]], None]] = None,
 ):
     """
     Train a reward prediction model using Expectation-Maximisation.
 
-    Each batch update performs an E-step (no_grad forward pass to compute per-step
-    soft targets) followed by an M-step (backward pass against those targets).
+    Each batch update performs three steps:
+      1. E-step (no_grad): compute per-step soft targets using inverse-variance weights
+         derived from the current per-position noise variance estimates.
+      2. M-step for σ² (no_grad): update per-position variance via EMA of squared
+         residuals from the E-step.
+      3. M-step for θ (backward): gradient update against the soft targets.
 
     Args:
         env: Gymnasium environment.
@@ -564,6 +578,11 @@ def train(
         seed: Random seed for weight initialisation and data splitting.
         model_type: Model architecture to use ("mlp").
         output_dir: Directory for model checkpoints, metrics, and predictions.
+        max_seq_len: Maximum possible sequence length across the full dataset, used
+            to pre-allocate the per-position variance buffer. If None, derived from
+            the dataset by scanning all examples.
+        noise_ema_alpha: EMA decay for the per-position variance M-step. Set to 0
+            to skip variance updates (equal-variance fallback).
         on_batch_end: Optional callback invoked after every batch update with a dict
             containing {"reward": float, "regu": float, "total": float} loss values.
             Useful for testing and monitoring training dynamics.
@@ -576,6 +595,12 @@ def train(
     logging.info("Training with seed: %s", seed)
     torch.manual_seed(seed if seed is not None else 127)
     train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
+
+    # Per-position noise variance buffer for the variance M-step.
+    # Initialised to 1 (equal variance) so the E-step starts with uniform weights.
+    if max_seq_len is None:
+        max_seq_len = max(inp["state"].shape[0] for inp, _ in dataset)
+    sigma_sq = torch.ones(max_seq_len)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
@@ -607,19 +632,19 @@ def train(
             for inputs, labels in train_dataloader:
                 seq_lengths = labels["seq_lengths"]  # (batch,)
                 aggregate_rewards = labels["aggregate_reward"].float()  # (batch,)
-                max_seq_len = inputs["state"].shape[1]
+                batch_seq_len = inputs["state"].shape[1]
 
                 # Mask: True for actual steps, False for padding
                 mask = create_sequence_mask(
-                    seq_lengths, max_seq_len
+                    seq_lengths, batch_seq_len
                 )  # (batch, seq_len)
 
                 # E-step: compute per-step soft targets without gradient
                 soft_targets = compute_soft_targets(
-                    model, inputs, seq_lengths, aggregate_rewards, mask
+                    model, inputs, seq_lengths, aggregate_rewards, mask, sigma_sq
                 )  # (batch, seq_len)
 
-                # M-step: regress model against soft targets
+                # M-step for θ: regress model against soft targets
                 outputs = model(**inputs)  # (batch, seq_len, 1)
                 per_step_preds = outputs.squeeze(-1)  # (batch, seq_len)
 
@@ -638,6 +663,12 @@ def train(
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+                # M-step for σ²: see _update_sigma_sq
+                if noise_ema_alpha > 0:
+                    _update_sigma_sq(
+                        sigma_sq, per_step_preds, soft_targets, mask, noise_ema_alpha
+                    )
 
                 epoch_losses["reward"].append(reward_loss.item())
                 epoch_losses["regu"].append(regu_loss.item())
@@ -804,16 +835,19 @@ def compute_soft_targets(
     seq_lengths: torch.Tensor,
     aggregate_rewards: torch.Tensor,
     mask: torch.Tensor,
+    sigma_sq: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """E-step: compute per-step soft targets by distributing the window residual.
 
-    For each window w of length D with observed aggregate Yᵥ and current predictions
+    For each window of length D with observed aggregate Yᵥ and current predictions
     μₜ = f_θ(sₜ, aₜ), the soft target is:
 
-        t̃ₜ = μₜ + (Yᵥ - Σⱼ μⱼ) / D
+        t̃ₜ = μₜ + (Yᵥ - Σⱼ μⱼ) · wₜ
 
-    The correction (Yᵥ - Σⱼ μⱼ) / D is identical for every step in the window,
-    following from the equal-variance Gaussian assumption.
+    where wₜ = (1/σ̂ₜ²) / Σⱼ (1/σ̂ⱼ²) are inverse-variance weights derived from
+    the per-position noise variance estimates σ̂ₜ². Steps with lower variance
+    receive a larger share of the residual correction. Under equal variance all
+    weights equal 1/D, recovering the uniform formula from est_o2.
 
     Args:
         model: Current reward model.
@@ -822,6 +856,9 @@ def compute_soft_targets(
         seq_lengths: LongTensor of shape (batch,) with actual window lengths.
         aggregate_rewards: FloatTensor of shape (batch,) with observed aggregates.
         mask: BoolTensor of shape (batch, max_seq_len) masking actual positions.
+        sigma_sq: Optional FloatTensor of shape (global_max_seq_len,) with running
+            per-position noise variance estimates. If None, falls back to the
+            equal-variance uniform distribution.
 
     Returns:
         FloatTensor of shape (batch, max_seq_len). Values at padded positions
@@ -830,12 +867,60 @@ def compute_soft_targets(
     with torch.no_grad():
         outputs_old = model(**inputs)  # (batch, seq_len, 1)
         mu = outputs_old.squeeze(-1)  # (batch, seq_len)
-        # Sum only over actual (non-padded) steps
         window_mu = (mu * mask.float()).sum(dim=1)  # (batch,)
         residual = aggregate_rewards - window_mu  # (batch,)
-        # Distribute residual uniformly across actual steps
-        delta = (residual / seq_lengths.float()).unsqueeze(1)  # (batch, 1)
-        return mu + delta.expand_as(mu)  # (batch, seq_len)
+
+        if sigma_sq is None:
+            # Equal-variance fallback: uniform residual distribution
+            delta = (residual / seq_lengths.float()).unsqueeze(1)  # (batch, 1)
+            return mu + delta.expand_as(mu)
+
+        # Heteroscedastic: inverse-variance weighted distribution
+        batch_seq_len = mu.shape[1]
+        # Slice to batch seq length and expand to (batch, batch_seq_len)
+        inv_var = (1.0 / (sigma_sq[:batch_seq_len] + 1e-8)).unsqueeze(0)
+        inv_var = inv_var * mask.float()  # zero out padded positions
+        total_inv_var = inv_var.sum(dim=1, keepdim=True)  # (batch, 1)
+        weights = inv_var / (total_inv_var + 1e-8)  # (batch, batch_seq_len)
+        return mu + residual.unsqueeze(1) * weights
+
+
+def _update_sigma_sq(
+    sigma_sq: torch.Tensor,
+    per_step_preds: torch.Tensor,
+    soft_targets: torch.Tensor,
+    mask: torch.Tensor,
+    noise_ema_alpha: float,
+) -> None:
+    """M-step for σ²: EMA update of per-position noise variance.
+
+    Updates sigma_sq in-place using squared residuals between the pre-update
+    predictions and the E-step soft targets. Using pre-update predictions keeps
+    the variance estimate consistent with the soft targets from the same forward pass.
+
+    Args:
+        sigma_sq: FloatTensor of shape (global_max_seq_len,). Updated in-place.
+        per_step_preds: FloatTensor of shape (batch, batch_seq_len) — pre-update
+            per-step reward predictions (detached from the computation graph).
+        soft_targets: FloatTensor of shape (batch, batch_seq_len) from the E-step.
+        mask: BoolTensor of shape (batch, batch_seq_len) masking actual positions.
+        noise_ema_alpha: EMA decay coefficient α ∈ (0, 1].
+    """
+    with torch.no_grad():
+        sq_residuals = (per_step_preds.detach() - soft_targets) ** 2
+        mask_float = mask.float()
+        num_valid = mask_float.sum(dim=0)  # (batch_seq_len,)
+        pos_mean_sq = (sq_residuals * mask_float).sum(dim=0) / (num_valid + 1e-8)
+        # Only update positions that appeared in this batch
+        update_wt = torch.where(
+            num_valid > 0,
+            torch.tensor(noise_ema_alpha),
+            torch.tensor(0.0),
+        )
+        batch_seq_len = per_step_preds.shape[1]
+        sigma_sq[:batch_seq_len] = (1.0 - update_wt) * sigma_sq[
+            :batch_seq_len
+        ] + update_wt * pos_mean_sq
 
 
 def experiment(args: TrainingArgs):
@@ -881,6 +966,8 @@ def experiment(args: TrainingArgs):
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
             seed=args.seed,
+            max_seq_len=max_delay,
+            noise_ema_alpha=args.noise_ema_alpha,
         )
 
 
@@ -1009,6 +1096,12 @@ def parse_args() -> TrainingArgs:
         help="Weight of regularisation. lam in [0, 1]",
     )
     parser.add_argument("--local-eager-mode", action="store_true", default=False)
+    parser.add_argument(
+        "--noise-ema-alpha",
+        type=float,
+        default=0.1,
+        help="EMA decay for per-position variance M-step (0 < α ≤ 1). Set to 0 to disable.",
+    )
     parser.add_argument(
         "--reward-model-kwargs",
         nargs="*",
