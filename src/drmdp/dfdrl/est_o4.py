@@ -609,7 +609,7 @@ def _log_final_mask(model: nn.Module) -> None:
         active_dims,
         total_dims,
         active_dims / total_dims,
-        final_mask
+        final_mask,
     )
 
 
