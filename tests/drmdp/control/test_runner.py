@@ -209,6 +209,21 @@ class TestRun:
         )
         runner.run(args)
 
+    def test_hc_run_completes_without_error(self, output_dir):
+        """run() with agent_type='hc' exits without raising."""
+        args = dataclasses.replace(
+            self._base_args(output_dir), agent_type="hc", num_steps=200
+        )
+        runner.run(args)
+
+    def test_hc_model_saved(self, output_dir):
+        """After an HC run, hc_model.zip exists in output_dir."""
+        args = dataclasses.replace(
+            self._base_args(output_dir), agent_type="hc", num_steps=200
+        )
+        runner.run(args)
+        assert os.path.isfile(os.path.join(output_dir, "hc_model.zip"))
+
 
 # ---------------------------------------------------------------------------
 # TestHCLoggingCallback

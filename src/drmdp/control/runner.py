@@ -17,7 +17,7 @@ Usage (SAC + IRCR):
 Usage (HC):
     python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
         --delay 3 --num-steps 50000 --agent-type hc \\
-        --agent-kwarg max_delay=3 --output-dir /tmp/control-hc
+        --output-dir /tmp/control-hc
 """
 
 import argparse
@@ -43,7 +43,7 @@ class TrainingArgs:
 
     Attributes:
         env: Gymnasium environment name.
-        delay: Fixed reward delay (number of steps).
+        delay: Reward delay (number of steps).
         max_episode_steps: Maximum steps per episode before truncation.
             None uses the environment's default.
         reward_model_type: Reward model identifier. Supports "ircr", "dgra", and "grd".
@@ -65,8 +65,9 @@ class TrainingArgs:
         agent_type: Agent algorithm. "sac" uses standard SAC with a reward
             model; "hc" uses HC-decomposition SAC without a reward model.
         agent_kwargs: Keyword arguments forwarded to the agent constructor.
-            Used when ``agent_type="hc"`` (e.g. ``max_delay``,
-            ``history_hidden_size``).
+            Used when ``agent_type="hc"`` (e.g. ``history_hidden_size``,
+            ``reg_lambda``). ``max_delay`` is derived from the delay
+            distribution and cannot be overridden here.
     """
 
     env: str
@@ -257,14 +258,15 @@ def run(args: TrainingArgs) -> None:
     logging.basicConfig(level=logging.INFO)
     logging.info("Training args: %s", args)
 
+    delay = rewdelay.ClippedPoissonDelay(args.delay)
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
     env = core.EnvMonitorWrapper(env)
-    env = rewdelay.DelayedRewardWrapper(env, rewdelay.FixedDelay(args.delay))
+    env = rewdelay.DelayedRewardWrapper(env, delay)
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
 
     with logger.ExperimentLogger(args.output_dir, params=args) as exp_logger:
         if args.agent_type == "hc":
-            _run_hc(args, env, exp_logger)
+            _run_hc(args, env, exp_logger, delay=delay)
         else:
             _run_sac(args, env, exp_logger)
 
@@ -309,21 +311,28 @@ def _run_hc(
     args: TrainingArgs,
     env: Any,
     exp_logger: logger.ExperimentLogger,
+    delay: rewdelay.RewardDelay,
 ) -> None:
     """Train HC-decomposition SAC."""
     # IntervalPositionWrapper depends on info["interval_end"] from ImputeMissingRewardWrapper,
     # so it must be applied after that wrapper.
-    max_delay = int(args.agent_kwargs.get("max_delay", args.delay))
+    _, max_delay = delay.range()
     env = hc.IntervalPositionWrapper(env, max_delay=max_delay)
+    # Runner owns max_delay; strip from agent_kwargs so both IntervalPositionWrapper
+    # and HCSAC (and its replay buffer) use the same value from the delay distribution.
+    remaining_kwargs = {
+        key: val for key, val in args.agent_kwargs.items() if key != "max_delay"
+    }
     agent = hc.HCSAC(
         env,
+        max_delay=max_delay,
         learning_rate=args.sac_learning_rate,
         buffer_size=args.sac_buffer_size,
         batch_size=args.sac_batch_size,
         gradient_steps=args.sac_gradient_steps,
         seed=args.seed,
         verbose=1,
-        **args.agent_kwargs,
+        **remaining_kwargs,
     )
     callback = _HCLoggingCallback(
         log_episode_frequency=args.log_episode_frequency,
@@ -389,7 +398,7 @@ def parse_args() -> TrainingArgs:
         "--delay",
         type=int,
         default=3,
-        help="Fixed reward delay (number of steps)",
+        help="Reward delay (number of steps)",
     )
     parser.add_argument(
         "--max-episode-steps",
@@ -489,7 +498,7 @@ def parse_args() -> TrainingArgs:
         metavar="KEY=VALUE",
         help="Agent-specific keyword argument (repeatable). "
         "Values are parsed via ast.literal_eval; unrecognised literals "
-        "are kept as strings. E.g. --agent-kwarg max_delay=3",
+        "are kept as strings. E.g. --agent-kwarg key=value",
     )
 
     args, _ = parser.parse_known_args()
