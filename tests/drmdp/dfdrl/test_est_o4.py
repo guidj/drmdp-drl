@@ -125,14 +125,16 @@ class TestInputMask:
         with pytest.raises(ValueError, match="Unknown mask_type"):
             mask()
 
-    def test_default_init_sigmoid_is_active(self):
-        """Default init has active logit = 1.0, inactive = 0.0, so sigmoid mask
-        values should equal softmax([0, 1])[1] ≈ 0.731 and binary_mask = 1 for all."""
+    def test_sigmoid_returns_softmax_active_logit(self):
+        """Sigmoid mask value equals softmax([inactive, active])[1] for each dim."""
         mask = est_o4.InputMask(input_dim=4, mask_type="sigmoid")
+        with torch.no_grad():
+            mask.logits[:, 0] = 0.0
+            mask.logits[:, 1] = 1.0
         values = mask()
-        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]))[1].item()
+        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]), dim=0)[1].item()
         np.testing.assert_allclose(values.detach().numpy(), expected, atol=1e-6)
-        assert mask.binary_mask().sum().item() == 4  # all dims active
+        assert mask.binary_mask().sum().item() == 4  # active > inactive → all ones
 
     def test_positive_logits_increase_active_fraction(self):
         """Pushing the active logit column positive should increase the active fraction."""
@@ -237,12 +239,15 @@ class TestSparsityLoss:
             sparsity = p_active.mean()
             assert 0 < sparsity.item() < 1
 
-    def test_default_init_sparsity_matches_active_prior(self):
-        """Default init (active=1.0, inactive=0.0) gives p_active = softmax([0,1])[1]."""
+    def test_sparsity_loss_equals_mean_softmax_active_logit(self):
+        """p_active = mean(softmax(logits, dim=-1)[:, 1]) when logits are [0.0, 1.0]."""
         model = est_o4.RNetwork(state_dim=4, action_dim=2, hidden_dim=16)
+        with torch.no_grad():
+            model.input_mask.logits[:, 0] = 0.0
+            model.input_mask.logits[:, 1] = 1.0
         p_active = torch.nn.functional.softmax(model.input_mask.logits, dim=-1)[:, 1]
         sparsity = p_active.mean().item()
-        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]))[1].item()
+        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]), dim=0)[1].item()
         np.testing.assert_allclose(sparsity, expected, atol=1e-6)
 
     def test_low_active_logit_decreases_sparsity_loss(self):
