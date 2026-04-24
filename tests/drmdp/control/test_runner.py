@@ -204,6 +204,17 @@ class TestRun:
         runner.run(args)
         assert os.path.isfile(os.path.join(output_dir, "hc_model.zip"))
 
+    def test_run_delayed_baseline(self, output_dir):
+        """run() with reward_model_type='none' completes and produces output files."""
+        args = dataclasses.replace(
+            self._base_args(output_dir),
+            reward_model_type="none",
+            reward_model_kwargs={},
+        )
+        runner.run(args)
+        assert os.path.isfile(os.path.join(output_dir, "experiment-logs.jsonl"))
+        assert os.path.isfile(os.path.join(output_dir, "sac_model.zip"))
+
     def _base_args(self, output_dir: str) -> runner.TrainingArgs:
         return runner.TrainingArgs(
             env="Pendulum-v1",
@@ -225,31 +236,31 @@ class TestRun:
 
 
 # ---------------------------------------------------------------------------
-# TestHCLoggingCallback
+# TestRewardObsLoggingCallback
 # ---------------------------------------------------------------------------
 
 
-class TestHCLoggingCallback:
+class TestRewardObsLoggingCallback:
     def test_on_step_returns_true(self):
-        callback = self._build_hc_callback()
-        result = self._step_hc(callback, done=False, timestep=1)
+        callback = self._build_ro_callback()
+        result = self._step_ro(callback, done=False, timestep=1)
         assert result is True
 
     def test_episode_count_increments_on_done(self):
-        callback = self._build_hc_callback()
-        self._step_hc(callback, done=True, timestep=1)
+        callback = self._build_ro_callback()
+        self._step_ro(callback, done=True, timestep=1)
         assert callback._episode_count == 1
 
     def test_episode_steps_reset_after_done(self):
-        callback = self._build_hc_callback()
-        self._step_hc(callback, done=False, timestep=1)
-        self._step_hc(callback, done=True, timestep=2)
+        callback = self._build_ro_callback()
+        self._step_ro(callback, done=False, timestep=1)
+        self._step_ro(callback, done=True, timestep=2)
         assert callback._episode_steps == 0
 
     def test_episode_rewards_reset_after_done(self):
-        callback = self._build_hc_callback()
-        self._step_hc(callback, done=False, timestep=1, reward=2.0)
-        self._step_hc(callback, done=True, timestep=2, reward=3.0)
+        callback = self._build_ro_callback()
+        self._step_ro(callback, done=False, timestep=1, reward=2.0)
+        self._step_ro(callback, done=True, timestep=2, reward=3.0)
         assert callback._episode_rewards == []
 
     def test_logger_called_at_log_frequency(self):
@@ -259,10 +270,12 @@ class TestHCLoggingCallback:
         only step 4 crosses the threshold.
         """
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(log_step_frequency=4, exp_logger=log_mock)
+        callback = runner._RewardObsLoggingCallback(
+            log_step_frequency=4, exp_logger=log_mock
+        )
         for timestep in range(1, 5):
             done = timestep % 2 == 0
-            self._step_hc(
+            self._step_ro(
                 callback,
                 done=done,
                 timestep=timestep,
@@ -274,7 +287,9 @@ class TestHCLoggingCallback:
     def test_delayed_returns_logged_as_sum_of_rewards(self):
         """delayed_returns in logged info equals sum of per-step rewards for the episode."""
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(log_step_frequency=3, exp_logger=log_mock)
+        callback = runner._RewardObsLoggingCallback(
+            log_step_frequency=3, exp_logger=log_mock
+        )
         rewards = [1.5, 2.5, 0.5]
         for idx, reward in enumerate(rewards):
             done = idx == len(rewards) - 1
@@ -294,7 +309,9 @@ class TestHCLoggingCallback:
     def test_delayed_returns_reset_between_episodes(self):
         """Each episode's delayed_returns reflects only that episode's rewards."""
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(log_step_frequency=2, exp_logger=log_mock)
+        callback = runner._RewardObsLoggingCallback(
+            log_step_frequency=2, exp_logger=log_mock
+        )
         for idx, reward in enumerate([1.0, 2.0]):
             callback.num_timesteps = idx + 1
             callback.locals = {
@@ -316,16 +333,16 @@ class TestHCLoggingCallback:
         assert log_mock.log_calls[0]["info"]["delayed_returns"] == 3.0
         assert log_mock.log_calls[1]["info"]["delayed_returns"] == 10.0
 
-    def _build_hc_callback(self, log_freq: int = 1) -> runner._HCLoggingCallback:
+    def _build_ro_callback(self, log_freq: int = 1) -> runner._RewardObsLoggingCallback:
         exp_logger = _MockLogger()
-        return runner._HCLoggingCallback(
+        return runner._RewardObsLoggingCallback(
             log_step_frequency=log_freq,
             exp_logger=exp_logger,  # type: ignore[arg-type]
         )
 
-    def _step_hc(
+    def _step_ro(
         self,
-        callback: runner._HCLoggingCallback,
+        callback: runner._RewardObsLoggingCallback,
         done: bool,
         timestep: int,
         return_val: float = 1.0,
@@ -367,6 +384,26 @@ class TestMakeRewardModel:
         )
         model = runner._make_reward_model(args, pendulum_env)
         assert isinstance(model, ircr.IRCRRewardModel)
+
+    def test_none_type_returns_none(self, tmp_path, pendulum_env):
+        args = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            env_kwargs={"max_episode_steps": 50},
+            reward_model_type="none",
+            reward_model_kwargs={},
+            update_every_n_steps=100,
+            clear_buffer_on_update=False,
+            num_steps=100,
+            sac_learning_rate=3e-4,
+            sac_buffer_size=100,
+            sac_batch_size=32,
+            sac_gradient_steps=1,
+            log_step_frequency=50,
+            output_dir=str(tmp_path),
+            seed=None,
+        )
+        assert runner._make_reward_model(args, pendulum_env) is None
 
     def test_unknown_type_raises_value_error(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
@@ -495,6 +532,14 @@ class TestParseArgs:
         ):
             args = runner.parse_args()
         assert args.clear_buffer_on_update is True
+
+    def test_none_reward_model_type_accepted(self, tmp_path):
+        with patch(
+            "sys.argv",
+            ["prog", "--reward-model-type", "none", "--output-dir", str(tmp_path)],
+        ):
+            args = runner.parse_args()
+        assert args.reward_model_type == "none"
 
 
 class TestLoadConfigs:

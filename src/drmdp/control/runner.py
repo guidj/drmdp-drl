@@ -3,8 +3,10 @@ Off-policy SAC control with interleaved reward model learning or HC decompositio
 
 Two agent types are supported:
 
-* ``sac`` (default): standard SAC with a pluggable reward model
+* ``sac`` (default): standard SAC with an optional pluggable reward model
   (e.g. IRCRRewardModel) that relabels replay buffer rewards at sample time.
+  Pass ``--reward-model-type none`` to train SAC directly on delayed rewards
+  without any reward model (delayed-rewards baseline).
 * ``hc``: HC-decomposition SAC (Han et al., ICML 2022) that learns a
   decomposed Q-function Q^H(h_t) + Q^C(s_t, a_t) directly from the delayed
   environment rewards.  No separate reward model is used.
@@ -13,6 +15,11 @@ Usage (SAC + IRCR):
     python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
         --delay 3 --num-steps 50000 --reward-model-type ircr \\
         --update-every-n-steps 1000 --output-dir /tmp/control-ircr
+
+Usage (SAC delayed-rewards baseline, no reward model):
+    python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
+        --delay 3 --num-steps 50000 --reward-model-type none \\
+        --output-dir /tmp/control-delayed
 
 Usage (HC):
     python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
@@ -49,7 +56,8 @@ class TrainingArgs:
         delay: Reward delay (number of steps).
         env_kwargs: Keyword arguments forwarded to ``gym.make()`` (e.g.
             ``{"max_episode_steps": 2500}``).
-        reward_model_type: Reward model identifier. Supports "ircr", "dgra", and "grd".
+        reward_model_type: Reward model identifier. Supports "ircr", "dgra", "grd",
+            and "none" (train directly on delayed rewards; no model instantiated).
             Only used when ``agent_type="sac"``.
         update_every_n_steps: Call reward_model.update() every N env steps.
             Only used when ``agent_type="sac"``.
@@ -209,8 +217,8 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             self.model.replay_buffer.reset()
 
 
-class _HCLoggingCallback(callbacks.BaseCallback):
-    """Lightweight episode logger for the HC agent.
+class _RewardObsLoggingCallback(callbacks.BaseCallback):
+    """Lightweight episode logger for the Vanilla SAC and HC agents.
 
     Logs per-episode returns and step counts to ExperimentLogger at a
     configurable frequency.  Unlike RewardModelUpdateCallback, this callback
@@ -251,7 +259,7 @@ class _HCLoggingCallback(callbacks.BaseCallback):
                 global_steps=self.num_timesteps,
                 returns=true_episode_return,
                 info={
-                    "hc_total_steps": self.num_timesteps,
+                    "total_steps": self.num_timesteps,
                     "delayed_returns": delayed_returns,
                 },
             )
@@ -288,7 +296,7 @@ def _run_sac(
     env: Any,
     exp_logger: logger.ExperimentLogger,
 ) -> None:
-    """Train standard SAC with a pluggable reward model."""
+    """Train standard SAC with a reward model or directly on delayed rewards."""
     reward_model = _make_reward_model(args, env)
     sac = stable_baselines3.SAC(
         "MlpPolicy",
@@ -302,12 +310,19 @@ def _run_sac(
         seed=args.seed,
         verbose=1,
     )
-    callback = RewardModelUpdateCallback(
-        reward_model=reward_model,
-        update_every_n_steps=args.update_every_n_steps,
-        clear_buffer_on_update=args.clear_buffer_on_update,
-        log_step_frequency=args.log_step_frequency,
-        exp_logger=exp_logger,
+    callback = (
+        RewardModelUpdateCallback(
+            reward_model=reward_model,
+            update_every_n_steps=args.update_every_n_steps,
+            clear_buffer_on_update=args.clear_buffer_on_update,
+            log_step_frequency=args.log_step_frequency,
+            exp_logger=exp_logger,
+        )
+        if reward_model
+        else _RewardObsLoggingCallback(
+            log_step_frequency=args.log_step_frequency,
+            exp_logger=exp_logger,
+        )
     )
     sac.learn(
         total_timesteps=args.num_steps,
@@ -346,7 +361,7 @@ def _run_hc(
         verbose=1,
         **remaining_kwargs,
     )
-    callback = _HCLoggingCallback(
+    callback = _RewardObsLoggingCallback(
         log_step_frequency=args.log_step_frequency,
         exp_logger=exp_logger,
     )
@@ -360,7 +375,7 @@ def _run_hc(
     logging.info("Model saved to %s/hc_model", args.output_dir)
 
 
-def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
+def _make_reward_model(args: TrainingArgs, env: Any) -> Optional[base.RewardModel]:
     """Instantiate the reward model specified in args.
 
     Args:
@@ -386,6 +401,8 @@ def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
             action_dim=action_dim,
             **args.reward_model_kwargs,
         )
+    if args.reward_model_type == "none":
+        return None
     raise ValueError(f"Unknown reward_model_type: {args.reward_model_type!r}")
 
 
@@ -612,8 +629,8 @@ def parse_args() -> TrainingArgs:
         "--reward-model-type",
         type=str,
         default="dgra",
-        choices=["ircr", "dgra", "grd"],
-        help="Reward model to use",
+        choices=["ircr", "dgra", "grd", "none"],
+        help="Reward model to use ('none' trains directly on delayed rewards)",
     )
     parser.add_argument(
         "--update-every-n-steps",
