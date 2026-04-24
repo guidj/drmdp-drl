@@ -47,8 +47,8 @@ class TrainingArgs:
     Attributes:
         env: Gymnasium environment name.
         delay: Reward delay (number of steps).
-        max_episode_steps: Maximum steps per episode before truncation.
-            None uses the environment's default.
+        env_kwargs: Keyword arguments forwarded to ``gym.make()`` (e.g.
+            ``{"max_episode_steps": 2500}``).
         reward_model_type: Reward model identifier. Supports "ircr", "dgra", and "grd".
             Only used when ``agent_type="sac"``.
         update_every_n_steps: Call reward_model.update() every N env steps.
@@ -75,7 +75,6 @@ class TrainingArgs:
 
     env: str
     delay: int
-    max_episode_steps: Optional[int]
     reward_model_type: str
     update_every_n_steps: int
     clear_buffer_on_update: bool
@@ -90,6 +89,7 @@ class TrainingArgs:
     seed: Optional[int] = None
     agent_type: str = "sac"
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    env_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
 
 class RewardModelUpdateCallback(callbacks.BaseCallback):
@@ -117,7 +117,6 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._log_episode_frequency = log_episode_frequency
         self._exp_logger = exp_logger
 
-        # Per-episode accumulators; reset at each episode boundary.
         self._episode_obs: List[np.ndarray] = []
         self._episode_actions: List[np.ndarray] = []
         self._episode_rewards: List[float] = []
@@ -125,13 +124,11 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._episode_steps: int = 0
         self._episode_count: int = 0
 
-        # Completed trajectories not yet passed to the reward model.
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
         self._reward_model_total_steps: int = 0
 
     def _on_step(self) -> bool:
-        # model._last_obs has shape (n_envs, obs_dim); index 0 for single env.
         obs_before = self.model._last_obs[0]
         action = self.locals["actions"][0]
         reward = float(self.locals["rewards"][0])
@@ -155,7 +152,6 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         return True
 
     def _on_training_end(self) -> None:
-        # Incorporate trajectories collected after the last interval update.
         if len(self._pending_trajectories) > 0:
             self._flush_pending_trajectories()
 
@@ -269,7 +265,7 @@ def run(args: TrainingArgs) -> None:
     logging.info("Training args: %s", args)
 
     delay = rewdelay.ClippedPoissonDelay(args.delay)
-    env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
+    env = gym.make(args.env, **args.env_kwargs)
     env = core.EnvMonitorWrapper(env)
     env = rewdelay.DelayedRewardWrapper(env, delay)
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
@@ -427,10 +423,11 @@ def _run_remote(args: TrainingArgs) -> None:
 def _load_configs(config_path: str) -> List[TrainingArgs]:
     """Load and expand experiment configs from a JSON file.
 
-    Top-level fields (except "experiments", "output_dir", and "num_runs") act as
-    shared defaults. Each experiment is expanded into num_runs TrainingArgs instances
-    with seeds generated via core.Seeder. Output dirs are derived from the top-level
-    output_dir when not specified per-experiment.
+    The config must have a top-level "environments" list. Top-level fields
+    (except "environments", "output_dir", "num_runs") are global defaults.
+    Environment-level fields override globals; experiment-level fields override
+    environment-level. Seeds are generated via core.Seeder using a global counter
+    that is unique across all (environment, experiment) pairs.
     """
     with open(config_path, encoding="utf-8") as config_file:
         raw = json.load(config_file)
@@ -440,12 +437,61 @@ def _load_configs(config_path: str) -> List[TrainingArgs]:
     shared_fields = {
         key: value
         for key, value in raw.items()
-        if key not in ("experiments", "output_dir", "num_runs")
+        if key not in ("environments", "output_dir", "num_runs")
     }
-    defaults = {**_default_training_args(), **shared_fields}
+    global_defaults = {**_default_training_args(), **shared_fields}
 
+    return _expand_environments(
+        raw["environments"], global_defaults, top_level_num_runs, top_level_output_dir
+    )
+
+
+def _expand_environments(
+    environments: Sequence[Mapping[str, Any]],
+    global_defaults: Mapping[str, Any],
+    top_level_num_runs: int,
+    top_level_output_dir: Optional[str],
+) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
-    for exp_idx, entry in enumerate(raw["experiments"]):
+    global_exp_offset: int = 0
+    for env_entry in environments:
+        env_label: str = env_entry.get("name", env_entry.get("env", ""))
+        env_num_runs: int = env_entry.get("num_runs", top_level_num_runs)
+        env_output_dir: Optional[str] = (
+            env_entry.get("output_dir") or top_level_output_dir
+        )
+        env_fields = {
+            key: value
+            for key, value in env_entry.items()
+            if key not in ("name", "experiments", "output_dir", "num_runs")
+        }
+        env_defaults = {**global_defaults, **env_fields}
+        experiments = env_entry.get("experiments", [])
+
+        configs.extend(
+            _expand_experiments(
+                experiments,
+                env_defaults,
+                env_num_runs,
+                env_output_dir,
+                env_label=env_label,
+                global_exp_offset=global_exp_offset,
+            )
+        )
+        global_exp_offset += len(experiments)
+    return configs
+
+
+def _expand_experiments(
+    experiments: Sequence[Mapping[str, Any]],
+    defaults: Mapping[str, Any],
+    top_level_num_runs: int,
+    top_level_output_dir: Optional[str],
+    env_label: Optional[str] = None,
+    global_exp_offset: int = 0,
+) -> List[TrainingArgs]:
+    configs: List[TrainingArgs] = []
+    for exp_idx, entry in enumerate(experiments):
         num_runs: int = entry.get("num_runs", top_level_num_runs)
         base_seed: Optional[int] = entry.get("seed")
         experiment_fields = {
@@ -454,12 +500,13 @@ def _load_configs(config_path: str) -> List[TrainingArgs]:
             if key not in ("num_runs", "output_dir", "seed")
         }
         merged_base = {**defaults, **experiment_fields}
+        global_idx = global_exp_offset + exp_idx
 
         for run_idx in range(num_runs):
             merged = {**merged_base}
-            merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx, run_idx)
+            merged["seed"] = _resolve_seed(num_runs, base_seed, global_idx, run_idx)
             merged["output_dir"] = _resolve_output_dir(
-                entry, exp_idx, run_idx, top_level_output_dir
+                entry, exp_idx, run_idx, top_level_output_dir, env_label
             )
             configs.append(TrainingArgs(**merged))
     return configs
@@ -482,18 +529,23 @@ def _resolve_output_dir(
     exp_idx: int,
     run_idx: int,
     top_level_output_dir: Optional[str],
+    env_label: Optional[str] = None,
 ) -> str:
     if "output_dir" in entry:
         return str(entry["output_dir"])
     base = top_level_output_dir or os.path.join(tempfile.gettempdir(), "drmdp-batch")
-    return os.path.join(base, f"exp-{exp_idx:03d}", f"run-{run_idx:03d}")
+    parts: List[str] = []
+    if env_label:
+        parts.append(env_label)
+    parts.extend([f"exp-{exp_idx:03d}", f"run-{run_idx:03d}"])
+    return os.path.join(base, *parts)
 
 
-def _default_training_args() -> Dict[str, Any]:
+def _default_training_args() -> Mapping[str, Any]:
     return {
         "env": "MountainCarContinuous-v0",
         "delay": 3,
-        "max_episode_steps": 2500,
+        "env_kwargs": {"max_episode_steps": 2500},
         "reward_model_type": "ircr",
         "update_every_n_steps": 1000,
         "clear_buffer_on_update": False,
@@ -651,6 +703,7 @@ def parse_args() -> TrainingArgs:
         args_dict["reward_model_kwargs"]
     )
     args_dict["agent_kwargs"] = parse_reward_model_kwargs(args_dict["agent_kwargs"])
+    args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
     return TrainingArgs(**args_dict)
 
 
