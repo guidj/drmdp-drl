@@ -553,7 +553,7 @@ def parse_args() -> TrainingArgs:
     parser.add_argument(
         "--reward-model-type",
         type=str,
-        default="ircr",
+        default="dgra",
         choices=["ircr", "dgra", "grd"],
         help="Reward model to use",
     )

@@ -126,7 +126,7 @@ class DGRARewardModel(base.RewardModel):
         action_dim: int,
         hidden_dim: int = 256,
         num_hidden_layers: int = 4,
-        learning_rate: float = 5e-4,
+        learning_rate: float = 1e-3,
         train_epochs: int = 10,
         batch_size: int = 64,
         regu_lam: float = 1.0,
