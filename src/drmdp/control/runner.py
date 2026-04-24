@@ -319,6 +319,7 @@ def _run_sac(
         replay_buffer_class=base.RelabelingReplayBuffer,
         replay_buffer_kwargs={"reward_model": reward_model},
         seed=args.seed,
+        ent_coef="auto_0.1",
         verbose=1,
     )
     callback = (
@@ -369,6 +370,7 @@ def _run_hc(
         batch_size=args.sac_batch_size,
         gradient_steps=args.sac_gradient_steps,
         seed=args.seed,
+        ent_coef="auto_0.1",
         verbose=1,
         **remaining_kwargs,
     )
