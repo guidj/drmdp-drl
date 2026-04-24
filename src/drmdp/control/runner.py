@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import gymnasium as gym
@@ -136,6 +137,10 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
         self._reward_model_total_steps: int = 0
+        self._start_time: float = 0.0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
 
     def _on_step(self) -> bool:
         obs_before = self.model._last_obs[0]
@@ -196,6 +201,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
                     "delayed_returns": trajectory.episode_return,
                     "estimated_return": float(est_rewards.sum()),
                     "reward_model": dict(self._last_model_metrics),
+                    "elapsed_seconds": time.time() - self._start_time,
                 },
             )
             self._last_log_steps = self.num_timesteps
@@ -238,6 +244,10 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
         self._episode_count: int = 0
         self._episode_rewards: List[float] = []
         self._last_log_steps: int = 0
+        self._start_time: float = 0.0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
 
     def _on_step(self) -> bool:
         self._episode_steps += 1
@@ -261,6 +271,7 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
                 info={
                     "total_steps": self.num_timesteps,
                     "delayed_returns": delayed_returns,
+                    "elapsed_seconds": time.time() - self._start_time,
                 },
             )
             self._last_log_steps = self.num_timesteps

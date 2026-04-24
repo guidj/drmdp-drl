@@ -6,8 +6,8 @@ import dataclasses
 import json
 import os
 import tempfile
+import unittest.mock
 from typing import Any, Dict, List, Mapping, Optional, Sequence
-from unittest.mock import MagicMock, patch
 
 import gymnasium as gym
 import numpy as np
@@ -149,6 +149,23 @@ class TestRewardModelUpdateCallback:
         callback._on_training_end()
 
         assert model.update_calls == 1
+
+    def test_elapsed_seconds_logged(self):
+        """elapsed_seconds is present and non-negative in each logged info dict."""
+        exp_logger = _MockLogger()
+        callback = _build_callback(log_step_freq=3, exp_logger=exp_logger)
+        callback._on_training_start()
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        for step_idx in range(1, 4):
+            done = step_idx == 3
+            _step_callback(callback, sac, obs, action, 1.0, done, step_idx)
+
+        assert len(exp_logger.log_calls) == 1
+        assert "elapsed_seconds" in exp_logger.log_calls[0]["info"]
+        assert exp_logger.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +350,28 @@ class TestRewardObsLoggingCallback:
         assert log_mock.log_calls[0]["info"]["delayed_returns"] == 3.0
         assert log_mock.log_calls[1]["info"]["delayed_returns"] == 10.0
 
+    def test_elapsed_seconds_logged(self):
+        """elapsed_seconds is present and non-negative in each logged info dict."""
+        log_mock = _MockLogger()
+        callback = runner._RewardObsLoggingCallback(
+            log_step_frequency=3, exp_logger=log_mock
+        )
+        callback._on_training_start()
+        rewards = [1.0, 2.0, 0.5]
+        for idx, reward in enumerate(rewards):
+            done = idx == len(rewards) - 1
+            callback.num_timesteps = idx + 1
+            callback.locals = {
+                "dones": np.array([done]),
+                "infos": [{"true_episode_return": 5.0}],
+                "rewards": np.array([reward]),
+            }
+            callback._on_step()
+
+        assert len(log_mock.log_calls) == 1
+        assert "elapsed_seconds" in log_mock.log_calls[0]["info"]
+        assert log_mock.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
+
     def _build_ro_callback(self, log_freq: int = 1) -> runner._RewardObsLoggingCallback:
         exp_logger = _MockLogger()
         return runner._RewardObsLoggingCallback(
@@ -480,14 +519,14 @@ class TestMakeRewardModel:
 
 class TestParseArgs:
     def test_defaults_are_valid_training_args(self, tmp_path):
-        with patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
+        with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
             args = runner.parse_args()
         assert isinstance(args, runner.TrainingArgs)
         assert args.env == "MountainCarContinuous-v0"
         assert args.delay == 3
 
     def test_custom_env_and_delay(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             [
                 "prog",
@@ -504,7 +543,7 @@ class TestParseArgs:
         assert args.delay == 5
 
     def test_reward_model_kwarg_parsed(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             [
                 "prog",
@@ -518,7 +557,7 @@ class TestParseArgs:
         assert args.reward_model_kwargs["max_buffer_size"] == 50
 
     def test_agent_type_hc(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             ["prog", "--agent-type", "hc", "--output-dir", str(tmp_path)],
         ):
@@ -526,7 +565,7 @@ class TestParseArgs:
         assert args.agent_type == "hc"
 
     def test_clear_buffer_flag(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             ["prog", "--clear-buffer-on-update", "--output-dir", str(tmp_path)],
         ):
@@ -534,7 +573,7 @@ class TestParseArgs:
         assert args.clear_buffer_on_update is True
 
     def test_none_reward_model_type_accepted(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             ["prog", "--reward-model-type", "none", "--output-dir", str(tmp_path)],
         ):
@@ -747,7 +786,7 @@ class TestRunBatch:
             )
             for idx in range(3)
         ]
-        with patch("drmdp.control.runner.run") as mock_run:
+        with unittest.mock.patch("drmdp.control.runner.run") as mock_run:
             runner.run_batch(configs, mode="debug")
         assert mock_run.call_count == 3
 
@@ -773,19 +812,19 @@ class TestRunBatch:
             )
             for idx in range(2)
         ]
-        mock_future = MagicMock()
+        mock_future = unittest.mock.MagicMock()
         mock_future.result.return_value = None
-        mock_executor = MagicMock()
-        mock_executor.__enter__ = MagicMock(return_value=mock_executor)
-        mock_executor.__exit__ = MagicMock(return_value=False)
+        mock_executor = unittest.mock.MagicMock()
+        mock_executor.__enter__ = unittest.mock.MagicMock(return_value=mock_executor)
+        mock_executor.__exit__ = unittest.mock.MagicMock(return_value=False)
         mock_executor.submit.return_value = mock_future
 
         with (
-            patch(
+            unittest.mock.patch(
                 "drmdp.control.runner.concurrent.futures.ProcessPoolExecutor",
                 return_value=mock_executor,
             ),
-            patch(
+            unittest.mock.patch(
                 "drmdp.control.runner.concurrent.futures.as_completed",
                 return_value=iter([mock_future, mock_future]),
             ),
@@ -812,7 +851,7 @@ class TestRunBatch:
             log_step_frequency=50,
             output_dir=str(tmp_path),
         )
-        with patch("drmdp.control.runner.run") as mock_run:
+        with unittest.mock.patch("drmdp.control.runner.run") as mock_run:
             runner.run_batch([config], mode="unknown_mode")
         assert mock_run.call_count == 1
 
@@ -937,9 +976,9 @@ def _build_callback(
     )
 
 
-def _make_mock_sac(obs_dim: int = 3, act_dim: int = 1) -> MagicMock:
+def _make_mock_sac(obs_dim: int = 3, act_dim: int = 1) -> unittest.mock.MagicMock:
     """Return a minimal SAC mock with _last_obs and replay_buffer."""
-    sac = MagicMock()
+    sac = unittest.mock.MagicMock()
     sac._last_obs = np.zeros((1, obs_dim), dtype=np.float32)
     sac.replay_buffer = _MockReplayBuffer()
     return sac
