@@ -132,7 +132,9 @@ class TestInputMask:
             mask.logits[:, 0] = 0.0
             mask.logits[:, 1] = 1.0
         values = mask()
-        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]), dim=0)[1].item()
+        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]), dim=0)[
+            1
+        ].item()
         np.testing.assert_allclose(values.detach().numpy(), expected, atol=1e-6)
         assert mask.binary_mask().sum().item() == 4  # active > inactive → all ones
 
@@ -247,7 +249,9 @@ class TestSparsityLoss:
             model.input_mask.logits[:, 1] = 1.0
         p_active = torch.nn.functional.softmax(model.input_mask.logits, dim=-1)[:, 1]
         sparsity = p_active.mean().item()
-        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]), dim=0)[1].item()
+        expected = torch.nn.functional.softmax(torch.tensor([0.0, 1.0]), dim=0)[
+            1
+        ].item()
         np.testing.assert_allclose(sparsity, expected, atol=1e-6)
 
     def test_low_active_logit_decreases_sparsity_loss(self):

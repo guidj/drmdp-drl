@@ -22,7 +22,9 @@ Usage (HC):
 
 import argparse
 import ast
+import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import tempfile
@@ -30,10 +32,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
+import ray
 import stable_baselines3
 from stable_baselines3.common import callbacks
 
-from drmdp import core, logger, rewdelay
+from drmdp import core, logger, ray_utils, rewdelay
 from drmdp.control import base, dgra, grd, hc, ircr
 
 
@@ -377,10 +380,144 @@ def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
     raise ValueError(f"Unknown reward_model_type: {args.reward_model_type!r}")
 
 
-def main() -> None:
-    """Parse command-line arguments and launch the control loop."""
-    args = parse_args()
+def run_batch(
+    configs: Sequence[TrainingArgs],
+    mode: str = "debug",
+    max_workers: Optional[int] = None,
+    ray_address: Optional[str] = None,
+) -> None:
+    """Launch multiple experiments under one of three execution backends.
+
+    Args:
+        configs: One TrainingArgs per experiment run (already expanded for num_runs).
+        mode: "debug" runs sequentially in-process; "local" uses a ProcessPoolExecutor;
+            "ray" submits Ray remote tasks.
+        max_workers: Maximum parallel workers for local mode. None uses os.cpu_count().
+        ray_address: Ray cluster address for ray mode. None starts a local Ray instance.
+    """
+    logging.info("Launching %d experiment(s) in %s mode.", len(configs), mode)
+    if mode == "ray":
+        ray.init(address=ray_address)
+        task_refs = [_run_remote.remote(args) for args in configs]
+        ray_utils.wait_till_completion(task_refs)
+    elif mode == "local":
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            futures = [executor.submit(run, args) for args in configs]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+    else:
+        for args in configs:
+            run(args)
+
+
+@ray.remote
+def _run_remote(args: TrainingArgs) -> None:
     run(args)
+
+
+def _load_configs(config_path: str) -> List[TrainingArgs]:
+    """Load and expand experiment configs from a JSON file.
+
+    Top-level fields (except "experiments", "output_dir", and "num_runs") act as
+    shared defaults. Each experiment is expanded into num_runs TrainingArgs instances
+    with seeds generated via core.Seeder. Output dirs are derived from the top-level
+    output_dir when not specified per-experiment.
+    """
+    with open(config_path, encoding="utf-8") as config_file:
+        raw = json.load(config_file)
+
+    top_level_output_dir: Optional[str] = raw.get("output_dir")
+    top_level_num_runs: int = raw.get("num_runs", 1)
+    shared_fields = {
+        key: value
+        for key, value in raw.items()
+        if key not in ("experiments", "output_dir", "num_runs")
+    }
+    defaults = {**_default_training_args(), **shared_fields}
+
+    configs: List[TrainingArgs] = []
+    for exp_idx, entry in enumerate(raw["experiments"]):
+        num_runs: int = entry.get("num_runs", top_level_num_runs)
+        base_seed: Optional[int] = entry.get("seed")
+        experiment_fields = {
+            key: value
+            for key, value in entry.items()
+            if key not in ("num_runs", "output_dir", "seed")
+        }
+        merged_base = {**defaults, **experiment_fields}
+
+        for run_idx in range(num_runs):
+            merged = {**merged_base}
+            merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx, run_idx)
+            merged["output_dir"] = _resolve_output_dir(
+                entry, exp_idx, run_idx, top_level_output_dir
+            )
+            configs.append(TrainingArgs(**merged))
+    return configs
+
+
+def _resolve_seed(
+    num_runs: int,
+    base_seed: Optional[int],
+    exp_idx: int,
+    run_idx: int,
+) -> Optional[int]:
+    if num_runs == 1:
+        return base_seed
+    seeder_instance = base_seed if base_seed is not None else exp_idx
+    return core.Seeder(instance=seeder_instance).get_seed(run_idx)
+
+
+def _resolve_output_dir(
+    entry: Mapping[str, Any],
+    exp_idx: int,
+    run_idx: int,
+    top_level_output_dir: Optional[str],
+) -> str:
+    if "output_dir" in entry:
+        return str(entry["output_dir"])
+    base = top_level_output_dir or os.path.join(tempfile.gettempdir(), "drmdp-batch")
+    return os.path.join(base, f"exp-{exp_idx:03d}", f"run-{run_idx:03d}")
+
+
+def _default_training_args() -> Dict[str, Any]:
+    return {
+        "env": "MountainCarContinuous-v0",
+        "delay": 3,
+        "max_episode_steps": 2500,
+        "reward_model_type": "ircr",
+        "update_every_n_steps": 1000,
+        "clear_buffer_on_update": False,
+        "reward_model_kwargs": {},
+        "num_steps": 50000,
+        "sac_learning_rate": 3e-4,
+        "sac_buffer_size": 100_000,
+        "sac_batch_size": 256,
+        "sac_gradient_steps": -1,
+        "log_episode_frequency": 10,
+        "output_dir": tempfile.gettempdir(),
+        "seed": None,
+        "agent_type": "sac",
+        "agent_kwargs": {},
+    }
+
+
+def main() -> None:
+    """Parse command-line arguments and launch single or batch control loop."""
+    batch_cli = _parse_batch_cli()
+    if batch_cli.config_file is not None:
+        configs = _load_configs(batch_cli.config_file)
+        run_batch(
+            configs,
+            mode=batch_cli.mode,
+            max_workers=batch_cli.max_workers,
+            ray_address=batch_cli.ray_address,
+        )
+    else:
+        args = parse_args()
+        run(args)
 
 
 def parse_args() -> TrainingArgs:
@@ -528,6 +665,19 @@ def parse_reward_model_kwargs(
             value = raw
         kwargs[key] = value
     return kwargs
+
+
+def _parse_batch_cli() -> argparse.Namespace:
+    """Parse only batch-mode flags; single-run flags are ignored here."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config-file", type=str, default=None)
+    parser.add_argument(
+        "--mode", type=str, default="debug", choices=["debug", "local", "ray"]
+    )
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--ray-address", type=str, default=None)
+    args, _ = parser.parse_known_args()
+    return args
 
 
 if __name__ == "__main__":

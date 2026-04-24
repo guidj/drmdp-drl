@@ -3,6 +3,7 @@ Tests for drmdp.control.runner: RewardModelUpdateCallback and run().
 """
 
 import dataclasses
+import json
 import os
 import tempfile
 from typing import Any, Mapping, Optional, Sequence
@@ -438,6 +439,214 @@ class TestParseArgs:
         ):
             args = runner.parse_args()
         assert args.clear_buffer_on_update is True
+
+
+class TestLoadConfigs:
+    def _write_config(self, tmp_path, data: dict) -> str:
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(data))
+        return str(config_file)
+
+    def test_single_experiment_single_run(self, tmp_path):
+        """One experiment with num_runs=1 produces exactly one TrainingArgs."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 1,
+            "experiments": [{"env": "Pendulum-v1", "delay": 2}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert len(configs) == 1
+        assert configs[0].env == "Pendulum-v1"
+        assert configs[0].delay == 2
+
+    def test_num_runs_expands_entries(self, tmp_path):
+        """num_runs=3 expands one experiment into three TrainingArgs."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 3,
+            "experiments": [{"env": "Pendulum-v1"}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert len(configs) == 3
+
+    def test_multiple_experiments_expanded(self, tmp_path):
+        """Two experiments each with num_runs=2 produces four configs total."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 2,
+            "experiments": [
+                {"env": "Pendulum-v1"},
+                {"env": "MountainCarContinuous-v0"},
+            ],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert len(configs) == 4
+
+    def test_explicit_seed_passed_through_for_single_run(self, tmp_path):
+        """An explicit seed with num_runs=1 is kept verbatim, not run through Seeder."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 1,
+            "experiments": [{"env": "Pendulum-v1", "seed": 99}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert configs[0].seed == 99
+
+    def test_seeds_differ_across_runs(self, tmp_path):
+        """Multiple runs for the same experiment receive different seeds."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 3,
+            "experiments": [{"env": "Pendulum-v1", "seed": 7}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        seeds = [cfg.seed for cfg in configs]
+        assert len(set(seeds)) == 3, "All seeds should be distinct across runs"
+
+    def test_output_dirs_derived_from_top_level(self, tmp_path):
+        """When experiment has no output_dir, dirs are derived from the top-level dir."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 2,
+            "experiments": [{"env": "Pendulum-v1"}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert configs[0].output_dir == str(tmp_path / "exp-000" / "run-000")
+        assert configs[1].output_dir == str(tmp_path / "exp-000" / "run-001")
+
+    def test_experiment_output_dir_overrides_top_level(self, tmp_path):
+        """An experiment-level output_dir is used verbatim for all its runs."""
+        exp_dir = str(tmp_path / "custom")
+        config = {
+            "output_dir": str(tmp_path),
+            "num_runs": 2,
+            "experiments": [{"env": "Pendulum-v1", "output_dir": exp_dir}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        # Both runs share the explicit output_dir without run-suffix
+        assert all(cfg.output_dir == exp_dir for cfg in configs)
+
+    def test_shared_fields_applied_to_all_experiments(self, tmp_path):
+        """Top-level fields serve as defaults for all experiments."""
+        config = {
+            "output_dir": str(tmp_path),
+            "delay": 10,
+            "experiments": [{"env": "Pendulum-v1"}, {"env": "Pendulum-v1"}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert all(cfg.delay == 10 for cfg in configs)
+
+    def test_experiment_field_overrides_shared_default(self, tmp_path):
+        """An experiment entry can override a shared top-level field."""
+        config = {
+            "output_dir": str(tmp_path),
+            "delay": 5,
+            "experiments": [{"env": "Pendulum-v1", "delay": 1}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert configs[0].delay == 1
+
+    def test_returns_training_args_instances(self, tmp_path):
+        """All returned objects are TrainingArgs dataclass instances."""
+        config = {
+            "output_dir": str(tmp_path),
+            "experiments": [{"env": "Pendulum-v1"}],
+        }
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert all(isinstance(cfg, runner.TrainingArgs) for cfg in configs)
+
+
+class TestRunBatch:
+    def test_debug_mode_calls_run_for_each_config(self, tmp_path):
+        """In debug mode, run() is called once for each config, sequentially."""
+        configs = [
+            runner.TrainingArgs(
+                env="Pendulum-v1",
+                delay=1,
+                max_episode_steps=50,
+                reward_model_type="ircr",
+                update_every_n_steps=50,
+                clear_buffer_on_update=False,
+                reward_model_kwargs={},
+                num_steps=100,
+                sac_learning_rate=3e-4,
+                sac_buffer_size=1000,
+                sac_batch_size=32,
+                sac_gradient_steps=1,
+                log_episode_frequency=1,
+                output_dir=str(tmp_path),
+                seed=idx,
+            )
+            for idx in range(3)
+        ]
+        with patch("drmdp.control.runner.run") as mock_run:
+            runner.run_batch(configs, mode="debug")
+        assert mock_run.call_count == 3
+
+    def test_local_mode_submits_one_future_per_config(self, tmp_path):
+        """In local mode, ProcessPoolExecutor.submit() is called once per config."""
+        configs = [
+            runner.TrainingArgs(
+                env="Pendulum-v1",
+                delay=1,
+                max_episode_steps=50,
+                reward_model_type="ircr",
+                update_every_n_steps=50,
+                clear_buffer_on_update=False,
+                reward_model_kwargs={},
+                num_steps=100,
+                sac_learning_rate=3e-4,
+                sac_buffer_size=1000,
+                sac_batch_size=32,
+                sac_gradient_steps=1,
+                log_episode_frequency=1,
+                output_dir=str(tmp_path),
+                seed=idx,
+            )
+            for idx in range(2)
+        ]
+        mock_future = MagicMock()
+        mock_future.result.return_value = None
+        mock_executor = MagicMock()
+        mock_executor.__enter__ = MagicMock(return_value=mock_executor)
+        mock_executor.__exit__ = MagicMock(return_value=False)
+        mock_executor.submit.return_value = mock_future
+
+        with (
+            patch(
+                "drmdp.control.runner.concurrent.futures.ProcessPoolExecutor",
+                return_value=mock_executor,
+            ),
+            patch(
+                "drmdp.control.runner.concurrent.futures.as_completed",
+                return_value=iter([mock_future, mock_future]),
+            ),
+        ):
+            runner.run_batch(configs, mode="local", max_workers=2)
+
+        assert mock_executor.submit.call_count == 2
+
+    def test_unknown_mode_falls_through_to_sequential(self, tmp_path):
+        """An unrecognised mode string falls through to the sequential else branch."""
+        config = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            max_episode_steps=50,
+            reward_model_type="ircr",
+            update_every_n_steps=50,
+            clear_buffer_on_update=False,
+            reward_model_kwargs={},
+            num_steps=100,
+            sac_learning_rate=3e-4,
+            sac_buffer_size=1000,
+            sac_batch_size=32,
+            sac_gradient_steps=1,
+            log_episode_frequency=1,
+            output_dir=str(tmp_path),
+        )
+        with patch("drmdp.control.runner.run") as mock_run:
+            runner.run_batch([config], mode="unknown_mode")
+        assert mock_run.call_count == 1
 
 
 class TestParseRewardModelKwargs:
