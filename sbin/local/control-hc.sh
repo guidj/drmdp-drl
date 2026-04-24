@@ -19,6 +19,6 @@ python $PARENT_DIR/src/$BASE/control/runner.py \
     --sac-buffer-size 100000 \
     --sac-batch-size 256 \
     --sac-gradient-steps -1 \
-    --log-episode-frequency 10 \
+    --log-step-frequency 10 \
     --output-dir $OUTPUT_DIR \
     --seed 0
