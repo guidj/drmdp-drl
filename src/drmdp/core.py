@@ -119,6 +119,9 @@ class EnvMonitorWrapper(gym.Wrapper):
         obs, reward, term, trunc, info = super().step(action)
         self.mon.rewards += reward
         self.mon.step += 1
+        if term or trunc:
+            info["true_episode_return"] = self.mon.rewards
+            info["true_episode_steps"] = self.mon.step
         return obs, reward, term, trunc, info
 
     def reset(self, *, seed=None, options=None):

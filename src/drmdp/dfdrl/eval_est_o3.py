@@ -1,7 +1,7 @@
 """
-Evaluation module for O2 reward estimation models.
+Evaluation module for O3 EM-based reward estimation models.
 
-Loads saved MLP models from est_o2.py and evaluates them.
+Loads saved MLP models from est_o3.py and evaluates them.
 
 Evaluation modes:
 1. Predictions mode: Loads and displays predictions from saved JSON
@@ -9,14 +9,14 @@ Evaluation modes:
 
 Usage Examples:
     # Evaluate from saved predictions
-    python -m drmdp.dfdrl.eval_est_o2 \
-        --model-dir outputs/o2/mlp \
+    python -m drmdp.dfdrl.eval_est_o3 \
+        --model-dir outputs/o3/mlp \
         --mode predictions \
         --num-examples 10
 
     # Interactive evaluation with live environment
-    python -m drmdp.dfdrl.eval_est_o2 \
-        --model-dir outputs/o2/mlp \
+    python -m drmdp.dfdrl.eval_est_o3 \
+        --model-dir outputs/o3/mlp \
         --mode interactive \
         --env MountainCarContinuous-v0 \
         --delay 3 \
@@ -35,7 +35,7 @@ import torch
 from torch import nn
 
 from drmdp import rewdelay
-from drmdp.dfdrl import est_o2
+from drmdp.dfdrl import est_o3
 
 
 def load_config(output_dir: str) -> Dict[str, Any]:
@@ -79,7 +79,7 @@ def load_model(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Create reward model (MLP only)
-    r_model = est_o2.RNetwork(
+    r_model = est_o3.RNetwork(
         state_dim=state_dim,
         action_dim=action_dim,
         **(reward_model_kwargs or {}),
@@ -121,7 +121,7 @@ def evaluate_from_predictions_file(
     num_to_show = min(num_examples, len(predictions))
 
     print("\n" + "=" * 100)
-    print(f"O2 Model Predictions (Reward: {data['model_type'].upper()})")
+    print(f"O3 Model Predictions (Reward: {data['model_type'].upper()})")
     print(f"Showing {num_to_show}/{len(predictions)} examples")
     print("=" * 100)
     print(
@@ -149,7 +149,12 @@ def evaluate_from_predictions_file(
     reward_rmse = np.sqrt(np.mean(np.square(reward_errors)))
 
     print(f"Reward MAE: {reward_mae:.8f}, RMSE: {reward_rmse:.8f}")
-    print(f"Overall MSE (from file): {data['final_mse']:.8f}")
+    final_mse = data["final_mse"]
+    if isinstance(final_mse, dict):
+        for key, val in final_mse.items():
+            print(f"Overall MSE [{key}] (from file): {val:.8f}")
+    else:
+        print(f"Overall MSE (from file): {final_mse:.8f}")
     print("=" * 100)
 
 
@@ -284,9 +289,9 @@ def evaluate_interactive(
 
 
 def main():
-    """Parse args and evaluate O2 return-grounded reward estimation models."""
+    """Parse args and evaluate O3 EM-based reward estimation models."""
     parser = argparse.ArgumentParser(
-        description="Evaluate O2 reward estimation models (MLP only)"
+        description="Evaluate O3 EM-based reward estimation models (MLP only)"
     )
     parser.add_argument(
         "--model-dir",

@@ -24,6 +24,7 @@ to match the delayed aggregate reward signal.
 """
 
 import argparse
+import ast
 import dataclasses
 import io
 import json
@@ -31,7 +32,7 @@ import logging
 import os
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -62,6 +63,7 @@ class TrainingArgs:
     log_episode_frequency: int
     output_dir: str
     num_runs: int
+    reward_model_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     seed: Optional[int] = None
 
 
@@ -400,6 +402,7 @@ def save_config_and_metrics(
     train_losses: Sequence,
     eval_losses: Sequence,
     final_mse: float,
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
 ):
     """
     Save configuration and training metrics to JSON files.
@@ -434,7 +437,7 @@ def save_config_and_metrics(
 
     # Save config
     config_file = os.path.join(output_dir, "config.json")
-    hparams = {
+    config = {
         "spec": SPEC,
         "model_type": model_type,
         "env_name": env.spec.id if hasattr(env, "spec") and env.spec else "unknown",
@@ -442,15 +445,22 @@ def save_config_and_metrics(
         "action_dim": act_dim,
         "batch_size": batch_size,
         "eval_steps": eval_steps,
-        "hidden_dim": 256,
+        "reward_model_kwargs": reward_model_kwargs or {},
     }
     with tf.io.gfile.GFile(config_file, "w") as writable:
         json.dump(
-            hparams,
+            config,
             writable,
             indent=2,
         )
     logging.info("Config saved to %s", config_file)
+
+    # TensorBoard add_hparams only accepts scalar types; expand reward_model_kwargs as flat entries
+    hparams = {
+        key: value for key, value in config.items() if key != "reward_model_kwargs"
+    }
+    for key, value in (reward_model_kwargs or {}).items():
+        hparams[f"reward_model_kwargs.{key}"] = value
     return hparams
 
 
@@ -461,6 +471,7 @@ def train(
     batch_size: int,
     eval_steps: int,
     log_episode_frequency: int,
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
     seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
@@ -473,6 +484,7 @@ def train(
         dataset: Training dataset
         batch_size: Batch size for training
         eval_steps: Number of evaluation steps
+        reward_model_kwargs: Keyword arguments forwarded to RNetwork (e.g. powers, hidden_dim)
         model_type: Type of model to use ("mlp", "rnn", or "transformer")
         output_dir: Directory to save predictions and results
     """
@@ -484,7 +496,9 @@ def train(
 
     # Select model architecture
     if model_type == "mlp":
-        model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
+        model = RNetwork(
+            state_dim=obs_dim, action_dim=act_dim, **(reward_model_kwargs or {})
+        )
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
@@ -617,6 +631,7 @@ def train(
             train_losses=train_losses,
             eval_losses=eval_losses,
             final_mse=final_mse,
+            reward_model_kwargs=reward_model_kwargs,
         )
 
         # Save config and final metrics
@@ -677,6 +692,7 @@ def experiment(args: TrainingArgs):
             batch_size=args.batch_size,
             eval_steps=args.eval_steps,
             model_type=args.model_type,
+            reward_model_kwargs=args.reward_model_kwargs,
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
             seed=args.seed,
@@ -695,6 +711,19 @@ def run_fn(args: TrainingArgs):
         logging.error("Error in task %s: %s", args.seed, err)
         # Fail job for ray status reporting
         sys.exit(1)
+
+
+def _parse_kwargs(pairs: Optional[List[str]]) -> Dict[str, Any]:
+    if not pairs:
+        return {}
+    result: Dict[str, Any] = {}
+    for pair in pairs:
+        key, _, raw_value = pair.partition("=")
+        try:
+            result[key] = ast.literal_eval(raw_value)
+        except (ValueError, SyntaxError):
+            result[key] = raw_value
+    return result
 
 
 def main():
@@ -782,9 +811,17 @@ def parse_args() -> TrainingArgs:
         default=1,
         help="Number of runs - with their own seed.",
     )
+    parser.add_argument(
+        "--reward-model-kwargs",
+        nargs="*",
+        default=None,
+        help="Keyword arguments for RNetwork (e.g. powers=2 hidden_dim=512)",
+    )
 
     args, _ = parser.parse_known_args()
-    return TrainingArgs(**vars(args))
+    arg_dict = vars(args)
+    arg_dict["reward_model_kwargs"] = _parse_kwargs(arg_dict.get("reward_model_kwargs"))
+    return TrainingArgs(**arg_dict)
 
 
 if __name__ == "__main__":

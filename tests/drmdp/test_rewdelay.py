@@ -1,5 +1,6 @@
 import gymnasium as gym
 import numpy as np
+import pytest
 from gymnasium import spaces
 
 from drmdp import rewdelay
@@ -317,6 +318,112 @@ def test_data_buffer_max_size_bytes_with_first_acc_mode():
     assert buffer.size_bytes() == 32
 
 
+class TestFixedDelayMethods:
+    def test_range_returns_delay_pair(self):
+        delay = rewdelay.FixedDelay(5)
+        assert delay.range() == (5, 5)
+
+    def test_id_returns_fixed(self):
+        assert rewdelay.FixedDelay.id() == "fixed"
+
+
+class TestUniformDelayMethods:
+    def test_range_returns_min_max(self):
+        delay = rewdelay.UniformDelay(2, 6)
+        assert delay.range() == (2, 6)
+
+    def test_id_returns_uniform(self):
+        assert rewdelay.UniformDelay.id() == "uniform"
+
+    def test_sample_within_range(self):
+        delay = rewdelay.UniformDelay(3, 7)
+        for _ in range(20):
+            sample = delay.sample()
+            assert 3 <= sample <= 7
+
+
+class TestClippedPoissonDelayMethods:
+    def test_range_uses_provided_bounds(self):
+        delay = rewdelay.ClippedPoissonDelay(5, min_delay=2, max_delay=10)
+        assert delay.range() == (2, 10)
+
+    def test_id_returns_clipped_poisson(self):
+        assert rewdelay.ClippedPoissonDelay.id() == "clipped-poisson"
+
+    def test_sample_within_clipped_range(self):
+        delay = rewdelay.ClippedPoissonDelay(3, min_delay=1, max_delay=5)
+        for _ in range(20):
+            sample = delay.sample()
+            assert 1 <= int(sample) <= 5
+
+
+class TestWindowedTaskSchedule:
+    def test_fixed_mode_next_update_ep(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        assert schedule.next_update_ep == 20  # curr(10) + init(10)
+
+    def test_double_mode_next_update_ep(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="double", init_update_ep=5)
+        assert schedule.next_update_ep == 10  # curr(5) * 2
+
+    def test_invalid_mode_raises_value_error(self):
+        with pytest.raises(ValueError):
+            rewdelay.WindowedTaskSchedule(mode="invalid", init_update_ep=10)
+
+    def test_step_advances_at_boundary_fixed(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        schedule.step(20)
+        assert schedule.curr_update_ep == 20
+        assert schedule.next_update_ep == 30
+
+    def test_step_advances_at_boundary_double(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="double", init_update_ep=5)
+        schedule.step(10)  # next_update_ep was 10
+        assert schedule.curr_update_ep == 10
+        assert schedule.next_update_ep == 20  # 10 * 2
+
+    def test_step_no_change_before_boundary(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        schedule.step(5)
+        assert schedule.curr_update_ep == 10
+        assert schedule.next_update_ep == 20
+
+    def test_set_state_and_current_window_done(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="fixed", init_update_ep=10)
+        assert not schedule.current_window_done
+        schedule.set_state(True)
+        assert schedule.current_window_done
+        schedule.set_state(False)
+        assert not schedule.current_window_done
+
+    def test_step_resets_done_state(self):
+        schedule = rewdelay.WindowedTaskSchedule(mode="double", init_update_ep=5)
+        schedule.set_state(True)
+        assert schedule.current_window_done
+        schedule.step(10)  # triggers boundary advancement
+        assert not schedule.current_window_done
+
+
+class TestSupportsName:
+    def test_get_name_contains_class_name(self):
+        env = DummyEnv()
+        wrapped = rewdelay.DelayedRewardWrapper(
+            env, reward_delay=rewdelay.FixedDelay(2)
+        )
+        wrapped.reset()
+        name = wrapped.get_name()
+        assert "DelayedRewardWrapper" in name
+
+    def test_get_env_name_contains_underlying_class(self):
+        env = DummyEnv()
+        wrapped = rewdelay.DelayedRewardWrapper(
+            env, reward_delay=rewdelay.FixedDelay(2)
+        )
+        wrapped.reset()
+        env_name = wrapped.get_env_name()
+        assert "DummyEnv" in env_name
+
+
 def test_data_buffer_max_capacity_max_size_bytes_with_latest_acc_mode():
     buffer = rewdelay.DataBuffer(
         max_capacity=2,
@@ -338,3 +445,93 @@ def test_data_buffer_max_capacity_max_size_bytes_with_latest_acc_mode():
     assert buffer.buffer == [1]
     assert buffer.size() == 1
     assert buffer.size_bytes() == 32
+
+
+# ---------------------------------------------------------------------------
+# TestImputeMissingRewardWrapper
+# ---------------------------------------------------------------------------
+
+
+class TestImputeMissingRewardWrapper:
+    """Tests for ImputeMissingRewardWrapper.
+
+    Focuses on the info["interval_end"] flag introduced to let downstream
+    components identify interval boundaries without relying on reward != 0.
+    """
+
+    def _make_env(self, delay: int = 3) -> rewdelay.ImputeMissingRewardWrapper:
+        """Build a DelayedRewardWrapper + ImputeMissingRewardWrapper stack."""
+        env = DummyEnv(term_steps=100)
+        env = rewdelay.DelayedRewardWrapper(
+            env, reward_delay=rewdelay.FixedDelay(delay)
+        )
+        return rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
+
+    def test_interval_end_false_on_non_boundary_step(self):
+        """info["interval_end"] is False on steps where no reward is emitted."""
+        env = self._make_env(delay=3)
+        env.reset()
+        _, _, _, _, info = env.step(0)
+        assert info["interval_end"] is False
+
+    def test_interval_end_true_on_boundary_step(self):
+        """info["interval_end"] is True on the final step of a signal interval."""
+        env = self._make_env(delay=3)
+        env.reset()
+        # Steps 1 and 2 are non-boundary; step 3 (index 2) ends the interval.
+        env.step(0)
+        env.step(0)
+        _, _, _, _, info = env.step(0)
+        assert info["interval_end"] is True
+
+    def test_interval_end_true_when_aggregate_reward_is_zero(self):
+        """interval_end is True even when the aggregate reward sums to 0.
+
+        This is the key case that motivated using info["interval_end"] instead
+        of checking reward != 0: per-step rewards that cancel out would produce
+        a non-zero interval_end flag but a zero imputed reward.
+        """
+
+        class ZeroRewardEnv(gym.Env):
+            """All per-step rewards are 0.0."""
+
+            def __init__(self) -> None:
+                self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(2,))
+                self.action_space = spaces.Discrete(2)
+
+            def step(self, action):
+                del action
+                return np.zeros(2), 0.0, False, False, {}
+
+            def reset(self, seed=None, options=None):
+                del seed, options
+                return np.zeros(2), {}
+
+        env: gym.Env = ZeroRewardEnv()
+        env = rewdelay.DelayedRewardWrapper(env, reward_delay=rewdelay.FixedDelay(2))
+        env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
+        env.reset()
+        env.step(0)
+        _, reward, _, _, info = env.step(0)
+        # Aggregate reward is 0.0 + 0.0 = 0.0, but interval_end must be True.
+        assert reward == 0.0
+        assert info["interval_end"] is True
+
+    def test_non_boundary_reward_is_imputed_to_zero(self):
+        """Non-boundary steps return the configured impute_value (0.0)."""
+        env = self._make_env(delay=3)
+        env.reset()
+        _, reward, _, _, info = env.step(0)
+        assert reward == 0.0
+        assert info["interval_end"] is False
+
+    def test_boundary_reward_passes_through(self):
+        """The aggregate reward on a boundary step is not altered."""
+        env = self._make_env(delay=3)
+        env.reset()
+        env.step(0)
+        env.step(0)
+        _, reward, _, _, info = env.step(0)
+        # DummyEnv always returns 1.0; aggregate over 3 steps = 3.0.
+        assert reward == 3.0
+        assert info["interval_end"] is True

@@ -17,10 +17,11 @@ Usage Example:
 """
 
 import argparse
+import ast
 import json
 import pathlib
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -228,6 +229,7 @@ def train(
     dataset: data.Dataset,
     batch_size: int,
     eval_steps: int,
+    reward_model_kwargs: Optional[Mapping[str, Any]] = None,
     output_dir: str = "outputs",
 ):
     """
@@ -238,6 +240,7 @@ def train(
         dataset: Training dataset
         batch_size: Batch size for training
         eval_steps: Number of evaluation steps
+        reward_model_kwargs: Keyword arguments forwarded to RNetwork (e.g. powers, hidden_dim)
         output_dir: Directory to save predictions and results
 
     Returns:
@@ -248,7 +251,9 @@ def train(
     act_dim = env.action_space.shape[0]
 
     # Create model
-    model = RNetwork(state_dim=obs_dim, action_dim=act_dim, hidden_dim=256)
+    model = RNetwork(
+        state_dim=obs_dim, action_dim=act_dim, **(reward_model_kwargs or {})
+    )
     print("Training immediate reward prediction model (MLP)")
 
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
@@ -367,7 +372,7 @@ def train(
                 "action_dim": act_dim,
                 "batch_size": batch_size,
                 "eval_steps": eval_steps,
-                "hidden_dim": 256,
+                "reward_model_kwargs": reward_model_kwargs or {},
                 "timestamp": int(output_path.name),
             },
             writable,
@@ -376,6 +381,19 @@ def train(
     print(f"Config saved to {config_file}")
 
     return final_mse, predictions_list
+
+
+def _parse_kwargs(pairs: Optional[List[str]]) -> Dict[str, Any]:
+    if not pairs:
+        return {}
+    result: Dict[str, Any] = {}
+    for pair in pairs:
+        key, _, raw_value = pair.partition("=")
+        try:
+            result[key] = ast.literal_eval(raw_value)
+        except (ValueError, SyntaxError):
+            result[key] = raw_value
+    return result
 
 
 def main():
@@ -416,6 +434,12 @@ def main():
         default="outputs",
         help="Output directory for results (default: outputs)",
     )
+    parser.add_argument(
+        "--reward-model-kwargs",
+        nargs="*",
+        default=None,
+        help="Keyword arguments for RNetwork (e.g. powers=2 hidden_dim=512)",
+    )
 
     args = parser.parse_args()
 
@@ -442,6 +466,7 @@ def main():
         dataset=dataset,
         batch_size=args.batch_size,
         eval_steps=args.eval_steps,
+        reward_model_kwargs=_parse_kwargs(args.reward_model_kwargs),
         output_dir=args.output_dir,
     )
 

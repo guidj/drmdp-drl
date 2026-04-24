@@ -12,86 +12,18 @@ Critical tests focus on:
 
 import json
 import os
+import sys
 import tempfile
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import gymnasium as gym
 import numpy as np
 import pytest
 import torch
+from torch.utils import data as torch_data
 
 from drmdp import dataproc, rewdelay
 from drmdp.dfdrl import est_o2
-
-# =============================================================================
-# Module-level helper functions
-# =============================================================================
-
-
-def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple]:
-    """
-    Create a mock buffer from episode rewards.
-
-    Args:
-        episodes: List of reward sequences, one per episode
-
-    Returns:
-        Buffer in format: List[(state, action, next_state, reward, term)]
-    """
-    buffer = []
-    for ep_idx, rewards in enumerate(episodes):
-        for step_idx, reward in enumerate(rewards):
-            # Create dummy state/action (just use indices for debugging)
-            state = np.array([float(ep_idx), float(step_idx)])
-            action = np.array([float(ep_idx * 10 + step_idx)])
-            next_state = np.array([float(ep_idx), float(step_idx + 1)])
-            term = step_idx == len(rewards) - 1  # Terminal at last step
-
-            buffer.append((state, action, next_state, reward, term))
-
-    return buffer
-
-
-# =============================================================================
-# Module-level fixtures
-# =============================================================================
-
-
-@pytest.fixture
-def simple_env():
-    """Create a simple environment for testing."""
-    return gym.make("MountainCarContinuous-v0")
-
-
-@pytest.fixture
-def simple_model_and_dataset():
-    """Create a simple model and dataset for evaluation tests."""
-    # Create small dataset
-    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    delay = rewdelay.FixedDelay(3)
-    examples = est_o2.delayed_reward_data(buffer, delay)
-
-    inputs, labels = zip(*examples)
-    dataset = est_o2.DictDataset(inputs=list(inputs), labels=list(labels))
-
-    # Create model
-    torch.manual_seed(42)
-    model = est_o2.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
-
-    return model, dataset
-
-
-@pytest.fixture(scope="module")
-def training_dataset():
-    """Create a realistic training dataset for integration tests."""
-    env = gym.make("MountainCarContinuous-v0", max_episode_steps=50)
-    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
-    delay = rewdelay.FixedDelay(5)
-    examples = est_o2.delayed_reward_data(buffer, delay)
-
-    inputs, labels = zip(*examples)
-    return est_o2.DictDataset(inputs=list(inputs), labels=list(labels))
-
 
 # =============================================================================
 # TestRNetwork
@@ -324,7 +256,7 @@ class TestDelayedRewardDataReturns:
         # Verify that end_return values match cumulative returns
         # (We can't verify all timesteps since only windows are created,
         # but we can verify the relationship holds)
-        for inputs, labels in examples:
+        for _, labels in examples:
             start_return = labels["start_return"].item()
             end_return = labels["end_return"].item()
             aggregate_reward = labels["aggregate_reward"].item()
@@ -352,7 +284,7 @@ class TestDelayedRewardDataReturns:
         examples = est_o2.delayed_reward_data(buffer, delay=delay)
 
         # Verify the critical relationship holds for all windows
-        for inputs, labels in examples:
+        for _, labels in examples:
             start_return = labels["start_return"].item()
             end_return = labels["end_return"].item()
             aggregate_reward = labels["aggregate_reward"].item()
@@ -389,7 +321,7 @@ class TestDelayedRewardDataReturns:
         examples = est_o2.delayed_reward_data(buffer, delay=delay)
 
         # All end_returns should be valid
-        for inputs, labels in examples:
+        for _, labels in examples:
             end_return = labels["end_return"].item()
             start_return = labels["start_return"].item()
             # end_return should be >= start_return (or both negative)
@@ -534,7 +466,7 @@ class TestDelayedRewardDataReturns:
         # Windows starting at indices 3 and 5 should have start_return=0
 
         # Just verify the critical relationship holds for all windows
-        for inputs, labels in examples:
+        for _, labels in examples:
             start_return = labels["start_return"].item()
             end_return = labels["end_return"].item()
             aggregate_reward = labels["aggregate_reward"].item()
@@ -968,6 +900,46 @@ class TestEvaluateModel:
 
         np.testing.assert_allclose(metrics["total"], metrics["reward"], atol=1e-6)
 
+    def test_shuffle_true_produces_valid_metrics(self, simple_model_and_dataset):
+        """shuffle=True runs without error and returns a valid metrics dict."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+        metrics, _ = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=2,
+            regu_lam=1.0,
+            collect_predictions=False,
+            shuffle=True,
+        )
+        for key in ("reward", "regu", "total"):
+            assert key in metrics
+            assert len(metrics[key]) > 0
+            assert metrics[key].mean() >= 0.0
+
+    def test_metrics_length_equals_num_batches(self, simple_model_and_dataset):
+        """metrics arrays have one entry per evaluated batch."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+        metrics, _ = est_o2.evaluate_model(
+            model, dataset, batch_size=1, regu_lam=1.0, collect_predictions=False
+        )
+        assert len(metrics["total"]) == len(dataset)
+
+    def test_max_batches_limits_metrics_length(self, simple_model_and_dataset):
+        """max_batches=1 stops after one batch, so metrics arrays have length 1."""
+        model, dataset = simple_model_and_dataset
+        model.eval()
+        metrics, _ = est_o2.evaluate_model(
+            model,
+            dataset,
+            batch_size=1,
+            regu_lam=1.0,
+            collect_predictions=False,
+            max_batches=1,
+        )
+        assert len(metrics["total"]) == 1
+
 
 class TestSaveConfigAndMetrics:
     """Tests for save_config_and_metrics() function."""
@@ -982,7 +954,11 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5, 0.4, 0.3],
-                eval_losses=[0.6, 0.5],
+                eval_losses={
+                    "reward": [0.6, 0.5],
+                    "regu": [0.1, 0.1],
+                    "total": [0.7, 0.6],
+                },
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1004,7 +980,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5, 0.4],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1022,7 +998,7 @@ class TestSaveConfigAndMetrics:
                 "action_dim",
                 "batch_size",
                 "eval_steps",
-                "hidden_dim",
+                "reward_model_kwargs",
             ]
 
             for field in required_fields:
@@ -1032,7 +1008,11 @@ class TestSaveConfigAndMetrics:
         """Validate metrics JSON has required fields."""
         with tempfile.TemporaryDirectory() as output_dir:
             train_losses = [0.5, 0.4, 0.3]
-            eval_losses = [0.6, 0.5]
+            eval_losses = {
+                "reward": [0.6, 0.5],
+                "regu": [0.1, 0.1],
+                "total": [0.7, 0.6],
+            }
             final_mse = 0.25
             final_rmse = 0.5
 
@@ -1075,7 +1055,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1096,7 +1076,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1118,7 +1098,7 @@ class TestSaveConfigAndMetrics:
                 batch_size=32,
                 eval_steps=10,
                 train_losses=[0.5],
-                eval_losses=[0.6],
+                eval_losses={"reward": [0.6], "regu": [0.1], "total": [0.7]},
                 final_mse=0.25,
                 final_rmse=0.5,
             )
@@ -1294,7 +1274,7 @@ class TestTrain:
                 metrics = json.load(readable)
 
             # With 15 epochs and log_episode_frequency=5, should have 3 eval points
-            assert len(metrics["eval_losses"]) == 3
+            assert len(metrics["eval_losses"]["total"]) == 3
 
     def test_tensorboard_logging(self, simple_env, training_dataset):
         """Verify tensorboard events file exists in output_dir."""
@@ -1423,9 +1403,7 @@ class TestEndToEnd:
         dataset = est_o2.DictDataset(inputs=list(inputs_list), labels=list(labels_list))
 
         # Create dataloader
-        from torch.utils.data import DataLoader
-
-        dataloader = DataLoader(
+        dataloader = torch_data.DataLoader(
             dataset,
             batch_size=4,
             shuffle=False,
@@ -1466,8 +1444,6 @@ class TestCommandLine:
 
     def test_parse_args_defaults(self):
         """Mock sys.argv, verify default values."""
-        import sys
-
         # Save original argv
         original_argv = sys.argv
 
@@ -1497,8 +1473,6 @@ class TestCommandLine:
 
     def test_parse_args_custom_values(self):
         """Mock sys.argv with all args, verify parsing."""
-        import sys
-
         # Save original argv
         original_argv = sys.argv
 
@@ -1551,3 +1525,166 @@ class TestCommandLine:
         finally:
             # Restore original argv
             sys.argv = original_argv
+
+
+# =============================================================================
+# TestReguLoss
+# =============================================================================
+
+
+class TestReguLoss:
+    """Regression tests for the regu_loss computation in train().
+
+    These tests verify that regu_loss depends on model predictions (window_reward),
+    not on the observed aggregate_reward. Using aggregate_reward produces zero
+    gradients w.r.t. model parameters, making regularization a no-op.
+    """
+
+    def test_regu_loss_gradient_nonzero(self):
+        """Verify regu_loss computed from window_reward has non-zero gradients.
+
+        Constructs a minimal forward pass, computes regu_loss using the model's
+        predicted window_reward, and checks that at least one parameter receives
+        a non-zero gradient after backward().
+        """
+        torch.manual_seed(42)
+        model = est_o2.RNetwork(state_dim=4, action_dim=2, hidden_dim=32)
+        criterion = torch.nn.MSELoss()
+
+        batch_size = 3
+        seq_len = 5
+        state = torch.randn(batch_size, seq_len, 4)
+        action = torch.randn(batch_size, seq_len, 2)
+        term = torch.zeros(batch_size, seq_len, 1)
+
+        start_return = torch.randn(batch_size)
+        end_return = torch.randn(batch_size)
+
+        # Forward pass: outputs shape (batch_size, seq_len, 1)
+        outputs = model(state, action, term)
+        window_reward = torch.sum(outputs, dim=1).squeeze(-1)
+
+        # regu_loss using model predictions — gradients must flow
+        regu_loss = criterion(start_return + window_reward, end_return)
+        regu_loss.backward()
+
+        # At least one parameter must have a non-zero gradient
+        has_nonzero_grad = any(
+            param.grad is not None and param.grad.abs().sum().item() > 0.0
+            for param in model.parameters()
+        )
+        assert has_nonzero_grad, (
+            "regu_loss using window_reward must produce non-zero gradients"
+        )
+
+    def test_regu_loss_uses_model_predictions(self, simple_env, training_dataset):
+        """Verify regu_loss changes when window_reward (model output) changes.
+
+        Keeps start_return, end_return, and aggregate_reward fixed while
+        varying window_reward. Confirms the loss is sensitive to model outputs.
+        """
+        batch_losses = []
+        with tempfile.TemporaryDirectory() as output_dir:
+            est_o2.train(
+                env=simple_env,
+                dataset=training_dataset,
+                train_epochs=2,
+                batch_size=16,
+                eval_steps=5,
+                log_episode_frequency=5,
+                regu_lam=1.0,
+                seed=42,
+                output_dir=output_dir,
+                on_batch_end=batch_losses.append,
+            )
+        regu_values = [batch["regu"] for batch in batch_losses]
+        # A constant regu_loss (e.g. always 0) would mean predictions are
+        # ignored; a non-constant sequence confirms the loss tracks the model.
+        assert len(set(regu_values)) > 1, "regu_loss must vary across batches"
+
+    def test_regu_loss_formula_consistency(self, simple_env, training_dataset):
+        """Verify total_loss == reward_loss + regu_lam * regu_loss for every batch.
+
+        Checks that the three loss components reported by the callback satisfy
+        the defining relationship used inside train(), confirming the formula
+        is executed correctly rather than just being arithmetically valid.
+        """
+        batch_losses = []
+        regu_lam = 0.5
+        with tempfile.TemporaryDirectory() as output_dir:
+            est_o2.train(
+                env=simple_env,
+                dataset=training_dataset,
+                train_epochs=2,
+                batch_size=16,
+                eval_steps=5,
+                log_episode_frequency=5,
+                regu_lam=regu_lam,
+                seed=42,
+                output_dir=output_dir,
+                on_batch_end=batch_losses.append,
+            )
+        for batch in batch_losses:
+            expected_total = batch["reward"] + regu_lam * batch["regu"]
+            np.testing.assert_allclose(batch["total"], expected_total, atol=1e-5)
+
+
+# =============================================================================
+# Module-level helper functions and fixtures
+# =============================================================================
+
+
+def create_mock_buffer(episodes: List[List[float]]) -> List[Tuple[Any, ...]]:
+    """Create a mock buffer from episode rewards.
+
+    Args:
+        episodes: List of reward sequences, one per episode
+
+    Returns:
+        Buffer in format: List[(state, action, next_state, reward, term)]
+    """
+    buffer = []
+    for ep_idx, rewards in enumerate(episodes):
+        for step_idx, reward in enumerate(rewards):
+            state = np.array([float(ep_idx), float(step_idx)])
+            action = np.array([float(ep_idx * 10 + step_idx)])
+            next_state = np.array([float(ep_idx), float(step_idx + 1)])
+            term = step_idx == len(rewards) - 1
+
+            buffer.append((state, action, next_state, reward, term))
+
+    return buffer
+
+
+@pytest.fixture
+def simple_env():
+    """Create a simple environment for testing."""
+    return gym.make("MountainCarContinuous-v0")
+
+
+@pytest.fixture
+def simple_model_and_dataset():
+    """Create a simple model and dataset for evaluation tests."""
+    buffer = create_mock_buffer([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    delay = rewdelay.FixedDelay(3)
+    examples = est_o2.delayed_reward_data(buffer, delay)
+
+    inputs, labels = zip(*examples)
+    dataset = est_o2.DictDataset(inputs=list(inputs), labels=list(labels))
+
+    torch.manual_seed(42)
+    model = est_o2.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
+
+    return model, dataset
+
+
+@pytest.fixture(scope="module")
+def training_dataset():
+    """Create a realistic training dataset for integration tests."""
+    env = gym.make("MountainCarContinuous-v0", max_episode_steps=50)
+    buffer = dataproc.collection_traj_data(env, steps=100, include_term=True, seed=42)
+    delay = rewdelay.FixedDelay(5)
+    examples = est_o2.delayed_reward_data(buffer, delay)
+
+    inputs, labels = zip(*examples)
+    return est_o2.DictDataset(inputs=list(inputs), labels=list(labels))

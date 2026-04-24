@@ -1,26 +1,30 @@
 """
-Reward prediction networks for delayed, aggregate, and anonymous feedback (DAAF).
+EM-based reward prediction for delayed, aggregate, and anonymous feedback (DAAF).
 
-This module provides three architectures for predicting rewards from sequences
-of (state, action) pairs:
+This module implements est_o3, an Expectation-Maximisation formulation of reward
+estimation from delayed aggregate feedback.
 
-1. RNetwork: Feedforward MLP - processes each (s,a) pair independently
+At each training iteration the loop performs two steps per batch:
 
-All models support two modes:
-- forward(): Sequential prediction for training on delayed reward sequences
-- forward_markovian(): Markovian prediction for test time (reward depends only on current s,a)
+  E-step (no gradient): Compute per-step soft targets with inverse-variance weights
+      t̃ₜ = μₜ + (Yᵥ - Σⱼ μⱼ) · wₜ,  wₜ = (1/σ̂ₜ²) / Σⱼ (1/σ̂ⱼ²)
+  where μₜ = f_θ(sₜ, aₜ) and σ̂ₜ² is a running per-position variance estimate.
+  Under equal variance this reduces to the uniform correction (Yᵥ - Σⱼ μⱼ) / D.
 
-Usage Example:
-    # Feedforward (Each step is independent)
-    model = RNetwork(state_dim=4, action_dim=2, hidden_dim=256)
-    # The last variable indicates termination
-    # Sequential input: (batch_size, seq_len, state_dim), (batch_size, seq_len, action_dim), (batch_size, seq_len, 1)
-    rewards = model(states, actions)  # Output: (batch_size, seq_len, 1)
-    # Markovian input: (batch_size, state_dim), (batch_size, action_dim), (batch_size, 1)
-    reward = model.forward_markovian(state, action)  # Output: (batch_size, 1)
+  M-step for σ² (no gradient): EMA update of per-position noise variance
+      σ̂ₜ² ← (1 − α) σ̂ₜ² + α · mean_batch((f_θ(sₜ, aₜ) − t̃ₜ)²)
+  Initialised to 1 (equal variance). α = noise_ema_alpha.
 
-All models output per-step reward predictions that are summed during training
-to match the delayed aggregate reward signal.
+  M-step for θ (backward pass): Minimise per-step MSE against soft targets, masked
+  to exclude zero-padded positions:
+      L_reward = (1 / D) · Σₜ maskₜ · (f_θ(sₜ, aₜ) - t̃ₜ)²
+
+The return-consistency regularisation from est_o2 is preserved:
+  L_regu = MSE(start_return + Σₜ maskₜ · f̂(sₜ, aₜ), end_return)
+
+Both est_o2 and est_o3 share the same fixed points (Σₜ f̂(sₜ,aₜ) = Yᵥ); the
+per-position variance M-step lets the E-step correction reflect heteroscedastic
+noise rather than assuming every position has equal variance.
 """
 
 import argparse
@@ -46,7 +50,7 @@ from torch.utils import data, tensorboard
 from drmdp import dataproc, ray_utils, rewdelay
 
 # Spec version identifier
-SPEC = "o2"
+SPEC = "o3"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +70,9 @@ class TrainingArgs:
         output_dir: Directory for model checkpoints and metrics.
         num_runs: Number of independent runs (one seed per run).
         regu_lam: Weight for the return-consistency regularization term (λ ∈ [0, 1]).
+        noise_ema_alpha: EMA decay for the per-position variance M-step (α ∈ (0, 1]).
+            Larger values track recent residuals more aggressively; smaller values
+            smooth more slowly. Set to 0 to disable variance updates (equal-variance).
         local_eager_mode: If True, run experiments in-process; otherwise submit via Ray.
         seed: Random seed for reproducibility. None uses a default.
     """
@@ -82,6 +89,7 @@ class TrainingArgs:
     output_dir: str
     num_runs: int
     regu_lam: float
+    noise_ema_alpha: float
     local_eager_mode: bool
     reward_model_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     seed: Optional[int] = None
@@ -119,7 +127,7 @@ class RNetwork(nn.Module):
             term: Tensor of shape (batch_size, time step, 1)
 
         Returns:
-            reward: Tensor of shape (batch_size, 1)
+            reward: Tensor of shape (batch_size, seq_len, 1)
         """
         out = torch.concat([state, action, term], dim=-1)
         out = torch.pow(torch.unsqueeze(out, -1), self.powers)
@@ -159,7 +167,10 @@ def collate_variable_length_sequences(batch):
         batch: List of (inputs_dict, labels_dict) tuples
 
     Returns:
-        (batched_inputs_dict, batched_labels_dict) with padded sequences
+        (batched_inputs_dict, batched_labels_dict) with padded sequences.
+        batched_labels_dict includes 'seq_lengths' (LongTensor of shape (batch,))
+        containing the actual (unpadded) length of each sequence, required by
+        the EM E-step to distribute residuals by true window length.
     """
     inputs_list, labels_list = zip(*batch)
 
@@ -195,6 +206,7 @@ def collate_variable_length_sequences(batch):
         ),
         "start_return": torch.stack([labels["start_return"] for labels in labels_list]),
         "end_return": torch.stack([labels["end_return"] for labels in labels_list]),
+        "seq_lengths": torch.tensor(seq_lengths, dtype=torch.long),
     }
 
     # Pad per_step_rewards to match max_seq_len
@@ -218,7 +230,7 @@ def create_training_buffer(
     env, delay: rewdelay.RewardDelay, buffer_num_steps: int, seed: Optional[int] = None
 ):
     """
-    Collects example of (s,a,s',r,d) from an environment.
+    Collects examples of (s,a,s',r,d) from an environment.
     """
     buffer = dataproc.collection_traj_data(
         env, steps=buffer_num_steps, include_term=True, seed=seed
@@ -242,11 +254,12 @@ def delayed_reward_data(buffer, delay: rewdelay.RewardDelay):
     Returns:
         List of tuples (inputs, labels) where:
             - inputs: Dict with batched tensors of 'state', 'action', 'term'
-            - labels: Dict with 'aggregate_reward' (sum) and 'per_step_rewards' (list)
+            - labels: Dict with 'aggregate_reward' (sum), 'per_step_rewards' (list),
+              'start_return', 'end_return'
 
     Note:
-        Assumes actions are continuous or intended to be used as is.
         Sequences shorter than the sampled delay are discarded.
+        Windows never span episode boundaries.
     """
 
     def create_traj_step(state, action, reward, term):
@@ -354,8 +367,8 @@ def evaluate_model(
     """
     Evaluate model using Markovian predictions.
 
-    For each sequence, predicts reward for each (state, action, term) tuple independently,
-    then sums predictions to compare with aggregate reward.
+    For each sequence, predicts reward for each (state, action, term) tuple
+    independently, then sums predictions to compare with aggregate reward.
 
     Args:
         model: Trained model
@@ -366,7 +379,7 @@ def evaluate_model(
         collect_predictions: Whether to collect detailed predictions for analysis.
             If False, only MSE is computed (faster, less memory).
         max_batches: Maximum number of batches to evaluate. If None, evaluates
-            entire dataset. Useful for quick checks during training.
+            entire dataset.
         shuffle: Whether to shuffle the test dataloader
 
     Returns:
@@ -393,17 +406,16 @@ def evaluate_model(
             # Predict reward for each (state, action, term) tuple independently
             per_step_predictions = []
             for step_idx in range(seq_len):
-                # Extract (state, action, term) at timestep step_idx for all sequences in batch
+                # Extract (state, action, term) at timestep step_idx
                 state_t = inputs["state"][:, step_idx, :]  # (batch_size, state_dim)
                 action_t = inputs["action"][:, step_idx, :]  # (batch_size, action_dim)
                 term_t = inputs["term"][:, step_idx, :]  # (batch_size, 1)
 
-                # Add sequence dimension for RNN/Transformer models
+                # Add sequence dimension
                 state_seq = state_t.unsqueeze(1)  # (batch_size, 1, state_dim)
                 action_seq = action_t.unsqueeze(1)  # (batch_size, 1, action_dim)
                 term_seq = term_t.unsqueeze(1)  # (batch_size, 1, 1)
 
-                # Forward pass - returns (batch_size, 1, 1) for RNN/Transformer, (batch_size, 1) for MLP
                 reward_t = model(state_seq, action_seq, term_seq)
                 if reward_t.dim() == 3:
                     reward_t = reward_t.squeeze(1)  # (batch_size, 1)
@@ -413,11 +425,8 @@ def evaluate_model(
             predictions = torch.stack(per_step_predictions, dim=1)
 
             # Sum predictions across sequence to get aggregate reward
-            # Use squeeze(-1) to only squeeze the last dimension, preserving batch dimension
             pred_window_reward = torch.sum(predictions, dim=1).squeeze(-1)
 
-            # Extract aggregate rewards from batched label dict
-            # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
             aggregate_rewards = labels["aggregate_reward"].float()
             reward_mse = eval_criterion(pred_window_reward, aggregate_rewards)
             regu_mse = regu_criterion(
@@ -428,7 +437,6 @@ def evaluate_model(
             errors["regu"].append(regu_mse)
             errors["total"].append(mean_squared_error)
 
-            # Optionally collect predictions for analysis
             if collect_predictions:
                 for batch_idx in range(batch_size_actual):
                     per_step_rewards = (
@@ -449,7 +457,6 @@ def evaluate_model(
                         }
                     )
 
-            # Stop early if max_batches is specified
             if max_batches is not None and idx + 1 >= max_batches:
                 break
 
@@ -546,10 +553,19 @@ def train(
     seed: Optional[int] = None,
     model_type: str = "mlp",
     output_dir: str = "outputs",
+    max_seq_len: Optional[int] = None,
+    noise_ema_alpha: float = 0.1,
     on_batch_end: Optional[Callable[[Mapping[str, float]], None]] = None,
 ):
     """
-    Train a reward prediction model.
+    Train a reward prediction model using Expectation-Maximisation.
+
+    Each batch update performs three steps:
+      1. E-step (no_grad): compute per-step soft targets using inverse-variance weights
+         derived from the current per-position noise variance estimates.
+      2. M-step for σ² (no_grad): update per-position variance via EMA of squared
+         residuals from the E-step.
+      3. M-step for θ (backward): gradient update against the soft targets.
 
     Args:
         env: Gymnasium environment.
@@ -562,6 +578,14 @@ def train(
         seed: Random seed for weight initialisation and data splitting.
         model_type: Model architecture to use ("mlp").
         output_dir: Directory for model checkpoints, metrics, and predictions.
+        max_seq_len: Maximum possible sequence length across the full dataset, used
+            to pre-allocate the per-position variance buffer. If None, derived from
+            the dataset by scanning all examples.
+        noise_ema_alpha: EMA decay for the per-position variance M-step. Set to 0
+            to skip variance updates (equal-variance fallback).
+        on_batch_end: Optional callback invoked after every batch update with a dict
+            containing {"reward": float, "regu": float, "total": float} loss values.
+            Useful for testing and monitoring training dynamics.
 
     Returns:
         Tuple of (final_mse, predictions_list) where final_mse is a dict with
@@ -571,6 +595,12 @@ def train(
     logging.info("Training with seed: %s", seed)
     torch.manual_seed(seed if seed is not None else 127)
     train_ds, test_ds = data.random_split(dataset, lengths=[0.7, 0.3])
+
+    # Per-position noise variance buffer for the variance M-step.
+    # Initialised to 1 (equal variance) so the E-step starts with uniform weights.
+    if max_seq_len is None:
+        max_seq_len = max(inp["state"].shape[0] for inp, _ in dataset)
+    sigma_sq = torch.ones(max_seq_len)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
@@ -582,12 +612,10 @@ def train(
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'mlp'.")
 
-    logging.info("Training with %s model", model_type.upper())
+    logging.info("Training with %s model (EM)", model_type.upper())
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.MSELoss()
     regu_criterion = nn.MSELoss()
 
-    # Training Loop
     train_losses = []
     eval_losses: Dict[str, List[float]] = collections.defaultdict(list)
 
@@ -599,30 +627,48 @@ def train(
                 shuffle=True,
                 collate_fn=collate_variable_length_sequences,
             )
-            # Training
+
             epoch_losses = collections.defaultdict(list)
             for inputs, labels in train_dataloader:
-                # Forward pass (models handle zero stub internally for RNN/Transformer)
-                outputs = model(**inputs)
+                seq_lengths = labels["seq_lengths"]  # (batch,)
+                aggregate_rewards = labels["aggregate_reward"].float()  # (batch,)
+                batch_seq_len = inputs["state"].shape[1]
 
-                # Calculate loss for each seq in batch
-                # outputs shape: (batch_size, seq_len, 1)
-                # Use squeeze(-1) to only squeeze the last dimension, preserving batch dimension
-                window_reward = torch.sum(outputs, dim=1).squeeze(-1)
+                # Mask: True for actual steps, False for padding
+                mask = create_sequence_mask(
+                    seq_lengths, batch_seq_len
+                )  # (batch, seq_len)
 
-                # Extract aggregate rewards from batched label dict
-                # DataLoader collates dicts, so labels["aggregate_reward"] is already a tensor
-                aggregate_rewards = labels["aggregate_reward"].float()
+                # E-step: compute per-step soft targets without gradient
+                soft_targets = compute_soft_targets(
+                    model, inputs, seq_lengths, aggregate_rewards, mask, sigma_sq
+                )  # (batch, seq_len)
+
+                # M-step for θ: regress model against soft targets
+                outputs = model(**inputs)  # (batch, seq_len, 1)
+                per_step_preds = outputs.squeeze(-1)  # (batch, seq_len)
+
+                # Masked per-step MSE against soft targets
+                sq_err = (per_step_preds - soft_targets) ** 2  # (batch, seq_len)
+                reward_loss = (sq_err * mask.float()).sum() / mask.float().sum()
+
+                # Window reward for return regularization (masked sum over actual steps)
+                window_reward = (per_step_preds * mask.float()).sum(dim=1)  # (batch,)
                 regu_loss = regu_criterion(
                     labels["start_return"] + window_reward, labels["end_return"]
                 )
-                reward_loss = criterion(window_reward, aggregate_rewards)
+
                 loss = reward_loss + (regu_lam * regu_loss)
 
-                # Backward and optimize
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+                # M-step for σ²: see _update_sigma_sq
+                if noise_ema_alpha > 0:
+                    _update_sigma_sq(
+                        sigma_sq, per_step_preds, soft_targets, mask, noise_ema_alpha
+                    )
 
                 epoch_losses["reward"].append(reward_loss.item())
                 epoch_losses["regu"].append(regu_loss.item())
@@ -639,7 +685,6 @@ def train(
             # Mean loss for the epoch
             avg_train_loss = np.mean(epoch_losses["total"]).item()
             train_losses.append(avg_train_loss)
-            # Epoch results
             for key in ("reward", "regu", "total"):
                 summary_writer.add_scalar(
                     f"MSE/train/{key}", np.mean(epoch_losses[key]), global_step=epoch
@@ -731,8 +776,6 @@ def train(
 
         # Save model
         model_file = os.path.join(output_dir, f"model_{model_type}.pt")
-        # torch.save requires a real file path, not a file handle
-        # First save to temporary buffer, then write to GFile
         buffer = io.BytesIO()
         torch.save(model.state_dict(), buffer)
         buffer.seek(0)
@@ -754,7 +797,6 @@ def train(
             reward_model_kwargs=reward_model_kwargs,
         )
 
-        # Save config and final metrics
         summary_writer.add_hparams(
             hparam_dict=hparams,
             metric_dict={
@@ -762,18 +804,123 @@ def train(
                 **{f"rmse.{key}": value for key, value in final_rmse.items()},
             },
         )
-        # Create sample input for graph tracing
         sample_input = (
-            # state
             torch.zeros(1, 1, obs_dim),
-            # action
             torch.zeros(1, 1, act_dim),
-            # term
             torch.zeros(1, 1, 1),
         )
         summary_writer.add_graph(model, sample_input)
 
     return final_mse, predictions_list
+
+
+def create_sequence_mask(seq_lengths: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    """Create a boolean mask for valid (non-padded) sequence positions.
+
+    Args:
+        seq_lengths: LongTensor of shape (batch,) with the actual length of each sequence.
+        max_seq_len: Total (padded) sequence length.
+
+    Returns:
+        BoolTensor of shape (batch, max_seq_len) where entry [b, t] is True if
+        position t is within the actual sequence for example b.
+    """
+    position_indices = torch.arange(max_seq_len).unsqueeze(0)  # (1, max_seq_len)
+    return position_indices < seq_lengths.unsqueeze(1)  # (batch, max_seq_len)
+
+
+def compute_soft_targets(
+    model: nn.Module,
+    inputs: Mapping[str, torch.Tensor],
+    seq_lengths: torch.Tensor,
+    aggregate_rewards: torch.Tensor,
+    mask: torch.Tensor,
+    sigma_sq: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """E-step: compute per-step soft targets by distributing the window residual.
+
+    For each window of length D with observed aggregate Yᵥ and current predictions
+    μₜ = f_θ(sₜ, aₜ), the soft target is:
+
+        t̃ₜ = μₜ + (Yᵥ - Σⱼ μⱼ) · wₜ
+
+    where wₜ = (1/σ̂ₜ²) / Σⱼ (1/σ̂ⱼ²) are inverse-variance weights derived from
+    the per-position noise variance estimates σ̂ₜ². Steps with lower variance
+    receive a larger share of the residual correction. Under equal variance all
+    weights equal 1/D, recovering the uniform formula from est_o2.
+
+    Args:
+        model: Current reward model.
+        inputs: Dict with tensors 'state', 'action', 'term' of shape
+            (batch, max_seq_len, dim).
+        seq_lengths: LongTensor of shape (batch,) with actual window lengths.
+        aggregate_rewards: FloatTensor of shape (batch,) with observed aggregates.
+        mask: BoolTensor of shape (batch, max_seq_len) masking actual positions.
+        sigma_sq: Optional FloatTensor of shape (global_max_seq_len,) with running
+            per-position noise variance estimates. If None, falls back to the
+            equal-variance uniform distribution.
+
+    Returns:
+        FloatTensor of shape (batch, max_seq_len). Values at padded positions
+        are present but should be excluded via mask in the M-step loss.
+    """
+    with torch.no_grad():
+        outputs_old = model(**inputs)  # (batch, seq_len, 1)
+        mu = outputs_old.squeeze(-1)  # (batch, seq_len)
+        window_mu = (mu * mask.float()).sum(dim=1)  # (batch,)
+        residual = aggregate_rewards - window_mu  # (batch,)
+
+        if sigma_sq is None:
+            # Equal-variance fallback: uniform residual distribution
+            delta = (residual / seq_lengths.float()).unsqueeze(1)  # (batch, 1)
+            return mu + delta.expand_as(mu)
+
+        # Heteroscedastic: inverse-variance weighted distribution
+        batch_seq_len = mu.shape[1]
+        # Slice to batch seq length and expand to (batch, batch_seq_len)
+        inv_var = (1.0 / (sigma_sq[:batch_seq_len] + 1e-8)).unsqueeze(0)
+        inv_var = inv_var * mask.float()  # zero out padded positions
+        total_inv_var = inv_var.sum(dim=1, keepdim=True)  # (batch, 1)
+        weights = inv_var / (total_inv_var + 1e-8)  # (batch, batch_seq_len)
+        return mu + residual.unsqueeze(1) * weights
+
+
+def _update_sigma_sq(
+    sigma_sq: torch.Tensor,
+    per_step_preds: torch.Tensor,
+    soft_targets: torch.Tensor,
+    mask: torch.Tensor,
+    noise_ema_alpha: float,
+) -> None:
+    """M-step for σ²: EMA update of per-position noise variance.
+
+    Updates sigma_sq in-place using squared residuals between the pre-update
+    predictions and the E-step soft targets. Using pre-update predictions keeps
+    the variance estimate consistent with the soft targets from the same forward pass.
+
+    Args:
+        sigma_sq: FloatTensor of shape (global_max_seq_len,). Updated in-place.
+        per_step_preds: FloatTensor of shape (batch, batch_seq_len) — pre-update
+            per-step reward predictions (detached from the computation graph).
+        soft_targets: FloatTensor of shape (batch, batch_seq_len) from the E-step.
+        mask: BoolTensor of shape (batch, batch_seq_len) masking actual positions.
+        noise_ema_alpha: EMA decay coefficient α ∈ (0, 1].
+    """
+    with torch.no_grad():
+        sq_residuals = (per_step_preds.detach() - soft_targets) ** 2
+        mask_float = mask.float()
+        num_valid = mask_float.sum(dim=0)  # (batch_seq_len,)
+        pos_mean_sq = (sq_residuals * mask_float).sum(dim=0) / (num_valid + 1e-8)
+        # Only update positions that appeared in this batch
+        update_wt = torch.where(
+            num_valid > 0,
+            torch.tensor(noise_ema_alpha),
+            torch.tensor(0.0),
+        )
+        batch_seq_len = per_step_preds.shape[1]
+        sigma_sq[:batch_seq_len] = (1.0 - update_wt) * sigma_sq[
+            :batch_seq_len
+        ] + update_wt * pos_mean_sq
 
 
 def experiment(args: TrainingArgs):
@@ -783,11 +930,9 @@ def experiment(args: TrainingArgs):
         args: Training configuration and hyperparameters.
     """
     logging.basicConfig(level=logging.INFO)
-    # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
     logging.info("Spec: %s", args)
 
-    # Create delay and training buffer
     delay = rewdelay.ClippedPoissonDelay(args.delay, min_delay=2)
     _, max_delay = delay.range()
     logging.info(
@@ -803,12 +948,9 @@ def experiment(args: TrainingArgs):
     )
     logging.info("Created %d training examples", len(training_buffer))
 
-    # Create dataset
     inputs, labels = zip(*training_buffer)
-    # Store raw examples instead of pre-collated tensors
     dataset = DictDataset(inputs=list(inputs), labels=list(labels))
 
-    # Train model(s)
     if args.model_type == "mlp":
         logging.info("=" * 80)
         logging.info("Training MLP")
@@ -824,6 +966,8 @@ def experiment(args: TrainingArgs):
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
             seed=args.seed,
+            max_seq_len=max_delay,
+            noise_ema_alpha=args.noise_ema_alpha,
         )
 
 
@@ -837,7 +981,6 @@ def run_fn(args: TrainingArgs):
         experiment(args)
     except Exception as err:
         logging.error("Error in task %s: %s", args.seed, err)
-        # Fail job for ray status reporting
         sys.exit(1)
 
 
@@ -868,7 +1011,6 @@ def main():
                 args, output_dir=seed_output_path, seed=seed
             )
             if args.local_eager_mode:
-                # run locally in earger mode
                 experiment(seed_args)
             else:
                 tasks.append(run_fn.remote(seed_args))
@@ -883,7 +1025,7 @@ def parse_args() -> TrainingArgs:
         TrainingArgs populated from command-line flags.
     """
     parser = argparse.ArgumentParser(
-        description="Train reward prediction models for delayed feedback"
+        description="Train EM reward prediction models for delayed feedback"
     )
     parser.add_argument(
         "--model-type",
@@ -951,9 +1093,15 @@ def parse_args() -> TrainingArgs:
         "--regu-lam",
         type=float,
         default=1.0,
-        help="Weight of regualirisation. lam in [0, 1]",
+        help="Weight of regularisation. lam in [0, 1]",
     )
     parser.add_argument("--local-eager-mode", action="store_true", default=False)
+    parser.add_argument(
+        "--noise-ema-alpha",
+        type=float,
+        default=0.1,
+        help="EMA decay for per-position variance M-step (0 < α ≤ 1). Set to 0 to disable.",
+    )
     parser.add_argument(
         "--reward-model-kwargs",
         nargs="*",
