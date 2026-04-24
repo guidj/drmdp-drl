@@ -62,7 +62,7 @@ class TrainingArgs:
         sac_buffer_size: Capacity of SAC's replay buffer.
         sac_batch_size: Mini-batch size for SAC gradient updates.
         sac_gradient_steps: Gradient steps per env step (-1 = match collected).
-        log_episode_frequency: Log to ExperimentLogger every N episodes.
+        log_step_frequency: Log to ExperimentLogger every N environment steps.
         output_dir: Directory for logs and the saved SAC model.
         seed: Random seed for reproducibility.
         agent_type: Agent algorithm. "sac" uses standard SAC with a reward
@@ -84,7 +84,7 @@ class TrainingArgs:
     sac_buffer_size: int
     sac_batch_size: int
     sac_gradient_steps: int
-    log_episode_frequency: int
+    log_step_frequency: int
     output_dir: str
     seed: Optional[int] = None
     agent_type: str = "sac"
@@ -106,7 +106,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         reward_model: base.RewardModel,
         update_every_n_steps: int,
         clear_buffer_on_update: bool,
-        log_episode_frequency: int,
+        log_step_frequency: int,
         exp_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
@@ -114,7 +114,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._reward_model = reward_model
         self._update_every_n_steps = update_every_n_steps
         self._clear_buffer_on_update = clear_buffer_on_update
-        self._log_episode_frequency = log_episode_frequency
+        self._log_step_frequency = log_step_frequency
         self._exp_logger = exp_logger
 
         self._episode_obs: List[np.ndarray] = []
@@ -123,6 +123,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._episode_terminals: List[bool] = []
         self._episode_steps: int = 0
         self._episode_count: int = 0
+        self._last_log_steps: int = 0
 
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
@@ -167,7 +168,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._pending_trajectories.append(trajectory)
         self._episode_count += 1
 
-        if self._episode_count % self._log_episode_frequency == 0:
+        if self.num_timesteps - self._last_log_steps >= self._log_step_frequency:
             true_episode_return = float(
                 self.locals["infos"][0].get("true_episode_return", 0.0)
             )
@@ -179,6 +180,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             self._exp_logger.log(
                 episode=self._episode_count,
                 steps=self._episode_steps,
+                global_steps=self.num_timesteps,
                 returns=true_episode_return,
                 info={
                     "sac_total_steps": self.num_timesteps,
@@ -188,6 +190,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
                     "reward_model": dict(self._last_model_metrics),
                 },
             )
+            self._last_log_steps = self.num_timesteps
 
         self._episode_obs = []
         self._episode_actions = []
@@ -216,16 +219,17 @@ class _HCLoggingCallback(callbacks.BaseCallback):
 
     def __init__(
         self,
-        log_episode_frequency: int,
+        log_step_frequency: int,
         exp_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
         super().__init__(verbose)
-        self._log_episode_frequency = log_episode_frequency
+        self._log_step_frequency = log_step_frequency
         self._exp_logger = exp_logger
         self._episode_steps: int = 0
         self._episode_count: int = 0
         self._episode_rewards: List[float] = []
+        self._last_log_steps: int = 0
 
     def _on_step(self) -> bool:
         self._episode_steps += 1
@@ -236,7 +240,7 @@ class _HCLoggingCallback(callbacks.BaseCallback):
 
     def _on_episode_end(self) -> None:
         self._episode_count += 1
-        if self._episode_count % self._log_episode_frequency == 0:
+        if self.num_timesteps - self._last_log_steps >= self._log_step_frequency:
             true_episode_return = float(
                 self.locals["infos"][0].get("true_episode_return", 0.0)
             )
@@ -244,12 +248,14 @@ class _HCLoggingCallback(callbacks.BaseCallback):
             self._exp_logger.log(
                 episode=self._episode_count,
                 steps=self._episode_steps,
+                global_steps=self.num_timesteps,
                 returns=true_episode_return,
                 info={
                     "hc_total_steps": self.num_timesteps,
                     "delayed_returns": delayed_returns,
                 },
             )
+            self._last_log_steps = self.num_timesteps
         self._episode_steps = 0
         self._episode_rewards = []
 
@@ -300,12 +306,12 @@ def _run_sac(
         reward_model=reward_model,
         update_every_n_steps=args.update_every_n_steps,
         clear_buffer_on_update=args.clear_buffer_on_update,
-        log_episode_frequency=args.log_episode_frequency,
+        log_step_frequency=args.log_step_frequency,
         exp_logger=exp_logger,
     )
     sac.learn(
         total_timesteps=args.num_steps,
-        log_interval=args.log_episode_frequency,
+        log_interval=4,
         callback=callback,
         progress_bar=True,
     )
@@ -341,12 +347,12 @@ def _run_hc(
         **remaining_kwargs,
     )
     callback = _HCLoggingCallback(
-        log_episode_frequency=args.log_episode_frequency,
+        log_step_frequency=args.log_step_frequency,
         exp_logger=exp_logger,
     )
     agent.learn(
         total_timesteps=args.num_steps,
-        log_interval=args.log_episode_frequency,
+        log_interval=4,
         callback=callback,
         progress_bar=True,
     )
@@ -555,7 +561,7 @@ def _default_training_args() -> Mapping[str, Any]:
         "sac_buffer_size": 100_000,
         "sac_batch_size": 256,
         "sac_gradient_steps": -1,
-        "log_episode_frequency": 10,
+        "log_step_frequency": 10_000,
         "output_dir": tempfile.gettempdir(),
         "seed": None,
         "agent_type": "sac",
@@ -662,10 +668,10 @@ def parse_args() -> TrainingArgs:
         help="Gradient steps per env step (-1 = match collected steps)",
     )
     parser.add_argument(
-        "--log-episode-frequency",
+        "--log-step-frequency",
         type=int,
-        default=10,
-        help="Log to ExperimentLogger every N episodes",
+        default=10000,
+        help="Log to ExperimentLogger every N environment steps",
     )
     parser.add_argument(
         "--output-dir",

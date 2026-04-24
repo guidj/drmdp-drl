@@ -79,6 +79,7 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         self,
         episode: int,
         steps: int,
+        global_steps: int,
         returns: float,
         info: Optional[Mapping[str, Any]] = None,
     ):
@@ -88,6 +89,7 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         entry = {
             "episode": episode,
             "steps": steps,
+            "global_steps": global_steps,
             "returns": returns,
             "info": info,
         }

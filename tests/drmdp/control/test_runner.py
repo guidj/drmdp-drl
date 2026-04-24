@@ -112,9 +112,13 @@ class TestRewardModelUpdateCallback:
         assert sac.replay_buffer.reset_count == 0
 
     def test_logger_called_at_log_frequency(self):
-        """ExperimentLogger.log() is called every log_episode_frequency episodes."""
+        """ExperimentLogger.log() fires at every log_step_frequency env steps.
+
+        4 episodes × 3 steps = 12 total steps; with log_step_frequency=6
+        the threshold is crossed at step 6 (end of ep 2) and step 12 (end of ep 4).
+        """
         exp_logger = _MockLogger()
-        callback = _build_callback(log_freq=2, exp_logger=exp_logger)
+        callback = _build_callback(log_step_freq=6, exp_logger=exp_logger)
         sac = _make_mock_sac()
         obs = np.zeros(3, dtype=np.float32)
         action = np.zeros(1, dtype=np.float32)
@@ -214,7 +218,7 @@ class TestRun:
             sac_buffer_size=1000,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_episode_frequency=1,
+            log_step_frequency=50,
             output_dir=output_dir,
             seed=42,
         )
@@ -249,10 +253,13 @@ class TestHCLoggingCallback:
         assert callback._episode_rewards == []
 
     def test_logger_called_at_log_frequency(self):
+        """Logs only when enough steps have elapsed since the last log.
+
+        4 steps total, done at steps 2 and 4; with log_step_frequency=4
+        only step 4 crosses the threshold.
+        """
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(
-            log_episode_frequency=2, exp_logger=log_mock
-        )
+        callback = runner._HCLoggingCallback(log_step_frequency=4, exp_logger=log_mock)
         for timestep in range(1, 5):
             done = timestep % 2 == 0
             self._step_hc(
@@ -267,9 +274,7 @@ class TestHCLoggingCallback:
     def test_delayed_returns_logged_as_sum_of_rewards(self):
         """delayed_returns in logged info equals sum of per-step rewards for the episode."""
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(
-            log_episode_frequency=1, exp_logger=log_mock
-        )
+        callback = runner._HCLoggingCallback(log_step_frequency=3, exp_logger=log_mock)
         rewards = [1.5, 2.5, 0.5]
         for idx, reward in enumerate(rewards):
             done = idx == len(rewards) - 1
@@ -289,9 +294,7 @@ class TestHCLoggingCallback:
     def test_delayed_returns_reset_between_episodes(self):
         """Each episode's delayed_returns reflects only that episode's rewards."""
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(
-            log_episode_frequency=1, exp_logger=log_mock
-        )
+        callback = runner._HCLoggingCallback(log_step_frequency=2, exp_logger=log_mock)
         for idx, reward in enumerate([1.0, 2.0]):
             callback.num_timesteps = idx + 1
             callback.locals = {
@@ -316,7 +319,7 @@ class TestHCLoggingCallback:
     def _build_hc_callback(self, log_freq: int = 1) -> runner._HCLoggingCallback:
         exp_logger = _MockLogger()
         return runner._HCLoggingCallback(
-            log_episode_frequency=log_freq,
+            log_step_frequency=log_freq,
             exp_logger=exp_logger,  # type: ignore[arg-type]
         )
 
@@ -358,7 +361,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_episode_frequency=1,
+            log_step_frequency=50,
             output_dir=str(tmp_path),
             seed=None,
         )
@@ -379,7 +382,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_episode_frequency=1,
+            log_step_frequency=50,
             output_dir=str(tmp_path),
             seed=None,
         )
@@ -400,7 +403,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_episode_frequency=1,
+            log_step_frequency=50,
             output_dir=str(tmp_path),
             seed=None,
         )
@@ -422,7 +425,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_episode_frequency=1,
+            log_step_frequency=50,
             output_dir=str(tmp_path),
             seed=None,
         )
@@ -693,7 +696,7 @@ class TestRunBatch:
                 sac_buffer_size=1000,
                 sac_batch_size=32,
                 sac_gradient_steps=1,
-                log_episode_frequency=1,
+                log_step_frequency=50,
                 output_dir=str(tmp_path),
                 seed=idx,
             )
@@ -719,7 +722,7 @@ class TestRunBatch:
                 sac_buffer_size=1000,
                 sac_batch_size=32,
                 sac_gradient_steps=1,
-                log_episode_frequency=1,
+                log_step_frequency=50,
                 output_dir=str(tmp_path),
                 seed=idx,
             )
@@ -761,7 +764,7 @@ class TestRunBatch:
             sac_buffer_size=1000,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_episode_frequency=1,
+            log_step_frequency=50,
             output_dir=str(tmp_path),
         )
         with patch("drmdp.control.runner.run") as mock_run:
@@ -853,11 +856,18 @@ class _MockLogger:
         self,
         episode: int,
         steps: int,
+        global_steps: int,
         returns: float,
         info: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.log_calls.append(
-            {"episode": episode, "steps": steps, "returns": returns, "info": info}
+            {
+                "episode": episode,
+                "steps": steps,
+                "global_steps": global_steps,
+                "returns": returns,
+                "info": info,
+            }
         )
 
 
@@ -865,7 +875,7 @@ def _build_callback(
     reward_model: Optional[base.RewardModel] = None,
     update_every: int = 100,
     clear_buffer: bool = False,
-    log_freq: int = 1,
+    log_step_freq: int = 6,
     exp_logger: Any = None,
 ) -> runner.RewardModelUpdateCallback:
     """Construct a callback with sensible defaults for unit testing."""
@@ -877,7 +887,7 @@ def _build_callback(
         reward_model=reward_model,
         update_every_n_steps=update_every,
         clear_buffer_on_update=clear_buffer,
-        log_episode_frequency=log_freq,
+        log_step_frequency=log_step_freq,
         exp_logger=exp_logger,
     )
 
