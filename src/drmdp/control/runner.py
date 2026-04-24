@@ -229,9 +229,11 @@ class _HCLoggingCallback(callbacks.BaseCallback):
         self._exp_logger = exp_logger
         self._episode_steps: int = 0
         self._episode_count: int = 0
+        self._episode_rewards: List[float] = []
 
     def _on_step(self) -> bool:
         self._episode_steps += 1
+        self._episode_rewards.append(float(self.locals["rewards"][0]))
         if bool(self.locals["dones"][0]):
             self._on_episode_end()
         return True
@@ -242,13 +244,18 @@ class _HCLoggingCallback(callbacks.BaseCallback):
             true_episode_return = float(
                 self.locals["infos"][0].get("true_episode_return", 0.0)
             )
+            delayed_returns = float(sum(self._episode_rewards))
             self._exp_logger.log(
                 episode=self._episode_count,
                 steps=self._episode_steps,
                 returns=true_episode_return,
-                info={"hc_total_steps": self.num_timesteps},
+                info={
+                    "hc_total_steps": self.num_timesteps,
+                    "delayed_returns": delayed_returns,
+                },
             )
         self._episode_steps = 0
+        self._episode_rewards = []
 
 
 def run(args: TrainingArgs) -> None:

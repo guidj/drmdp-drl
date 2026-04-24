@@ -245,11 +245,13 @@ class TestHCLoggingCallback:
         done: bool,
         timestep: int,
         return_val: float = 1.0,
+        reward: float = 0.0,
     ) -> bool:
         callback.num_timesteps = timestep
         callback.locals = {
             "dones": np.array([done]),
             "infos": [{"true_episode_return": return_val}],
+            "rewards": np.array([reward]),
         }
         return callback._on_step()
 
@@ -269,21 +271,80 @@ class TestHCLoggingCallback:
         self._step_hc(callback, done=True, timestep=2)
         assert callback._episode_steps == 0
 
+    def test_episode_rewards_reset_after_done(self):
+        callback = self._build_hc_callback()
+        self._step_hc(callback, done=False, timestep=1, reward=2.0)
+        self._step_hc(callback, done=True, timestep=2, reward=3.0)
+        assert callback._episode_rewards == []
+
     def test_logger_called_at_log_frequency(self):
         log_mock = _MockLogger()
         callback = runner._HCLoggingCallback(
             log_episode_frequency=2, exp_logger=log_mock
         )
         for timestep in range(1, 5):
+            # done at timestep 2 (episode 1) and timestep 4 (episode 2)
             done = timestep % 2 == 0
-            callback.num_timesteps = timestep
+            self._step_hc(
+                callback,
+                done=done,
+                timestep=timestep,
+                return_val=1.0,
+                reward=1.0,
+            )
+        # log_episode_frequency=2 → only episode 2 triggers logging
+        assert len(log_mock.log_calls) == 1
+
+    def test_delayed_returns_logged_as_sum_of_rewards(self):
+        """delayed_returns in logged info equals sum of per-step rewards for the episode."""
+        log_mock = _MockLogger()
+        callback = runner._HCLoggingCallback(
+            log_episode_frequency=1, exp_logger=log_mock
+        )
+        rewards = [1.5, 2.5, 0.5]
+        for idx, reward in enumerate(rewards):
+            done = idx == len(rewards) - 1
+            callback.num_timesteps = idx + 1
             callback.locals = {
                 "dones": np.array([done]),
-                "infos": [{"true_episode_return": 1.0}],
+                "infos": [{"true_episode_return": 10.0}],
+                "rewards": np.array([reward]),
             }
             callback._on_step()
-        # Episodes 1 and 2 done; log at every 2 → only episode 2 logged
+
         assert len(log_mock.log_calls) == 1
+        logged_info = log_mock.log_calls[0]["info"]
+        assert "delayed_returns" in logged_info
+        assert logged_info["delayed_returns"] == 4.5
+
+    def test_delayed_returns_reset_between_episodes(self):
+        """Each episode's delayed_returns reflects only that episode's rewards."""
+        log_mock = _MockLogger()
+        callback = runner._HCLoggingCallback(
+            log_episode_frequency=1, exp_logger=log_mock
+        )
+        # Episode 1: rewards sum to 3.0
+        for idx, reward in enumerate([1.0, 2.0]):
+            callback.num_timesteps = idx + 1
+            callback.locals = {
+                "dones": np.array([idx == 1]),
+                "infos": [{"true_episode_return": 0.0}],
+                "rewards": np.array([reward]),
+            }
+            callback._on_step()
+
+        # Episode 2: rewards sum to 10.0
+        for idx, reward in enumerate([4.0, 6.0]):
+            callback.num_timesteps = idx + 3
+            callback.locals = {
+                "dones": np.array([idx == 1]),
+                "infos": [{"true_episode_return": 0.0}],
+                "rewards": np.array([reward]),
+            }
+            callback._on_step()
+
+        assert log_mock.log_calls[0]["info"]["delayed_returns"] == 3.0
+        assert log_mock.log_calls[1]["info"]["delayed_returns"] == 10.0
 
 
 class TestMakeRewardModel:
