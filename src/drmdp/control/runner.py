@@ -95,6 +95,8 @@ class TrainingArgs:
     sac_gradient_steps: int
     log_step_frequency: int
     output_dir: str
+    exp_name: str
+    run_id: int
     seed: Optional[int] = None
     agent_type: str = "sac"
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
@@ -546,6 +548,8 @@ def _expand_experiments(
 
         for run_idx in range(num_runs):
             merged = {**merged_base}
+            merged["exp_name"] = f"exp-{global_idx:03d}"
+            merged["run_id"] = run_idx
             merged["seed"] = _resolve_seed(num_runs, base_seed, global_idx, run_idx)
             merged["output_dir"] = _resolve_output_dir(
                 entry, exp_idx, run_idx, top_level_output_dir, env_label
@@ -599,6 +603,8 @@ def _default_training_args() -> Mapping[str, Any]:
         "sac_gradient_steps": -1,
         "log_step_frequency": 10_000,
         "output_dir": tempfile.gettempdir(),
+        "exp_name": "exp-000",
+        "run_id": 0,
         "seed": None,
         "agent_type": "sac",
         "agent_kwargs": {},
@@ -623,6 +629,8 @@ def _generate_configs(
     merged_base = {**_default_training_args(), **experiment_fields, **common_kwargs}
     for run_idx in range(num_runs):
         merged = {**merged_base}
+        merged["exp_name"] = "exp-000"
+        merged["run_id"] = run_idx
         merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx=0, run_idx=run_idx)
         merged["output_dir"] = _resolve_output_dir(
             {},

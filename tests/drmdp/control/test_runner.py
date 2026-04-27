@@ -232,6 +232,18 @@ class TestRun:
         assert os.path.isfile(os.path.join(output_dir, "experiment-logs.jsonl"))
         assert os.path.isfile(os.path.join(output_dir, "sac_model.zip"))
 
+    def test_exp_name_and_run_id_in_params_file(self, output_dir):
+        """experiment-params.json contains exp_name and run_id fields."""
+        args = dataclasses.replace(
+            self._base_args(output_dir), exp_name="exp-007", run_id=3
+        )
+        runner.run(args)
+        params_path = os.path.join(output_dir, "experiment-params.json")
+        with open(params_path, encoding="utf-8") as params_file:
+            params = json.load(params_file)
+        assert params["exp_name"] == "exp-007"
+        assert params["run_id"] == 3
+
     def _base_args(self, output_dir: str) -> runner.TrainingArgs:
         return runner.TrainingArgs(
             env="Pendulum-v1",
@@ -248,6 +260,8 @@ class TestRun:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=output_dir,
+            exp_name="exp-000",
+            run_id=0,
             seed=42,
         )
 
@@ -419,6 +433,8 @@ class TestMakeRewardModel:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         model = runner._make_reward_model(args, pendulum_env)
@@ -440,6 +456,8 @@ class TestMakeRewardModel:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         assert runner._make_reward_model(args, pendulum_env) is None
@@ -460,6 +478,8 @@ class TestMakeRewardModel:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         with pytest.raises(ValueError):
@@ -481,6 +501,8 @@ class TestMakeRewardModel:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         model = runner._make_reward_model(args, pendulum_env)
@@ -503,6 +525,8 @@ class TestMakeRewardModel:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         model = runner._make_reward_model(args, pendulum_env)
@@ -624,6 +648,13 @@ class TestGenerateConfigs:
         assert configs[0].env == "Pendulum-v1"
         assert configs[0].delay == 7
         assert configs[0].reward_model_type == "none"
+
+    def test_exp_name_and_run_id_set_in_single_cli_mode(self, tmp_path):
+        """Single-CLI mode always uses exp-000; run_id increments per run."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        assert all(cfg.exp_name == "exp-000" for cfg in configs)
+        assert [cfg.run_id for cfg in configs] == [0, 1, 2]
 
     def _make_single_cli(self, tmp_path: Any) -> Mapping[str, Any]:
         """Minimal single_cli dict equivalent to a parsed CLI invocation.
@@ -819,6 +850,13 @@ class TestLoadConfigs:
         configs = runner._load_configs(self._write_config(tmp_path, config))
         assert all(isinstance(cfg, runner.TrainingArgs) for cfg in configs)
 
+    def test_exp_name_and_run_id_set_correctly(self, tmp_path):
+        """exp_name is shared across runs; run_id is unique within an experiment."""
+        config = self._single_env(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(self._write_config(tmp_path, config))
+        assert all(cfg.exp_name == "exp-000" for cfg in configs)
+        assert [cfg.run_id for cfg in configs] == [0, 1, 2]
+
     def _write_config(self, tmp_path, data: Mapping[str, Any]) -> str:
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps(data))
@@ -860,6 +898,8 @@ class TestRunBatch:
                 sac_gradient_steps=1,
                 log_step_frequency=50,
                 output_dir=str(tmp_path),
+                exp_name="exp-000",
+                run_id=idx,
                 seed=idx,
             )
             for idx in range(3)
@@ -886,6 +926,8 @@ class TestRunBatch:
                 sac_gradient_steps=1,
                 log_step_frequency=50,
                 output_dir=str(tmp_path),
+                exp_name="exp-000",
+                run_id=idx,
                 seed=idx,
             )
             for idx in range(2)
@@ -928,6 +970,8 @@ class TestRunBatch:
             sac_gradient_steps=1,
             log_step_frequency=50,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
         )
         with unittest.mock.patch("drmdp.control.runner.run") as mock_run:
             runner.run_batch([config], mode="unknown_mode")
