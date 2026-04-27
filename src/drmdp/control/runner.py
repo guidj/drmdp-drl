@@ -456,7 +456,11 @@ def _run_remote(args: TrainingArgs) -> None:
     run(args)
 
 
-def _load_configs(config_path: str) -> List[TrainingArgs]:
+def _load_configs(
+    config_path: str,
+    exec_kwargs: Mapping[str, Any] = {},
+    common_kwargs: Mapping[str, Any] = {},
+) -> List[TrainingArgs]:
     """Load and expand experiment configs from a JSON file.
 
     The config must have a top-level "environments" list. Top-level fields
@@ -468,15 +472,17 @@ def _load_configs(config_path: str) -> List[TrainingArgs]:
     with open(config_path, encoding="utf-8") as config_file:
         raw = json.load(config_file)
 
-    top_level_output_dir: Optional[str] = raw.get("output_dir")
-    top_level_num_runs: int = raw.get("num_runs", 1)
+    top_level_output_dir: Optional[str] = raw.get(
+        "output_dir", common_kwargs.get("output_dir")
+    )
+    top_level_num_runs: int = raw.get("num_runs", exec_kwargs.get("num_runs", 1))
     shared_fields = {
         key: value
         for key, value in raw.items()
         if key not in ("environments", "output_dir", "num_runs")
     }
-    global_defaults = {**_default_training_args(), **shared_fields}
-
+    # default args << file args << cli args
+    global_defaults = {**_default_training_args(), **shared_fields, **common_kwargs}
     return _expand_environments(
         raw["environments"], global_defaults, top_level_num_runs, top_level_output_dir
     )
@@ -491,7 +497,7 @@ def _expand_environments(
     configs: List[TrainingArgs] = []
     global_exp_offset: int = 0
     for env_entry in environments:
-        env_label: str = env_entry.get("name", env_entry.get("env", ""))
+        env_label: str = env_entry.get("env", "")
         env_num_runs: int = env_entry.get("num_runs", top_level_num_runs)
         env_output_dir: Optional[str] = (
             env_entry.get("output_dir") or top_level_output_dir
@@ -599,23 +605,64 @@ def _default_training_args() -> Mapping[str, Any]:
     }
 
 
+def _generate_configs(
+    single_cli: Mapping[str, Any],
+    exec_kwargs: Mapping[str, Any] = {},
+    common_kwargs: Mapping[str, Any] = {},
+) -> Sequence[TrainingArgs]:
+    configs: List[TrainingArgs] = []
+    env_label: str = single_cli.get("env", "")
+    base_seed: Optional[int] = single_cli.get("seed")
+    output_dir: Optional[int] = single_cli.get("output_dir")
+    num_runs: int = exec_kwargs.get("num_runs", 1)
+    experiment_fields = {
+        key: value
+        for key, value in single_cli.items()
+        if key not in ("output_dir", "seed")
+    }
+    merged_base = {**_default_training_args(), **experiment_fields, **common_kwargs}
+    for run_idx in range(num_runs):
+        merged = {**merged_base}
+        merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx=0, run_idx=run_idx)
+        merged["output_dir"] = _resolve_output_dir(
+            single_cli,
+            exp_idx=0,
+            run_idx=run_idx,
+            top_level_output_dir=output_dir,
+            env_label=env_label,
+        )
+        configs.append(TrainingArgs(**merged))
+    return configs
+
+
 def main() -> None:
     """Parse command-line arguments and launch single or batch control loop."""
-    batch_cli = _parse_batch_cli()
+    logging.basicConfig(level=logging.INFO)
+    common_args = parse_common_args()
+    exec_args = parse_exec_args()
+    batch_cli = parse_batch_cli()
     if batch_cli.config_file is not None:
-        configs = _load_configs(batch_cli.config_file)
-        run_batch(
-            configs,
-            mode=batch_cli.mode,
-            max_workers=batch_cli.max_workers,
-            ray_address=batch_cli.ray_address,
+        logging.info("Parsed args: %s", batch_cli)
+        configs = _load_configs(
+            batch_cli.config_file,
+            exec_kwargs=vars(exec_args),
+            common_kwargs=vars(common_args),
         )
     else:
-        args = parse_args()
-        run(args)
+        single_cli = parse_single_cli()
+        logging.info("Parsed args: %s", single_cli)
+        configs = _generate_configs(
+            single_cli, exec_kwargs=vars(exec_args), common_kwargs=vars(common_args)
+        )
+    run_batch(
+        configs,
+        mode=exec_args.mode,
+        max_workers=exec_args.max_workers,
+        ray_address=exec_args.ray_address,
+    )
 
 
-def parse_args() -> TrainingArgs:
+def parse_single_cli() -> Mapping[str, Any]:
     """Parse command-line arguments into a TrainingArgs instance."""
     parser = argparse.ArgumentParser(
         description="Off-policy SAC control with interleaved reward model learning"
@@ -668,6 +715,47 @@ def parse_args() -> TrainingArgs:
         "are kept as strings. E.g. --reward-model-kwarg max_buffer_size=200",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility",
+    )
+    parser.add_argument(
+        "--agent-type",
+        type=str,
+        default="sac",
+        choices=["sac", "hc"],
+        help="Agent algorithm: 'sac' (default) or 'hc' (HC-decomposition SAC)",
+    )
+    parser.add_argument(
+        "--agent-kwarg",
+        action="append",
+        dest="agent_kwargs",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Agent-specific keyword argument (repeatable). "
+        "Values are parsed via ast.literal_eval; unrecognised literals "
+        "are kept as strings. E.g. --agent-kwarg key=value",
+    )
+
+    args, argv = parser.parse_known_args()
+    common_args = parse_common_args(argv)
+    args_dict = {**vars(args), **vars(common_args)}
+    args_dict["reward_model_kwargs"] = parse_reward_model_kwargs(
+        args_dict["reward_model_kwargs"]
+    )
+    args_dict["agent_kwargs"] = parse_reward_model_kwargs(args_dict["agent_kwargs"])
+    args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
+    # return TrainingArgs(**args_dict)
+    return args_dict
+
+
+def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse command-line arguments into a TrainingArgs instance."""
+    parser = argparse.ArgumentParser(
+        description="Off-policy SAC control with interleaved reward model learning"
+    )
+    parser.add_argument(
         "--num-steps",
         type=int,
         default=50000,
@@ -709,38 +797,27 @@ def parse_args() -> TrainingArgs:
         default=tempfile.gettempdir(),
         help="Directory for logs and saved model",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility",
-    )
-    parser.add_argument(
-        "--agent-type",
-        type=str,
-        default="sac",
-        choices=["sac", "hc"],
-        help="Agent algorithm: 'sac' (default) or 'hc' (HC-decomposition SAC)",
-    )
-    parser.add_argument(
-        "--agent-kwarg",
-        action="append",
-        dest="agent_kwargs",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Agent-specific keyword argument (repeatable). "
-        "Values are parsed via ast.literal_eval; unrecognised literals "
-        "are kept as strings. E.g. --agent-kwarg key=value",
-    )
+    args, _ = parser.parse_known_args(argv)
+    return args
 
-    args, _ = parser.parse_known_args()
-    args_dict = vars(args)
-    args_dict["reward_model_kwargs"] = parse_reward_model_kwargs(
-        args_dict["reward_model_kwargs"]
+
+def parse_exec_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Off-policy SAC control with interleaved reward model learning"
     )
-    args_dict["agent_kwargs"] = parse_reward_model_kwargs(args_dict["agent_kwargs"])
-    args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
-    return TrainingArgs(**args_dict)
+    parser.add_argument(
+        "--mode", type=str, default="debug", choices=["debug", "local", "ray"]
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=1,
+        help="Number of runs",
+    )
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--ray-address", type=str, default=None)
+    args, _ = parser.parse_known_args(argv)
+    return args
 
 
 def parse_reward_model_kwargs(
@@ -763,15 +840,10 @@ def parse_reward_model_kwargs(
     return kwargs
 
 
-def _parse_batch_cli() -> argparse.Namespace:
+def parse_batch_cli() -> argparse.Namespace:
     """Parse only batch-mode flags; single-run flags are ignored here."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config-file", type=str, default=None)
-    parser.add_argument(
-        "--mode", type=str, default="debug", choices=["debug", "local", "ray"]
-    )
-    parser.add_argument("--max-workers", type=int, default=None)
-    parser.add_argument("--ray-address", type=str, default=None)
     args, _ = parser.parse_known_args()
     return args
 

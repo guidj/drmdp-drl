@@ -520,7 +520,7 @@ class TestMakeRewardModel:
 class TestParseArgs:
     def test_defaults_are_valid_training_args(self, tmp_path):
         with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
-            args = runner.parse_args()
+            args = runner.parse_single_cli()
         assert isinstance(args, runner.TrainingArgs)
         assert args.env == "MountainCarContinuous-v0"
         assert args.delay == 3
@@ -538,7 +538,7 @@ class TestParseArgs:
                 str(tmp_path),
             ],
         ):
-            args = runner.parse_args()
+            args = runner.parse_single_cli()
         assert args.env == "Pendulum-v1"
         assert args.delay == 5
 
@@ -553,7 +553,7 @@ class TestParseArgs:
                 str(tmp_path),
             ],
         ):
-            args = runner.parse_args()
+            args = runner.parse_single_cli()
         assert args.reward_model_kwargs["max_buffer_size"] == 50
 
     def test_agent_type_hc(self, tmp_path):
@@ -561,7 +561,7 @@ class TestParseArgs:
             "sys.argv",
             ["prog", "--agent-type", "hc", "--output-dir", str(tmp_path)],
         ):
-            args = runner.parse_args()
+            args = runner.parse_single_cli()
         assert args.agent_type == "hc"
 
     def test_clear_buffer_flag(self, tmp_path):
@@ -569,7 +569,7 @@ class TestParseArgs:
             "sys.argv",
             ["prog", "--clear-buffer-on-update", "--output-dir", str(tmp_path)],
         ):
-            args = runner.parse_args()
+            args = runner.parse_single_cli()
         assert args.clear_buffer_on_update is True
 
     def test_none_reward_model_type_accepted(self, tmp_path):
@@ -577,7 +577,7 @@ class TestParseArgs:
             "sys.argv",
             ["prog", "--reward-model-type", "none", "--output-dir", str(tmp_path)],
         ):
-            args = runner.parse_args()
+            args = runner.parse_single_cli()
         assert args.reward_model_type == "none"
 
 
