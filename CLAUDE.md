@@ -8,10 +8,20 @@ Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous
 
 ## Workflows
 
+### Post-Change Verification
+
+After **any** code change, run:
+
+```sh
+make format && make check && make test
+```
+
+Identify all issues found. If the issues are minor (formatting, a missing annotation, a small logic fix), address them directly. If they are moderate — for example, they require changes to interfaces, public APIs, or multiple files — propose a plan for review before proceeding.
+
 ### Planning Mode
 When in planning mode, export the created plan to a `agents/plans/` directory using the filename format `yyyy-mm-dd-{plan-name}.md`.
 
-### Verification After Changes
+### Code Review After Implementation
 
 After completing any non-trivial implementation — new source files, refactors, or new/modified test files — spawn a dedicated subagent to audit the touched files. Do **not** rely on your own review of changes you just wrote; a fresh subagent catches violations the authoring agent overlooks.
 
@@ -40,8 +50,6 @@ The subagent must check every file that was touched or created across four areas
 - Flag overly large functions that mix concerns; suggest decomposition if it improves testability
 - Identify duplicated logic across source or test files that should be extracted
 
-Run `make check` and the affected test file(s) after the subagent finishes to confirm nothing was missed.
-
 ## Development Commands
 
 ### Environment Setup
@@ -52,27 +60,23 @@ make pip-sync  # or: uv sync
 
 ### Testing
 ```sh
-# Run all tests
-make test  # or: tox -e test, pytest
+make test      # Run all tests (tox -e test / pytest)
 
 # Specific test file/class/method
-pytest tests/drmdp/test_mathutils.py
-pytest tests/drmdp/test_mathutils.py::TestHashtrick
-pytest tests/drmdp/test_mathutils.py::TestHashtrick::test_empty_input
+pytest tests/drmdp/control/test_runner.py
+pytest tests/drmdp/control/test_runner.py::TestLoadConfigs
+pytest tests/drmdp/control/test_runner.py::TestLoadConfigs::test_num_runs_expands_entries
 
-# With coverage and pattern matching
-pytest -v --cov=drmdp --cov-report=term-missing
-pytest -k "boundary"  # Run tests matching "boundary"
-pytest --cov=drmdp --cov-report=html  # Generate HTML coverage report
+# Pattern matching and coverage
+pytest -k "boundary"
+pytest --cov=drmdp --cov-report=html  # View: htmlcov/index.html
 ```
 
 ### Linting and Formatting
 ```sh
-make check     # Check formatting/linting/types
-make format    # Auto-format code
-make format-nb # Format notebooks
+make format    # Auto-format (ruff format + ruff check --fix)
+make check     # Check formatting/linting/types (ruff + mypy)
 make tox       # Run all CI checks
-bumpver update --patch  # Bump version
 ```
 
 ## High-Level Architecture
@@ -90,92 +94,92 @@ bumpver update --patch  # Bump version
 - `EnvMonitorWrapper`/`EnvMonitor`: Track episode returns and steps
 - `Seeder`: Deterministic seed generation via Cantor pairing function
 
-**Optimization** (`optsol.py`):
-- `MultivariateNormal`: Bayesian linear regression and least squares solvers (exact/pseudo inverse)
-- Convex optimization via CVXPY with constraint support
-
 ### DFDRL: Deep RL for Delayed Feedback (`src/drmdp/dfdrl/`)
 
-Three reward estimation approaches with increasing sophistication:
+Offline reward estimation models (`est_oN.py`) trained on trajectory data:
 
-**O0 - Immediate Reward Baseline** (`est_o0.py`):
-- Baseline: predicts immediate rewards without delay
-- `RNetwork`: Feedforward MLP for (state, action) → reward
+- **O0**: Baseline — predicts immediate rewards from (state, action) without delay
+- **O1**: Window-based — MLP predicts per-step rewards; sum of predictions = observed aggregate reward
+- **O2**: Return-grounded — adds regularization loss `MSE(start_return + aggregate, end_return)` to anchor predictions to episodic return progression
+- **O3**: EM-based — expectation-maximisation with variable-length padded sequences
+- **O4**: Mask-based — learned causal mask (sigmoid / STE / Gumbel) over observations
 
-**O1 - Window-Based Reward Estimation** (`est_o1.py`):
-- Predicts per-step rewards from delayed aggregate feedback
-- `RNetwork`: MLP processing (state, action, term) with polynomial features
-- Training: sum of predicted rewards = observed aggregate reward
-- Data generation: `delayed_reward_data()` creates windows from trajectories
-
-**O2 - Return-Grounded Reward Prediction** (`est_o2.py`):
-- Single `RNetwork` (MLP) with return-consistency regularization
-- **Training**: Single stage with combined loss:
-  - `reward_loss`: MSE between summed per-step predictions and observed aggregate reward
-  - `regu_loss`: MSE(start_return + aggregate_reward, end_return) — ensures predictions are consistent with episodic return progression
-  - `total_loss = reward_loss + regu_lam * regu_loss`
-- **Data Generation**: `delayed_reward_data()` with `start_return`/`end_return` labels
-  - Each example tracks cumulative return before and after the window
-  - Windows stop at episode boundaries
+Each model has a paired `eval_est_oN.py` for evaluation.
 
 ### Control: Off-Policy RL with Reward Model Interleaving (`src/drmdp/control/`)
 
 Online policy learning via SB3 SAC with pluggable reward estimation. The policy trains on *estimated* per-step rewards rather than the delayed aggregate rewards emitted by the environment.
 
 **Core abstractions** (`base.py`):
-- `Trajectory`: Frozen dataclass for a completed episode — `(observations, actions, env_rewards, terminals, episode_return)`
+- `Trajectory`: Frozen dataclass — `(observations, actions, env_rewards, terminals, episode_return)`
 - `RewardModel`: ABC with `predict(obs, actions, terminals) -> rewards` and `update(trajectories) -> metrics`
-- `RelabelingReplayBuffer(ReplayBuffer)`: SB3 subclass that calls `reward_model.predict()` inside `sample()` — reward relabeling is transparent to SAC; stored rewards are never modified
+- `RelabelingReplayBuffer(ReplayBuffer)`: Calls `reward_model.predict()` inside `sample()` — relabeling is transparent to SAC; stored rewards are never modified
 
-**IRCR reward model** (`ircr.py`):
-- `IRCRRewardModel`: Non-parametric guidance rewards via KNN lookup over a trajectory database
-- For each (s, a), averages the episode returns of the K nearest stored (s, a) pairs, normalised to [0, 1]
-- No neural network; validates the control loop before parametric models are added
+**Reward models**:
+- `ircr.py` — `IRCRRewardModel`: non-parametric KNN guidance rewards over a trajectory database; normalised mean episode return of K nearest (s, a) pairs
+- `dgra.py` — `DGRARewardModel`: window-based neural reward model; trains on consecutive windows of trajectory data
+- `grd.py` — `GRDRewardModel`: graph-based with a causal structure network (`CausalStructure`) and dynamics network; learns which state dimensions causally influence reward
+
+**HC agent** (`hc.py`):
+- `HCSAC`: History-Corrected SAC (Han et al., ICML 2022) — learns a decomposed Q-function Q^H(h_t) + Q^C(s_t, a_t) directly from delayed rewards; no separate reward model
 
 **Control loop** (`runner.py`):
-- `TrainingArgs`: Frozen configuration dataclass
-- `RewardModelUpdateCallback(BaseCallback)`: Tracks episode trajectories, calls `reward_model.update()` at a fixed step interval, logs to `ExperimentLogger`
-- `run(args)`: Wraps env with `DelayedRewardWrapper` + `ImputeMissingRewardWrapper`, creates SAC with `RelabelingReplayBuffer`, then calls `sac.learn()`
+- `TrainingArgs`: Frozen configuration dataclass. Required fields include `exp_name: str` (e.g. `"exp-000"`, shared across runs) and `run_id: int` (0-indexed, unique within an experiment) — both are serialised to `experiment-params.json` via `ExperimentLogger`
+- `run(args)`: Wraps env → runs SAC or HC to completion → saves model
+- `run_batch(configs, mode)`: Unified entry point for all execution. `mode="debug"` runs sequentially; `mode="local"` uses `ProcessPoolExecutor`; `mode="ray"` submits Ray remote tasks
+- `RewardModelUpdateCallback`: Tracks episode trajectories, calls `reward_model.update()` at a fixed step interval
 
-### Data Processing & Utilities
+**CLI unification**: Both single-run and batch-run paths converge on `run_batch()`. Global flags `--mode`, `--num-runs`, `--output-dir` apply to both. Use `--config-file` for batch JSON configs; omit it for single-run via CLI args.
 
-- `dataproc.py`: `collection_traj_data()` collects trajectories with episode boundary handling
-- `mathutils.py`: Base conversion, feature hashing, Poisson confidence intervals
-- `logger.py`: `ExperimentLogger` context manager for experiment tracking
-- `ray_utils.py`: Ray distributed computing utilities
+**Batch config format** (`specs/control-local-batch.json`):
+```json
+{
+  "output_dir": "...",
+  "num_runs": 3,
+  "environments": [
+    {
+      "env": "MountainCarContinuous-v0",
+      "delay": 3,
+      "experiments": [
+        { "reward_model_type": "ircr", "reward_model_kwargs": {...} },
+        { "reward_model_type": "dgra", "reward_model_kwargs": {...} }
+      ]
+    }
+  ]
+}
+```
+Field precedence: top-level defaults → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`.
 
 ## Running Experiments
 
-### Local Execution
+### Single-Run CLI
 ```sh
-sbin/local/rest-o1.sh     # Run O1 via Ray locally
-sbin/local/rest-o2.sh     # Run O2 via Ray locally
-sbin/local/control-ircr.sh  # Run IRCR + SAC control loop locally
-```
-
-### Remote/Cluster
-```sh
-# Cluster management (sbin/rconfig/)
-cluster-spin-up.sh / cluster-shutdown.sh
-cluster-state.sh / cluster-rescale.sh
-
-# Submit jobs (sbin/rjobs/)
-rjobs/rest-o1.sh  # Submit O1 to Ray cluster
-```
-
-### Direct Python
-```sh
-# O1 Window-Based
-python src/drmdp/dfdrl/est_o1.py --env MountainCarContinuous-v0 --delay 3 --num-steps 10000
-
-# O2 Return-Grounded
-python src/drmdp/dfdrl/est_o2.py --env MountainCarContinuous-v0 \
-    --delay 3 --num-steps 10000 --regu-lam 0.5
-
-# IRCR + SAC Control Loop
+# SAC + IRCR
 python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
     --delay 3 --num-steps 50000 --reward-model-type ircr \
-    --update-every-n-steps 1000 --output-dir /tmp/control-ircr
+    --output-dir /tmp/control-ircr
+
+# HC (no reward model)
+python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
+    --delay 3 --agent-type hc --output-dir /tmp/control-hc
+
+# Multiple runs in local parallel mode
+python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
+    --delay 3 --num-runs 5 --mode local --output-dir /tmp/out
+```
+
+### Batch via JSON Config
+```sh
+python src/drmdp/control/runner.py --config-file specs/control-local-batch.json \
+    --mode local --output-dir /tmp/batch-out
+```
+
+### Shell Scripts
+```sh
+sbin/local/control-ircr.sh    # IRCR + SAC
+sbin/local/control-dgra.sh    # DGRA + SAC
+sbin/local/control-hc.sh      # HC-decomposition SAC
+sbin/local/control-delayed.sh # Delayed-rewards baseline (no reward model)
 ```
 
 ## Critical Architectural Patterns
@@ -189,82 +193,22 @@ When processing windows:
 - Window generation stops at episode termination
 - No data leakage across episodes
 
-**Validation**: See `tests/drmdp/dfdrl/test_est_o2.py::test_episode_boundary_no_span`
-
-### Delayed Reward Processing Workflow
-
-1. **Data Collection**: Wrap env with `DelayedRewardWrapper`
-   - Aggregates rewards over windows
-   - Emits aggregate at window end, `None` for intermediate steps
-
-2. **Window Generation**: `delayed_reward_data()` or `delayed_reward_data_consecutive_windows()`
-   - Creates (state, action, term) sequences with aggregate reward labels
-   - Maintains episode boundaries, tracks cumulative returns
-
-3. **Training**: Model predicts per-step rewards summing to aggregate
-   - O1: Direct window supervision
-   - O2: Stage 1 return prediction → Stage 2 reward prediction with regularization
+**Validation**: `tests/drmdp/dfdrl/test_est_o2.py::TestEpisodeBoundary::test_episode_boundary_no_span`
 
 ### Reward Relabeling at Sample Time
 
-Rather than replacing rewards at collection time (env wrapper), `RelabelingReplayBuffer.sample()` calls `reward_model.predict()` on each drawn batch. This means:
-- The policy always trains on up-to-date estimates — when the reward model improves, the next sample reflects it
-- No modifications to stored buffer data
-- Reward models have no direct buffer access; control stays in the runner
-- Buffer can be explicitly cleared via `replay_buffer.reset()` when needed (configurable via `clear_buffer_on_update`)
+`RelabelingReplayBuffer.sample()` calls `reward_model.predict()` on each drawn batch — not at collection time. This means:
+- The policy always trains on up-to-date estimates as the model improves
+- Stored buffer data is never modified
+- Buffer can be reset via `replay_buffer.reset()` after model updates (controlled by `clear_buffer_on_update`)
 
 ## Coding Style
 
 Follow **Google's Python Style Guide** with these specific conventions:
 
-**Code Organization (Newspaper Style)**: Organize code top-down with classes before functions, main routines before subroutines
-```python
-# Good - Classes first, then functions, main before helpers
-class RNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        ...
+**Code Organization (Newspaper Style)**: Classes before module-level functions; within classes, `__init__` first, public methods next, `_`-prefixed helpers last.
 
-    def forward(self, state, action):
-        # Main routine
-        out = self._preprocess(state, action)
-        return self._predict(out)
-
-    def _preprocess(self, state, action):
-        # Helper/subroutine
-        ...
-
-    def _predict(self, features):
-        # Helper/subroutine
-        ...
-
-def train_model(model, data):
-    # Main function
-    for batch in data:
-        loss = _compute_loss(model, batch)
-        _update_weights(model, loss)
-
-def _compute_loss(model, batch):
-    # Helper function
-    ...
-
-def _update_weights(model, loss):
-    # Helper function
-    ...
-```
-
-**Comments**: Keep comments focused on explaining why, not what; avoid meta-commentary
-```python
-# Good
-# Reset at episode boundaries to prevent return carryover across episodes
-if term[step_idx]:
-    cumulative_sum = 0.0
-
-# Avoid - don't add meta-commentary about criticality or implementation changes
-# CRITICAL: now we use variable length sequences so we need padding
-# IMPORTANT: this was changed from fixed to dynamic
-```
-
-**Imports**: Only import modules and types, not functions or variables directly
+**Imports**: Only import modules and types, never bare functions or variables:
 ```python
 # Good
 import numpy as np
@@ -274,86 +218,23 @@ from typing import List, Dict
 from module import function_name
 ```
 
-**Variable Naming**: Use descriptive names, never single letters
-```python
-# Good
-for idx in range(len(items)):
-    for jdx in range(len(other_items)):
-        ...
+**Variable Naming**: Descriptive names, never single letters (`idx`/`jdx` not `i`/`j`).
 
-# Avoid
-for i in range(len(items)):
-    for j in range(len(other_items)):
-        ...
-```
+**Type Annotations**: Always use `typing` module types with full parameterization; prefer immutable (`Mapping`, `Sequence`, `Tuple`) unless mutation is required (`List`, `Dict`).
 
-**Type Annotations**: Always use typing module types with full parameterization; prefer immutable types
-```python
-# Good - typing module types, immutable by default
-from typing import Mapping, Sequence, Tuple, Optional
-def process_config(config: Mapping[str, Any]) -> Tuple[int, int]:
-    ...
-
-# Use mutable types only when mutation is needed
-from typing import Dict, List
-def accumulate_results(buffer: List[float]) -> Dict[str, float]:
-    buffer.append(new_value)  # Mutation required
-    ...
-
-# Avoid - built-in types without parameterization
-def get_bounds() -> tuple:
-    ...
-```
+**Comments**: Explain *why*, not *what*. No meta-commentary (`# CRITICAL:`, `# IMPORTANT:`).
 
 ## Testing Guidelines
 
-**Philosophy**: pytest with 80% coverage target. Tests grouped into classes by component.
+**Philosophy**: pytest, 80% coverage target. Tests grouped into classes by component; `class TestFoo` per function/class under test.
 
-### Test Organization
+**Structure**: Tests mirror source — `src/drmdp/control/runner.py` → `tests/drmdp/control/test_runner.py`. Helper functions and fixtures placed *after* all test classes.
 
-**Structure**: Tests mirror source code structure. For each module, create a corresponding test module:
-- `src/drmdp/mathutils.py` → `tests/drmdp/test_mathutils.py`
-- `src/drmdp/dfdrl/est_o1.py` → `tests/drmdp/dfdrl/test_est_o1.py`
+**Numerical precision**: `np.testing.assert_allclose(result, expected, atol=1e-6)`
 
-**Grouping**: Group tests by the function/class being tested:
-```python
-class TestHashtrick:  # One class per function/class under test
-    def test_empty_input(self):
-        ...
-    def test_collision_behavior(self):
-        ...
-```
+**Stochastic/PyTorch**: Set seeds (`torch.manual_seed(42)`), use `model.eval()` + `torch.no_grad()` for determinism.
 
-**Naming**: `test_<specific_behavior>()`, descriptive docstrings for critical tests
-
-### Test Categories
-
-**Unit Tests** (80% coverage):
-- Individual functions: all code paths, edge cases, error conditions
-- Use `pytest.raises()` for error testing
-- Fixtures for shared setup: `@pytest.fixture`
-- Parameterized tests: `@pytest.mark.parametrize()`
-- Numerical precision: `np.testing.assert_allclose(result, expected, atol=1e-6)`
-
-**Integration Tests** (extensive):
-- End-to-end workflows, multi-component interactions
-- Episode boundary handling (critical!)
-- Data consistency across transformations
-- Model training loops
-
-### Testing Special Cases
-
-**PyTorch/TensorFlow**: Set seeds for reproducibility (`torch.manual_seed(42)`), use `model.eval()` and `torch.no_grad()` for deterministic tests
-
-**Stochastic Components**: Verify same seed → same results, different seeds → different results
-
-**RL Components**: Verify trajectory structure `(s, a, s', r, done)`, episode boundaries, reward consistency
-
-### Coverage
-```sh
-pytest --cov=drmdp --cov-report=html
-# View: htmlcov/index.html
-```
+**Parameterized tests**: `@pytest.mark.parametrize()` for multiple inputs; `@pytest.fixture` for shared setup.
 
 ## Configuration
 
@@ -363,26 +244,28 @@ addopts = "-v --cov=drmdp --cov-report=xml:cobertura/coverage.xml --cov-report=t
 testpaths = ["tests"]
 ```
 
-**tox** (`tox.ini`): Environments for test, check-formatting, check-lint, check-lint-types. Python 3.11/3.12, uv for dependency management.
-
-**Dependencies**: torch, tensorflow, stable-baselines3, gymnasium, ray[data,tune], cvxpy, scipy, pytest, ruff, mypy
+**tox** (`tox.ini`): Environments `test`, `check-formatting`, `check-lint`, `check-lint-types`. Python 3.11/3.12, uv for dependency management.
 
 ## Project Structure
 
 ```
 src/drmdp/
-├── core.py, rewdelay.py, optsol.py  # Core abstractions
-├── dataproc.py, mathutils.py        # Data & utilities
+├── core.py, rewdelay.py, optsol.py   # Core abstractions
+├── dataproc.py, mathutils.py          # Data & utilities
 ├── logger.py, metrics.py, ray_utils.py
 ├── dfdrl/
-│   ├── est_o0.py, est_o1.py, est_o2.py       # Reward estimation (offline)
-│   └── eval_est_o0.py, eval_est_o1.py, eval_est_o2.py
+│   ├── est_o0..o4.py                  # Reward estimation models (offline)
+│   └── eval_est_o0..o4.py             # Evaluation scripts
 └── control/
-    ├── base.py    # Trajectory, RewardModel ABC, RelabelingReplayBuffer
-    ├── ircr.py    # IRCRRewardModel (non-parametric KNN guidance rewards)
-    └── runner.py  # TrainingArgs, RewardModelUpdateCallback, run(), CLI
+    ├── base.py      # Trajectory, RewardModel ABC, RelabelingReplayBuffer
+    ├── ircr.py      # Non-parametric KNN guidance rewards
+    ├── dgra.py      # Window-based neural reward model
+    ├── grd.py       # Graph-based causal reward model
+    ├── hc.py        # History-Corrected SAC (Han et al.)
+    └── runner.py    # TrainingArgs, run(), run_batch(), CLI
 
-tests/drmdp/         # Mirrors src/ structure
-sbin/                # Experiment scripts (local/, rconfig/, rjobs/)
-agents/plans/        # Implementation plans (yyyy-mm-dd-{name}.md)
+tests/drmdp/           # Mirrors src/ structure
+specs/                 # Batch config JSON files
+sbin/                  # Experiment scripts (local/, rconfig/, rjobs/)
+agents/plans/          # Implementation plans (yyyy-mm-dd-{name}.md)
 ```
