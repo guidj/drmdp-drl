@@ -497,7 +497,7 @@ def _expand_environments(
     configs: List[TrainingArgs] = []
     global_exp_offset: int = 0
     for env_entry in environments:
-        env_label: str = env_entry.get("env", "")
+        env_label: str = env_entry["env"]
         env_num_runs: int = env_entry.get("num_runs", top_level_num_runs)
         env_output_dir: Optional[str] = (
             env_entry.get("output_dir") or top_level_output_dir
@@ -505,7 +505,7 @@ def _expand_environments(
         env_fields = {
             key: value
             for key, value in env_entry.items()
-            if key not in ("name", "experiments", "output_dir", "num_runs")
+            if key not in ("experiments", "output_dir", "num_runs")
         }
         env_defaults = {**global_defaults, **env_fields}
         experiments = env_entry.get("experiments", [])
@@ -609,11 +609,11 @@ def _generate_configs(
     single_cli: Mapping[str, Any],
     exec_kwargs: Mapping[str, Any] = {},
     common_kwargs: Mapping[str, Any] = {},
-) -> Sequence[TrainingArgs]:
+) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     env_label: str = single_cli.get("env", "")
     base_seed: Optional[int] = single_cli.get("seed")
-    output_dir: Optional[int] = single_cli.get("output_dir")
+    output_dir: Optional[str] = single_cli.get("output_dir")
     num_runs: int = exec_kwargs.get("num_runs", 1)
     experiment_fields = {
         key: value
@@ -625,7 +625,7 @@ def _generate_configs(
         merged = {**merged_base}
         merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx=0, run_idx=run_idx)
         merged["output_dir"] = _resolve_output_dir(
-            single_cli,
+            {},
             exp_idx=0,
             run_idx=run_idx,
             top_level_output_dir=output_dir,

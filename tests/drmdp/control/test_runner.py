@@ -518,12 +518,12 @@ class TestMakeRewardModel:
 
 
 class TestParseArgs:
-    def test_defaults_are_valid_training_args(self, tmp_path):
+    def test_defaults_are_valid_mapping(self, tmp_path):
         with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
             args = runner.parse_single_cli()
-        assert isinstance(args, runner.TrainingArgs)
-        assert args.env == "MountainCarContinuous-v0"
-        assert args.delay == 3
+        assert isinstance(args, dict)
+        assert args["env"] == "MountainCarContinuous-v0"
+        assert args["delay"] == 3
 
     def test_custom_env_and_delay(self, tmp_path):
         with unittest.mock.patch(
@@ -539,8 +539,8 @@ class TestParseArgs:
             ],
         ):
             args = runner.parse_single_cli()
-        assert args.env == "Pendulum-v1"
-        assert args.delay == 5
+        assert args["env"] == "Pendulum-v1"
+        assert args["delay"] == 5
 
     def test_reward_model_kwarg_parsed(self, tmp_path):
         with unittest.mock.patch(
@@ -554,7 +554,7 @@ class TestParseArgs:
             ],
         ):
             args = runner.parse_single_cli()
-        assert args.reward_model_kwargs["max_buffer_size"] == 50
+        assert args["reward_model_kwargs"]["max_buffer_size"] == 50
 
     def test_agent_type_hc(self, tmp_path):
         with unittest.mock.patch(
@@ -562,7 +562,7 @@ class TestParseArgs:
             ["prog", "--agent-type", "hc", "--output-dir", str(tmp_path)],
         ):
             args = runner.parse_single_cli()
-        assert args.agent_type == "hc"
+        assert args["agent_type"] == "hc"
 
     def test_clear_buffer_flag(self, tmp_path):
         with unittest.mock.patch(
@@ -570,7 +570,7 @@ class TestParseArgs:
             ["prog", "--clear-buffer-on-update", "--output-dir", str(tmp_path)],
         ):
             args = runner.parse_single_cli()
-        assert args.clear_buffer_on_update is True
+        assert args["clear_buffer_on_update"] is True
 
     def test_none_reward_model_type_accepted(self, tmp_path):
         with unittest.mock.patch(
@@ -578,7 +578,78 @@ class TestParseArgs:
             ["prog", "--reward-model-type", "none", "--output-dir", str(tmp_path)],
         ):
             args = runner.parse_single_cli()
-        assert args.reward_model_type == "none"
+        assert args["reward_model_type"] == "none"
+
+
+class TestGenerateConfigs:
+    def test_single_run_produces_one_config(self, tmp_path):
+        """num_runs=1 produces exactly one TrainingArgs."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert len(configs) == 1
+        assert isinstance(configs[0], runner.TrainingArgs)
+
+    def test_multi_run_produces_correct_count(self, tmp_path):
+        """num_runs=3 produces three TrainingArgs instances."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        assert len(configs) == 3
+
+    def test_multi_run_produces_unique_output_dirs(self, tmp_path):
+        """Each run gets a distinct output_dir containing its run index."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        dirs = [cfg.output_dir for cfg in configs]
+        assert len(set(dirs)) == 3
+        assert "run-000" in dirs[0]
+        assert "run-001" in dirs[1]
+        assert "run-002" in dirs[2]
+
+    def test_multi_run_produces_unique_seeds(self, tmp_path):
+        """Each run receives a distinct seed when num_runs > 1."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        seeds = [cfg.seed for cfg in configs]
+        assert len(set(seeds)) == 3
+
+    def test_cli_args_override_defaults(self, tmp_path):
+        """Custom env, delay, and reward_model_type are preserved in produced configs."""
+        single_cli = {
+            **self._make_single_cli(tmp_path),
+            "env": "Pendulum-v1",
+            "delay": 7,
+            "reward_model_type": "none",
+        }
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert configs[0].env == "Pendulum-v1"
+        assert configs[0].delay == 7
+        assert configs[0].reward_model_type == "none"
+
+    def _make_single_cli(self, tmp_path: Any) -> Mapping[str, Any]:
+        """Minimal single_cli dict equivalent to a parsed CLI invocation.
+
+        Mirrors what parse_single_cli() returns: max_episode_steps has been
+        folded into env_kwargs, and output_dir / seed are present as top-level keys.
+        """
+        return {
+            "env": "MountainCarContinuous-v0",
+            "delay": 3,
+            "env_kwargs": {"max_episode_steps": 2500},
+            "reward_model_type": "ircr",
+            "update_every_n_steps": 1000,
+            "clear_buffer_on_update": False,
+            "reward_model_kwargs": {},
+            "agent_type": "sac",
+            "agent_kwargs": {},
+            "seed": None,
+            "num_steps": 50000,
+            "sac_learning_rate": 3e-4,
+            "sac_buffer_size": 100000,
+            "sac_batch_size": 256,
+            "sac_gradient_steps": -1,
+            "log_step_frequency": 10000,
+            "output_dir": str(tmp_path),
+        }
 
 
 class TestLoadConfigs:
@@ -607,7 +678,6 @@ class TestLoadConfigs:
             "num_runs": 2,
             "environments": [
                 {
-                    "name": "pendulum",
                     "env": "Pendulum-v1",
                     "experiments": [{}, {}],
                 }
@@ -622,8 +692,8 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "num_runs": 2,
             "environments": [
-                {"name": "pendulum", "env": "Pendulum-v1", "experiments": [{}]},
-                {"name": "mcc", "env": "MountainCarContinuous-v0", "experiments": [{}]},
+                {"env": "Pendulum-v1", "experiments": [{}]},
+                {"env": "MountainCarContinuous-v0", "experiments": [{}]},
             ],
         }
         configs = runner._load_configs(self._write_config(tmp_path, config))
@@ -656,8 +726,8 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "num_runs": 2,
             "environments": [
-                {"name": "e1", "env": "Pendulum-v1", "experiments": [{}]},
-                {"name": "e2", "env": "Pendulum-v1", "experiments": [{}]},
+                {"env": "Pendulum-v1", "experiments": [{}]},
+                {"env": "Pendulum-v1", "experiments": [{}]},
             ],
         }
         configs = runner._load_configs(self._write_config(tmp_path, config))
@@ -665,24 +735,33 @@ class TestLoadConfigs:
         assert len(set(seeds)) == len(seeds), "Seeds must be unique across environments"
 
     def test_output_dirs_include_env_label(self, tmp_path):
-        """Output dirs embed the env name and then exp/run indices."""
+        """Output dirs embed the gym env ID and then exp/run indices."""
         config = self._single_env(output_dir=str(tmp_path), num_runs=2)
         configs = runner._load_configs(self._write_config(tmp_path, config))
         assert configs[0].output_dir == str(
-            tmp_path / "pendulum" / "exp-000" / "run-000"
+            tmp_path / "Pendulum-v1" / "exp-000" / "run-000"
         )
         assert configs[1].output_dir == str(
-            tmp_path / "pendulum" / "exp-000" / "run-001"
+            tmp_path / "Pendulum-v1" / "exp-000" / "run-001"
         )
 
-    def test_env_name_falls_back_to_env_id_when_absent(self, tmp_path):
-        """When no name is given, the gym env id is used as the directory label."""
+    def test_output_dirs_use_env_id_directly(self, tmp_path):
+        """The gym env ID is used as-is as the directory label."""
         config = {
             "output_dir": str(tmp_path),
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
         }
         configs = runner._load_configs(self._write_config(tmp_path, config))
         assert "Pendulum-v1" in configs[0].output_dir
+
+    def test_missing_env_field_raises(self, tmp_path):
+        """A config entry without 'env' raises KeyError at load time."""
+        config = {
+            "output_dir": str(tmp_path),
+            "environments": [{"experiments": [{}]}],
+        }
+        with pytest.raises(KeyError):
+            runner._load_configs(self._write_config(tmp_path, config))
 
     def test_experiment_output_dir_overrides_top_level(self, tmp_path):
         """An experiment-level output_dir is used verbatim for all its runs."""
@@ -701,7 +780,7 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "delay": 10,
             "environments": [
-                {"name": "e1", "env": "Pendulum-v1", "experiments": [{}, {}]},
+                {"env": "Pendulum-v1", "experiments": [{}, {}]},
             ],
         }
         configs = runner._load_configs(self._write_config(tmp_path, config))
@@ -713,7 +792,7 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "delay": 5,
             "environments": [
-                {"name": "e1", "env": "Pendulum-v1", "delay": 2, "experiments": [{}]},
+                {"env": "Pendulum-v1", "delay": 2, "experiments": [{}]},
             ],
         }
         configs = runner._load_configs(self._write_config(tmp_path, config))
@@ -725,7 +804,6 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "environments": [
                 {
-                    "name": "e1",
                     "env": "Pendulum-v1",
                     "delay": 5,
                     "experiments": [{"delay": 1}],
@@ -753,7 +831,7 @@ class TestLoadConfigs:
         **top: Any,
     ) -> Mapping[str, Any]:
         """Helper to build a minimal multi-env config with one env and one experiment."""
-        env_entry: Dict[str, Any] = {"name": "pendulum", "env": "Pendulum-v1"}
+        env_entry: Dict[str, Any] = {"env": "Pendulum-v1"}
         if extra_env_fields:
             env_entry.update(extra_env_fields)
         exp_entry: Dict[str, Any] = {}
