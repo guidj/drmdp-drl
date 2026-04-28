@@ -189,3 +189,32 @@ class ProxiedEnv:
 
     env: gym.Env
     proxy: gym.Env
+
+
+class ArgChain:
+    """Priority-ordered lookup over a sequence of argument dicts.
+
+    Earlier layers take precedence; later layers are fallbacks.
+    """
+
+    def __init__(self, layers: Sequence[Mapping[str, Any]]) -> None:
+        self._layers: Tuple[Mapping[str, Any], ...] = tuple(layers)
+
+    def get(self, key: str, default: Optional[Any] = None) -> Any:
+        for layer in self._layers:
+            if key in layer:
+                return layer[key]
+        return default
+
+    def prepend(self, layers: Sequence[Mapping[str, Any]]) -> "ArgChain":
+        """Return a new ArgChain with layers inserted at highest priority."""
+        return ArgChain([*layers, *self._layers])
+
+    def extend(self, layers: Sequence[Mapping[str, Any]]) -> "ArgChain":
+        """Return a new ArgChain with layers inserted at lowest priority."""
+        return ArgChain(
+            [
+                *self._layers,
+                *layers,
+            ]
+        )

@@ -474,67 +474,43 @@ def _load_configs(
     with open(config_path, encoding="utf-8") as config_file:
         raw = json.load(config_file)
 
-    cli_num_runs: Optional[int] = exec_kwargs.get("num_runs")
-    cli_output_dir: Optional[str] = common_kwargs.get("output_dir")
-    top_level_num_runs: int = (
-        cli_num_runs if cli_num_runs is not None else raw.get("num_runs", 1)
-    )
-    top_level_output_dir: Optional[str] = (
-        cli_output_dir if cli_output_dir is not None else raw.get("output_dir")
-    )
     shared_fields = {
         key: value
         for key, value in raw.items()
         if key not in ("environments", "output_dir", "num_runs")
     }
-    # code defaults << file args << cli args (None values mean "not provided by user")
-    cli_overrides = {k: v for k, v in common_kwargs.items() if v is not None}
-    global_defaults = {**_default_training_args(), **shared_fields, **cli_overrides}
+
+    # Order of args: cli >> batch experiment >> batch env >> batch shared >> _defaults (code)
+    # During experiment expansion, specific arguments are added to the end with
+    # lower priority.
+    global_chain = core.ArgChain([exec_kwargs, common_kwargs, shared_fields])
     return _expand_environments(
         raw["environments"],
-        global_defaults,
-        top_level_num_runs,
-        top_level_output_dir,
-        cli_num_runs=cli_num_runs,
+        global_chain,
     )
 
 
 def _expand_environments(
     environments: Sequence[Mapping[str, Any]],
-    global_defaults: Mapping[str, Any],
-    top_level_num_runs: int,
-    top_level_output_dir: Optional[str],
-    cli_num_runs: Optional[int] = None,
+    global_chain: core.ArgChain,
 ) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     global_exp_offset: int = 0
     for env_entry in environments:
-        env_label: str = env_entry["env"]
-        env_num_runs: int = (
-            cli_num_runs
-            if cli_num_runs is not None
-            else env_entry.get("num_runs", top_level_num_runs)
-        )
-        env_output_dir: Optional[str] = (
-            env_entry.get("output_dir") or top_level_output_dir
-        )
         env_fields = {
             key: value
             for key, value in env_entry.items()
-            if key not in ("experiments", "output_dir", "num_runs")
+            if key not in ("experiments",)
         }
-        env_defaults = {**global_defaults, **env_fields}
+        # Env specific arguments have lower priority
+        env_chain = global_chain.extend([env_fields])
         experiments = env_entry.get("experiments", [])
 
         configs.extend(
             _expand_experiments(
                 experiments,
-                env_defaults,
-                env_num_runs,
-                env_output_dir,
-                env_label=env_label,
+                env_chain,
                 global_exp_offset=global_exp_offset,
-                cli_num_runs=cli_num_runs,
             )
         )
         global_exp_offset += len(experiments)
@@ -543,36 +519,28 @@ def _expand_environments(
 
 def _expand_experiments(
     experiments: Sequence[Mapping[str, Any]],
-    defaults: Mapping[str, Any],
-    top_level_num_runs: int,
-    top_level_output_dir: Optional[str],
-    env_label: Optional[str] = None,
+    base_chain: core.ArgChain,
     global_exp_offset: int = 0,
-    cli_num_runs: Optional[int] = None,
 ) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     for exp_idx, entry in enumerate(experiments):
-        num_runs: int = (
-            cli_num_runs
-            if cli_num_runs is not None
-            else entry.get("num_runs", top_level_num_runs)
-        )
-        base_seed: Optional[int] = entry.get("seed")
-        experiment_fields = {
-            key: value
-            for key, value in entry.items()
-            if key not in ("num_runs", "output_dir", "seed")
-        }
-        merged_base = {**defaults, **experiment_fields}
+        defaults = _default_training_args()
+        # Experiment specific args have lower priority
+        chain = base_chain.extend([entry])
         global_idx = global_exp_offset + exp_idx
-
+        num_runs: int = chain.get("num_runs")
         for run_idx in range(num_runs):
-            merged = {**merged_base}
+            merged = {key: chain.get(key, val) for key, val in defaults.items()}
             merged["exp_name"] = f"exp-{global_idx:03d}"
             merged["run_id"] = run_idx
-            merged["seed"] = _resolve_seed(num_runs, base_seed, global_idx, run_idx)
+            merged["seed"] = _resolve_seed(
+                num_runs, base_seed=None, exp_idx=global_idx, run_idx=run_idx
+            )
             merged["output_dir"] = _resolve_output_dir(
-                entry, exp_idx, run_idx, top_level_output_dir, env_label
+                exp_idx,
+                run_idx,
+                base_path=chain.get("output_dir"),
+                env_label=chain.get("env"),
             )
             configs.append(TrainingArgs(**merged))
     return configs
@@ -591,15 +559,12 @@ def _resolve_seed(
 
 
 def _resolve_output_dir(
-    entry: Mapping[str, Any],
     exp_idx: int,
     run_idx: int,
-    top_level_output_dir: Optional[str],
+    base_path: Optional[str] = None,
     env_label: Optional[str] = None,
 ) -> str:
-    if "output_dir" in entry:
-        return str(entry["output_dir"])
-    base = top_level_output_dir or os.path.join(tempfile.gettempdir(), "drmdp-batch")
+    base = base_path or os.path.join(tempfile.gettempdir(), "drmdp-batch")
     parts: List[str] = []
     if env_label:
         parts.append(env_label)
@@ -647,17 +612,17 @@ def _generate_configs(
         if key not in ("output_dir", "seed") and value is not None
     }
     cli_overrides = {k: v for k, v in common_kwargs.items() if v is not None}
-    merged_base = {**_default_training_args(), **experiment_fields, **cli_overrides}
+    chain = core.ArgChain([cli_overrides, experiment_fields, _default_training_args()])
+    defaults = _default_training_args()
     for run_idx in range(num_runs):
-        merged = {**merged_base}
+        merged = {key: chain.get(key, val) for key, val in defaults.items()}
         merged["exp_name"] = "exp-000"
         merged["run_id"] = run_idx
         merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx=0, run_idx=run_idx)
         merged["output_dir"] = _resolve_output_dir(
-            {},
             exp_idx=0,
             run_idx=run_idx,
-            top_level_output_dir=output_dir,
+            base_path=output_dir,
             env_label=env_label,
         )
         configs.append(TrainingArgs(**merged))
