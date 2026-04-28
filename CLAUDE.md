@@ -19,7 +19,7 @@ make format && make check && make test
 Identify all issues found. If the issues are minor (formatting, a missing annotation, a small logic fix), address them directly. If they are moderate — for example, they require changes to interfaces, public APIs, or multiple files — propose a plan for review before proceeding.
 
 ### Planning Mode
-When in planning mode, export the created plan to a `agents/plans/` directory using the filename format `yyyy-mm-dd-{plan-name}.md`.
+Whenever you create an implementation plan — whether via `/plan`, `EnterPlanMode`, or in response to any non-trivial task request — **always write the plan to `agents/plans/yyyy-mm-dd-{plan-name}.md` before starting implementation**. This is required unconditionally; do not defer it or skip it because the task seems small. Use the Write tool to create the file.
 
 ### Code Review After Implementation
 
