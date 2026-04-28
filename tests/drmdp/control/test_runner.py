@@ -879,6 +879,92 @@ class TestLoadConfigs:
         return {**top, "environments": [env_entry]}
 
 
+class TestLoadConfigsPrecedence:
+    """Argument precedence: code defaults < batch file < CLI args."""
+
+    def test_cli_num_runs_overrides_file_num_runs(self, tmp_path):
+        """CLI --num-runs overrides the top-level num_runs in the batch file."""
+        config = self._single_env(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(
+            self._write_config(tmp_path, config),
+            exec_kwargs={"num_runs": 5},
+        )
+        assert len(configs) == 5
+
+    def test_cli_num_runs_overrides_env_level_num_runs(self, tmp_path):
+        """CLI --num-runs overrides num_runs set at the environment level."""
+        config = {
+            "output_dir": str(tmp_path),
+            "environments": [
+                {"env": "Pendulum-v1", "num_runs": 2, "experiments": [{}]},
+            ],
+        }
+        configs = runner._load_configs(
+            self._write_config(tmp_path, config),
+            exec_kwargs={"num_runs": 4},
+        )
+        assert len(configs) == 4
+
+    def test_file_num_steps_not_overridden_by_absent_cli_arg(self, tmp_path):
+        """File num_steps is preserved when the user did not pass --num-steps (None)."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_steps": 99999,
+            "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            self._write_config(tmp_path, config),
+            common_kwargs={"num_steps": None},
+        )
+        assert configs[0].num_steps == 99999
+
+    def test_cli_num_steps_overrides_file(self, tmp_path):
+        """CLI --num-steps overrides num_steps set in the batch file."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_steps": 99999,
+            "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            self._write_config(tmp_path, config),
+            common_kwargs={"num_steps": 1000},
+        )
+        assert configs[0].num_steps == 1000
+
+    def test_cli_output_dir_overrides_file(self, tmp_path):
+        """CLI --output-dir overrides the output_dir in the batch file."""
+        cli_dir = str(tmp_path / "cli")
+        config = {
+            "output_dir": str(tmp_path / "file"),
+            "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            self._write_config(tmp_path, config),
+            common_kwargs={"output_dir": cli_dir},
+        )
+        assert configs[0].output_dir.startswith(cli_dir)
+
+    def _write_config(self, tmp_path: Any, data: Mapping[str, Any]) -> str:
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(data))
+        return str(config_file)
+
+    def _single_env(
+        self,
+        extra_env_fields: Optional[Mapping[str, Any]] = None,
+        extra_exp_fields: Optional[Mapping[str, Any]] = None,
+        **top: Any,
+    ) -> Mapping[str, Any]:
+        env_entry: Dict[str, Any] = {"env": "Pendulum-v1"}
+        if extra_env_fields:
+            env_entry.update(extra_env_fields)
+        exp_entry: Dict[str, Any] = {}
+        if extra_exp_fields:
+            exp_entry.update(extra_exp_fields)
+        env_entry["experiments"] = [exp_entry]
+        return {**top, "environments": [env_entry]}
+
+
 class TestRunBatch:
     def test_debug_mode_calls_run_for_each_config(self, tmp_path):
         """In debug mode, run() is called once for each config, sequentially."""

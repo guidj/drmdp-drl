@@ -474,19 +474,28 @@ def _load_configs(
     with open(config_path, encoding="utf-8") as config_file:
         raw = json.load(config_file)
 
-    top_level_output_dir: Optional[str] = raw.get(
-        "output_dir", common_kwargs.get("output_dir")
+    cli_num_runs: Optional[int] = exec_kwargs.get("num_runs")
+    cli_output_dir: Optional[str] = common_kwargs.get("output_dir")
+    top_level_num_runs: int = (
+        cli_num_runs if cli_num_runs is not None else raw.get("num_runs", 1)
     )
-    top_level_num_runs: int = raw.get("num_runs", exec_kwargs.get("num_runs", 1))
+    top_level_output_dir: Optional[str] = (
+        cli_output_dir if cli_output_dir is not None else raw.get("output_dir")
+    )
     shared_fields = {
         key: value
         for key, value in raw.items()
         if key not in ("environments", "output_dir", "num_runs")
     }
-    # default args << file args << cli args
-    global_defaults = {**_default_training_args(), **shared_fields, **common_kwargs}
+    # code defaults << file args << cli args (None values mean "not provided by user")
+    cli_overrides = {k: v for k, v in common_kwargs.items() if v is not None}
+    global_defaults = {**_default_training_args(), **shared_fields, **cli_overrides}
     return _expand_environments(
-        raw["environments"], global_defaults, top_level_num_runs, top_level_output_dir
+        raw["environments"],
+        global_defaults,
+        top_level_num_runs,
+        top_level_output_dir,
+        cli_num_runs=cli_num_runs,
     )
 
 
@@ -495,12 +504,17 @@ def _expand_environments(
     global_defaults: Mapping[str, Any],
     top_level_num_runs: int,
     top_level_output_dir: Optional[str],
+    cli_num_runs: Optional[int] = None,
 ) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     global_exp_offset: int = 0
     for env_entry in environments:
         env_label: str = env_entry["env"]
-        env_num_runs: int = env_entry.get("num_runs", top_level_num_runs)
+        env_num_runs: int = (
+            cli_num_runs
+            if cli_num_runs is not None
+            else env_entry.get("num_runs", top_level_num_runs)
+        )
         env_output_dir: Optional[str] = (
             env_entry.get("output_dir") or top_level_output_dir
         )
@@ -520,6 +534,7 @@ def _expand_environments(
                 env_output_dir,
                 env_label=env_label,
                 global_exp_offset=global_exp_offset,
+                cli_num_runs=cli_num_runs,
             )
         )
         global_exp_offset += len(experiments)
@@ -533,10 +548,15 @@ def _expand_experiments(
     top_level_output_dir: Optional[str],
     env_label: Optional[str] = None,
     global_exp_offset: int = 0,
+    cli_num_runs: Optional[int] = None,
 ) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     for exp_idx, entry in enumerate(experiments):
-        num_runs: int = entry.get("num_runs", top_level_num_runs)
+        num_runs: int = (
+            cli_num_runs
+            if cli_num_runs is not None
+            else entry.get("num_runs", top_level_num_runs)
+        )
         base_seed: Optional[int] = entry.get("seed")
         experiment_fields = {
             key: value
@@ -620,13 +640,14 @@ def _generate_configs(
     env_label: str = single_cli.get("env", "")
     base_seed: Optional[int] = single_cli.get("seed")
     output_dir: Optional[str] = single_cli.get("output_dir")
-    num_runs: int = exec_kwargs.get("num_runs", 1)
+    num_runs: int = exec_kwargs.get("num_runs") or 1
     experiment_fields = {
         key: value
         for key, value in single_cli.items()
-        if key not in ("output_dir", "seed")
+        if key not in ("output_dir", "seed") and value is not None
     }
-    merged_base = {**_default_training_args(), **experiment_fields, **common_kwargs}
+    cli_overrides = {k: v for k, v in common_kwargs.items() if v is not None}
+    merged_base = {**_default_training_args(), **experiment_fields, **cli_overrides}
     for run_idx in range(num_runs):
         merged = {**merged_base}
         merged["exp_name"] = "exp-000"
@@ -766,43 +787,43 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
     parser.add_argument(
         "--num-steps",
         type=int,
-        default=50000,
+        default=None,
         help="Total environment steps to train for",
     )
     parser.add_argument(
         "--sac-learning-rate",
         type=float,
-        default=3e-4,
+        default=None,
         help="Learning rate for SAC actor and critic",
     )
     parser.add_argument(
         "--sac-buffer-size",
         type=int,
-        default=100000,
+        default=None,
         help="Capacity of SAC's replay buffer",
     )
     parser.add_argument(
         "--sac-batch-size",
         type=int,
-        default=256,
+        default=None,
         help="Mini-batch size for SAC gradient updates",
     )
     parser.add_argument(
         "--sac-gradient-steps",
         type=int,
-        default=-1,
+        default=None,
         help="Gradient steps per env step (-1 = match collected steps)",
     )
     parser.add_argument(
         "--log-step-frequency",
         type=int,
-        default=10000,
+        default=None,
         help="Log to ExperimentLogger every N environment steps",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=tempfile.gettempdir(),
+        default=None,
         help="Directory for logs and saved model",
     )
     args, _ = parser.parse_known_args(argv)
@@ -819,7 +840,7 @@ def parse_exec_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--num-runs",
         type=int,
-        default=1,
+        default=None,
         help="Number of runs",
     )
     parser.add_argument("--max-workers", type=int, default=None)
