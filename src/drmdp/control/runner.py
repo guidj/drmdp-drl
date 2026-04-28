@@ -474,16 +474,19 @@ def _load_configs(
     with open(config_path, encoding="utf-8") as config_file:
         raw = json.load(config_file)
 
-    shared_fields = {
-        key: value
-        for key, value in raw.items()
-        if key not in ("environments", "output_dir", "num_runs")
+    shared_fields = {key: value for key, value in raw.items() if key != "environments"}
+    filtered_exec = {
+        key: value for key, value in exec_kwargs.items() if value is not None
+    }
+    filtered_common = {
+        key: value for key, value in common_kwargs.items() if value is not None
     }
 
-    # Order of args: cli >> batch experiment >> batch env >> batch shared >> _defaults (code)
-    # During experiment expansion, specific arguments are added to the end with
-    # lower priority.
-    global_chain = core.ArgChain([exec_kwargs, common_kwargs, shared_fields])
+    # Priority: CLI >> experiment >> env >> shared >> code defaults
+    global_chain = core.ArgChain.pinned(
+        [filtered_exec, filtered_common],
+        [shared_fields],
+    )
     return _expand_environments(
         raw["environments"],
         global_chain,
@@ -502,8 +505,7 @@ def _expand_environments(
             for key, value in env_entry.items()
             if key not in ("experiments",)
         }
-        # Env specific arguments have lower priority
-        env_chain = global_chain.extend([env_fields])
+        env_chain = global_chain.prepend([env_fields])
         experiments = env_entry.get("experiments", [])
 
         configs.extend(
@@ -525,16 +527,18 @@ def _expand_experiments(
     configs: List[TrainingArgs] = []
     for exp_idx, entry in enumerate(experiments):
         defaults = _default_training_args()
-        # Experiment specific args have lower priority
-        chain = base_chain.extend([entry])
+        chain = base_chain.prepend([entry])
         global_idx = global_exp_offset + exp_idx
-        num_runs: int = chain.get("num_runs")
+        num_runs: int = chain.get("num_runs", 1)
         for run_idx in range(num_runs):
             merged = {key: chain.get(key, val) for key, val in defaults.items()}
             merged["exp_name"] = f"exp-{global_idx:03d}"
             merged["run_id"] = run_idx
             merged["seed"] = _resolve_seed(
-                num_runs, base_seed=None, exp_idx=global_idx, run_idx=run_idx
+                num_runs,
+                base_seed=chain.get("seed"),
+                exp_idx=global_idx,
+                run_idx=run_idx,
             )
             merged["output_dir"] = _resolve_output_dir(
                 exp_idx,

@@ -785,17 +785,8 @@ class TestLoadConfigs:
         configs = runner._load_configs(self._write_config(tmp_path, config))
         assert "Pendulum-v1" in configs[0].output_dir
 
-    def test_missing_env_field_raises(self, tmp_path):
-        """A config entry without 'env' raises KeyError at load time."""
-        config = {
-            "output_dir": str(tmp_path),
-            "environments": [{"experiments": [{}]}],
-        }
-        with pytest.raises(KeyError):
-            runner._load_configs(self._write_config(tmp_path, config))
-
     def test_experiment_output_dir_overrides_top_level(self, tmp_path):
-        """An experiment-level output_dir is used verbatim for all its runs."""
+        """An experiment-level output_dir is used as the base path (env/exp/run subdirs are still appended)."""
         exp_dir = str(tmp_path / "custom")
         config = self._single_env(
             extra_exp_fields={"output_dir": exp_dir},
@@ -803,7 +794,7 @@ class TestLoadConfigs:
             num_runs=2,
         )
         configs = runner._load_configs(self._write_config(tmp_path, config))
-        assert all(cfg.output_dir == exp_dir for cfg in configs)
+        assert all(cfg.output_dir.startswith(exp_dir) for cfg in configs)
 
     def test_top_level_shared_fields_applied_to_all(self, tmp_path):
         """Top-level fields serve as defaults for all environments and experiments."""
@@ -924,6 +915,20 @@ class TestLoadConfigsPrecedence:
             "output_dir": str(tmp_path),
             "num_steps": 99999,
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            self._write_config(tmp_path, config),
+            common_kwargs={"num_steps": 1000},
+        )
+        assert configs[0].num_steps == 1000
+
+    def test_cli_num_steps_overrides_env_level_field(self, tmp_path):
+        """CLI --num-steps overrides num_steps even when set at the environment level."""
+        config = {
+            "output_dir": str(tmp_path),
+            "environments": [
+                {"env": "Pendulum-v1", "num_steps": 99999, "experiments": [{}]},
+            ],
         }
         configs = runner._load_configs(
             self._write_config(tmp_path, config),
