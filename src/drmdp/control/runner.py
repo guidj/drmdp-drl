@@ -691,18 +691,6 @@ def parse_single_cli() -> Mapping[str, Any]:
         help="Reward model to use ('none' trains directly on delayed rewards)",
     )
     parser.add_argument(
-        "--update-every-n-steps",
-        type=int,
-        default=1000,
-        help="Update the reward model every N environment steps",
-    )
-    parser.add_argument(
-        "--clear-buffer-on-update",
-        action="store_true",
-        default=False,
-        help="Reset SAC replay buffer after each reward model update",
-    )
-    parser.add_argument(
         "--reward-model-kwarg",
         action="append",
         dest="reward_model_kwargs",
@@ -758,6 +746,18 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         type=int,
         default=None,
         help="Total environment steps to train for",
+    )
+    parser.add_argument(
+        "--update-every-n-steps",
+        type=int,
+        default=1000,
+        help="Update the reward model every N environment steps",
+    )
+    parser.add_argument(
+        "--clear-buffer-on-update",
+        action="store_true",
+        default=False,
+        help="Reset SAC replay buffer after each reward model update",
     )
     parser.add_argument(
         "--sac-learning-rate",
