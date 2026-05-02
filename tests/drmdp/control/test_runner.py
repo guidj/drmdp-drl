@@ -1,5 +1,8 @@
 """
-Tests for drmdp.control.runner: RewardModelUpdateCallback and run().
+Tests for drmdp.control.runner: TrainingArgs, RewardModelUpdateCallback,
+_RewardObsLoggingCallback, StepEvalCallback, run(), run_batch(),
+_make_reward_model, parse_single_cli, _generate_configs, _load_configs,
+and parse_reward_model_kwargs.
 """
 
 import dataclasses
