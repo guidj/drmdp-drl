@@ -15,10 +15,6 @@ import pytest
 
 from drmdp.control import base, dgra, ircr, runner
 
-# ---------------------------------------------------------------------------
-# TestRewardModelUpdateCallback
-# ---------------------------------------------------------------------------
-
 
 class TestRewardModelUpdateCallback:
     def test_trajectory_built_correctly_across_episode(self):
@@ -216,11 +212,6 @@ class TestRewardModelUpdateCallback:
         assert exp_logger.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
 
 
-# ---------------------------------------------------------------------------
-# TestRun (integration)
-# ---------------------------------------------------------------------------
-
-
 class TestRun:
     @pytest.fixture()
     def output_dir(self):
@@ -280,6 +271,20 @@ class TestRun:
         assert os.path.isfile(os.path.join(output_dir, "experiment-logs.jsonl"))
         assert os.path.isfile(os.path.join(output_dir, "sac_model.zip"))
 
+    def test_eval_log_created_when_eval_step_freq_set(self, output_dir):
+        """When eval_step_freq > 0, eval-logs.jsonl is created in output_dir."""
+        args = dataclasses.replace(
+            self._base_args(output_dir), eval_step_freq=100, n_eval_episodes=2
+        )
+        runner.run(args)
+        assert os.path.isfile(os.path.join(output_dir, "eval-logs.jsonl"))
+
+    def test_no_eval_log_when_eval_step_freq_zero(self, output_dir):
+        """When eval_step_freq=0 (default), eval-logs.jsonl is not created."""
+        args = self._base_args(output_dir)
+        runner.run(args)
+        assert not os.path.isfile(os.path.join(output_dir, "eval-logs.jsonl"))
+
     def test_exp_name_and_run_id_in_params_file(self, output_dir):
         """experiment-params.json contains exp_name and run_id fields."""
         args = dataclasses.replace(
@@ -312,11 +317,6 @@ class TestRun:
             run_id=0,
             seed=42,
         )
-
-
-# ---------------------------------------------------------------------------
-# TestRewardObsLoggingCallback
-# ---------------------------------------------------------------------------
 
 
 class TestRewardObsLoggingCallback:
@@ -509,6 +509,194 @@ class TestRewardObsLoggingCallback:
             "rewards": np.array([reward]),
         }
         return callback._on_step()
+
+
+class TestStepEvalCallback:
+    def test_eval_fires_at_each_interval(self):
+        """_on_step triggers evaluation at every eval_step_freq multiple."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=5, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 2.0, 3.0], [10, 10, 10]),
+        ):
+            for step in range(1, 11):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        assert len(eval_log.log_calls) == 2
+
+    def test_eval_does_not_fire_between_intervals(self):
+        """No eval fires on steps that are not multiples of eval_step_freq."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=10, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([0.0], [5])
+        ):
+            for step in range(1, 9):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        assert len(eval_log.log_calls) == 0
+
+    def test_training_end_fires_if_final_step_not_evaluated(self):
+        """_on_training_end triggers an extra eval when the final step was not on the interval."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=5, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 2.0], [10, 10]),
+        ):
+            for step in range(1, 8):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+            callback._on_training_end()
+
+        # Eval at step 5 and then at training_end (step 7).
+        assert len(eval_log.log_calls) == 2
+
+    def test_training_end_skips_if_already_evaluated_at_final_step(self):
+        """_on_training_end does not duplicate an eval when the final step was on the interval."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=5, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 2.0], [10, 10]),
+        ):
+            for step in range(1, 11):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+            callback._on_training_end()
+
+        # Evals at 5 and 10; training_end sees last_eval_steps == 10, skips.
+        assert len(eval_log.log_calls) == 2
+
+    def test_logged_entry_contains_mean_return(self):
+        """Log entry returns field is the mean of episode_rewards."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=1, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 3.0], [10, 10]),
+        ):
+            callback.model = model
+            callback.num_timesteps = 1
+            callback._on_step()
+
+        assert eval_log.log_calls[0]["returns"] == pytest.approx(2.0)
+
+    def test_logged_entry_contains_std_and_n_eval_episodes(self):
+        """Log entry info contains std_return and n_eval_episodes."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(
+            eval_step_freq=1, n_eval_episodes=2, eval_log=eval_log
+        )
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 3.0], [10, 10]),
+        ):
+            callback.model = model
+            callback.num_timesteps = 1
+            callback._on_step()
+
+        info = eval_log.log_calls[0]["info"]
+        assert info["std_return"] == pytest.approx(1.0)
+        assert info["n_eval_episodes"] == 2
+
+    def test_global_steps_matches_num_timesteps(self):
+        """global_steps in the log entry equals num_timesteps at eval time."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=7, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([2.0], [5])
+        ):
+            for step in range(1, 8):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        assert eval_log.log_calls[0]["global_steps"] == 7
+
+    def test_eval_count_increments(self):
+        """_eval_count tracks the number of evaluations performed."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=3, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([1.0], [5])
+        ):
+            for step in range(1, 10):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        # Evals at steps 3, 6, 9.
+        assert callback._eval_count == 3
+        assert [call["episode"] for call in eval_log.log_calls] == [1, 2, 3]
+
+    def test_elapsed_seconds_in_info(self):
+        """elapsed_seconds is present and non-negative in eval log info."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=1, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([1.0], [5])
+        ):
+            callback.model = model
+            callback.num_timesteps = 1
+            callback._on_step()
+
+        assert "elapsed_seconds" in eval_log.log_calls[0]["info"]
+        assert eval_log.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
+
+    def _build_eval_cb(
+        self,
+        eval_step_freq: int = 10,
+        n_eval_episodes: int = 3,
+        eval_log: Optional[Any] = None,
+    ) -> runner.StepEvalCallback:
+        if eval_log is None:
+            eval_log = _MockLogger()
+        return runner.StepEvalCallback(
+            eval_env=unittest.mock.MagicMock(),
+            eval_step_freq=eval_step_freq,
+            n_eval_episodes=n_eval_episodes,
+            eval_logger=eval_log,  # type: ignore[arg-type]
+        )
 
 
 class TestMakeRewardModel:
@@ -787,20 +975,20 @@ class TestGenerateConfigs:
 class TestLoadConfigs:
     def test_single_experiment_single_run(self, tmp_path):
         """One experiment with num_runs=1 produces exactly one TrainingArgs."""
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_env_fields={"delay": 2},
             output_dir=str(tmp_path),
             num_runs=1,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 1
         assert configs[0].env == "Pendulum-v1"
         assert configs[0].delay == 2
 
     def test_num_runs_expands_entries(self, tmp_path):
         """num_runs=3 expands one experiment into three TrainingArgs."""
-        config = self._single_env(output_dir=str(tmp_path), num_runs=3)
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 3
 
     def test_multiple_experiments_expanded(self, tmp_path):
@@ -815,7 +1003,7 @@ class TestLoadConfigs:
                 }
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 4
 
     def test_multiple_environments_expanded(self, tmp_path):
@@ -828,27 +1016,27 @@ class TestLoadConfigs:
                 {"env": "MountainCarContinuous-v0", "experiments": [{}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 4
 
     def test_explicit_seed_passed_through_for_single_run(self, tmp_path):
         """An explicit seed with num_runs=1 is kept verbatim, not run through Seeder."""
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_exp_fields={"seed": 99},
             output_dir=str(tmp_path),
             num_runs=1,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].seed == 99
 
     def test_seeds_differ_across_runs(self, tmp_path):
         """Multiple runs for the same experiment receive different seeds."""
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_exp_fields={"seed": 7},
             output_dir=str(tmp_path),
             num_runs=3,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         seeds = [cfg.seed for cfg in configs]
         assert len(set(seeds)) == 3, "All seeds should be distinct across runs"
 
@@ -862,14 +1050,14 @@ class TestLoadConfigs:
                 {"env": "Pendulum-v1", "experiments": [{}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         seeds = [cfg.seed for cfg in configs]
         assert len(set(seeds)) == len(seeds), "Seeds must be unique across environments"
 
     def test_output_dirs_include_env_label(self, tmp_path):
         """Output dirs embed the gym env ID and then exp/run indices."""
-        config = self._single_env(output_dir=str(tmp_path), num_runs=2)
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=2)
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].output_dir == str(
             tmp_path / "Pendulum-v1" / "exp-000" / "run-000"
         )
@@ -883,18 +1071,18 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert "Pendulum-v1" in configs[0].output_dir
 
     def test_experiment_output_dir_overrides_top_level(self, tmp_path):
         """An experiment-level output_dir is used as the base path (env/exp/run subdirs are still appended)."""
         exp_dir = str(tmp_path / "custom")
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_exp_fields={"output_dir": exp_dir},
             output_dir=str(tmp_path),
             num_runs=2,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert all(cfg.output_dir.startswith(exp_dir) for cfg in configs)
 
     def test_top_level_shared_fields_applied_to_all(self, tmp_path):
@@ -906,7 +1094,7 @@ class TestLoadConfigs:
                 {"env": "Pendulum-v1", "experiments": [{}, {}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert all(cfg.delay == 10 for cfg in configs)
 
     def test_env_field_overrides_top_level_default(self, tmp_path):
@@ -918,7 +1106,7 @@ class TestLoadConfigs:
                 {"env": "Pendulum-v1", "delay": 2, "experiments": [{}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].delay == 2
 
     def test_experiment_field_overrides_env_default(self, tmp_path):
@@ -933,42 +1121,21 @@ class TestLoadConfigs:
                 }
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].delay == 1
 
     def test_returns_training_args_instances(self, tmp_path):
         """All returned objects are TrainingArgs dataclass instances."""
-        config = self._single_env(output_dir=str(tmp_path))
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        config = _make_single_env_config(output_dir=str(tmp_path))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert all(isinstance(cfg, runner.TrainingArgs) for cfg in configs)
 
     def test_exp_name_and_run_id_set_correctly(self, tmp_path):
         """exp_name is shared across runs; run_id is unique within an experiment."""
-        config = self._single_env(output_dir=str(tmp_path), num_runs=3)
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert all(cfg.exp_name == "exp-000" for cfg in configs)
         assert [cfg.run_id for cfg in configs] == [0, 1, 2]
-
-    def _write_config(self, tmp_path, data: Mapping[str, Any]) -> str:
-        config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps(data))
-        return str(config_file)
-
-    def _single_env(
-        self,
-        extra_env_fields: Optional[Mapping[str, Any]] = None,
-        extra_exp_fields: Optional[Mapping[str, Any]] = None,
-        **top: Any,
-    ) -> Mapping[str, Any]:
-        """Helper to build a minimal multi-env config with one env and one experiment."""
-        env_entry: Dict[str, Any] = {"env": "Pendulum-v1"}
-        if extra_env_fields:
-            env_entry.update(extra_env_fields)
-        exp_entry: Dict[str, Any] = {}
-        if extra_exp_fields:
-            exp_entry.update(extra_exp_fields)
-        env_entry["experiments"] = [exp_entry]
-        return {**top, "environments": [env_entry]}
 
 
 class TestLoadConfigsPrecedence:
@@ -976,9 +1143,9 @@ class TestLoadConfigsPrecedence:
 
     def test_cli_num_runs_overrides_file_num_runs(self, tmp_path):
         """CLI --num-runs overrides the top-level num_runs in the batch file."""
-        config = self._single_env(output_dir=str(tmp_path), num_runs=3)
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=3)
         configs = runner._load_configs(
-            self._write_config(tmp_path, config),
+            _write_config(tmp_path, config),
             exec_kwargs={"num_runs": 5},
         )
         assert len(configs) == 5
@@ -992,7 +1159,7 @@ class TestLoadConfigsPrecedence:
             ],
         }
         configs = runner._load_configs(
-            self._write_config(tmp_path, config),
+            _write_config(tmp_path, config),
             exec_kwargs={"num_runs": 4},
         )
         assert len(configs) == 4
@@ -1005,7 +1172,7 @@ class TestLoadConfigsPrecedence:
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
         }
         configs = runner._load_configs(
-            self._write_config(tmp_path, config),
+            _write_config(tmp_path, config),
             common_kwargs={"num_steps": None},
         )
         assert configs[0].num_steps == 99999
@@ -1018,7 +1185,7 @@ class TestLoadConfigsPrecedence:
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
         }
         configs = runner._load_configs(
-            self._write_config(tmp_path, config),
+            _write_config(tmp_path, config),
             common_kwargs={"num_steps": 1000},
         )
         assert configs[0].num_steps == 1000
@@ -1032,7 +1199,7 @@ class TestLoadConfigsPrecedence:
             ],
         }
         configs = runner._load_configs(
-            self._write_config(tmp_path, config),
+            _write_config(tmp_path, config),
             common_kwargs={"num_steps": 1000},
         )
         assert configs[0].num_steps == 1000
@@ -1045,30 +1212,10 @@ class TestLoadConfigsPrecedence:
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
         }
         configs = runner._load_configs(
-            self._write_config(tmp_path, config),
+            _write_config(tmp_path, config),
             common_kwargs={"output_dir": cli_dir},
         )
         assert configs[0].output_dir.startswith(cli_dir)
-
-    def _write_config(self, tmp_path: Any, data: Mapping[str, Any]) -> str:
-        config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps(data))
-        return str(config_file)
-
-    def _single_env(
-        self,
-        extra_env_fields: Optional[Mapping[str, Any]] = None,
-        extra_exp_fields: Optional[Mapping[str, Any]] = None,
-        **top: Any,
-    ) -> Mapping[str, Any]:
-        env_entry: Dict[str, Any] = {"env": "Pendulum-v1"}
-        if extra_env_fields:
-            env_entry.update(extra_env_fields)
-        exp_entry: Dict[str, Any] = {}
-        if extra_exp_fields:
-            exp_entry.update(extra_exp_fields)
-        env_entry["experiments"] = [exp_entry]
-        return {**top, "environments": [env_entry]}
 
 
 class TestRunBatch:
@@ -1207,11 +1354,6 @@ class TestParseRewardModelKwargs:
         assert result == {"max_buffer_size": 200, "k_neighbors": 5}
 
 
-# ---------------------------------------------------------------------------
-# Stubs and helpers
-# ---------------------------------------------------------------------------
-
-
 class _TrackingRewardModel(base.RewardModel):
     """Reward model that tracks update calls and returns a fixed constant."""
 
@@ -1309,13 +1451,36 @@ def _step_callback(
     num_timesteps: int,
 ) -> bool:
     """Simulate one SB3 callback step by setting required attributes/locals."""
-    sac_model._last_obs = obs_before[np.newaxis]  # (1, obs_dim)
+    sac_model._last_obs = obs_before[np.newaxis]
     callback.model = sac_model
     callback.locals = {
-        "actions": action[np.newaxis],  # (1, act_dim)
+        "actions": action[np.newaxis],
         "rewards": np.array([reward]),
         "dones": np.array([done]),
         "infos": [{}],
     }
     callback.num_timesteps = num_timesteps
     return callback._on_step()
+
+
+def _write_config(tmp_path: Any, data: Mapping[str, Any]) -> str:
+    """Serialise a batch-config dict to a temporary JSON file and return its path."""
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(data))
+    return str(config_file)
+
+
+def _make_single_env_config(
+    extra_env_fields: Optional[Mapping[str, Any]] = None,
+    extra_exp_fields: Optional[Mapping[str, Any]] = None,
+    **top: Any,
+) -> Mapping[str, Any]:
+    """Build a minimal batch config with one env entry and one experiment entry."""
+    env_entry: Dict[str, Any] = {"env": "Pendulum-v1"}
+    if extra_env_fields:
+        env_entry.update(extra_env_fields)
+    exp_entry: Dict[str, Any] = {}
+    if extra_exp_fields:
+        exp_entry.update(extra_exp_fields)
+    env_entry["experiments"] = [exp_entry]
+    return {**top, "environments": [env_entry]}

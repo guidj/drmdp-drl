@@ -30,6 +30,7 @@ Usage (HC):
 import argparse
 import ast
 import concurrent.futures
+import contextlib
 import dataclasses
 import json
 import logging
@@ -43,6 +44,7 @@ import numpy as np
 import ray
 import stable_baselines3
 from stable_baselines3.common import callbacks
+from stable_baselines3.common import evaluation as sb3_evaluation
 
 from drmdp import core, logger, ray_utils, rewdelay
 from drmdp.control import base, dgra, grd, hc, ircr
@@ -73,6 +75,9 @@ class TrainingArgs:
         sac_gradient_steps: Gradient steps per env step (-1 = match collected).
         log_episode_frequency: Log to ExperimentLogger every N completed episodes.
             1 logs every episode (default); N>1 logs every Nth episode.
+        eval_step_freq: Evaluate the greedy policy every N env steps on a clean
+            (undelayed) environment. 0 disables step-based evaluation.
+        n_eval_episodes: Number of episodes per evaluation when eval_step_freq > 0.
         output_dir: Directory for logs and the saved SAC model.
         seed: Random seed for reproducibility.
         agent_type: Agent algorithm. "sac" uses standard SAC with a reward
@@ -98,6 +103,8 @@ class TrainingArgs:
     output_dir: str
     exp_name: str
     run_id: int
+    eval_step_freq: int = 0
+    n_eval_episodes: int = 5
     seed: Optional[int] = None
     agent_type: str = "sac"
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
@@ -324,6 +331,65 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
         self._last_logged_episode = self._episode_count
 
 
+class StepEvalCallback(callbacks.BaseCallback):
+    """SB3 callback that evaluates the greedy policy at fixed step intervals.
+
+    Runs K deterministic episodes on a separate clean (undelayed) environment
+    every eval_step_freq env steps and logs mean/std returns to eval_logger.
+    """
+
+    def __init__(
+        self,
+        eval_env: Any,
+        eval_step_freq: int,
+        n_eval_episodes: int,
+        eval_logger: logger.ExperimentLogger,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._eval_env = eval_env
+        self._eval_step_freq = eval_step_freq
+        self._n_eval_episodes = n_eval_episodes
+        self._eval_logger = eval_logger
+        self._eval_count: int = 0
+        self._last_eval_steps: int = 0
+        self._start_time: float = 0.0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
+
+    def _on_step(self) -> bool:
+        if self._eval_step_freq > 0 and self.num_timesteps % self._eval_step_freq == 0:
+            self._run_eval()
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.num_timesteps > self._last_eval_steps:
+            self._run_eval()
+
+    def _run_eval(self) -> None:
+        episode_rewards, _ = sb3_evaluation.evaluate_policy(
+            self.model,
+            self._eval_env,
+            n_eval_episodes=self._n_eval_episodes,
+            deterministic=True,
+            return_episode_rewards=True,
+        )
+        self._eval_count += 1
+        self._eval_logger.log(
+            episode=self._eval_count,
+            steps=0,
+            global_steps=self.num_timesteps,
+            returns=float(np.mean(episode_rewards)),
+            info={
+                "std_return": float(np.std(episode_rewards)),
+                "n_eval_episodes": self._n_eval_episodes,
+                "elapsed_seconds": time.time() - self._start_time,
+            },
+        )
+        self._last_eval_steps = self.num_timesteps
+
+
 def run(args: TrainingArgs) -> None:
     """Build environment and launch the configured agent to completion.
 
@@ -340,17 +406,33 @@ def run(args: TrainingArgs) -> None:
     env = rewdelay.DelayedRewardWrapper(env, delay)
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
 
-    with logger.ExperimentLogger(args.output_dir, params=args) as exp_logger:
+    with contextlib.ExitStack() as stack:
+        exp_logger = stack.enter_context(
+            logger.ExperimentLogger(args.output_dir, params=args)
+        )
+        eval_cb: Optional[StepEvalCallback] = None
+        if args.eval_step_freq > 0:
+            eval_env = core.EnvMonitorWrapper(gym.make(args.env, **args.env_kwargs))
+            eval_logger = stack.enter_context(
+                logger.ExperimentLogger(args.output_dir, filename="eval-logs.jsonl")
+            )
+            eval_cb = StepEvalCallback(
+                eval_env=eval_env,
+                eval_step_freq=args.eval_step_freq,
+                n_eval_episodes=args.n_eval_episodes,
+                eval_logger=eval_logger,
+            )
         if args.agent_type == "hc":
-            _run_hc(args, env, exp_logger, delay=delay)
+            _run_hc(args, env, exp_logger, delay, eval_cb)
         else:
-            _run_sac(args, env, exp_logger)
+            _run_sac(args, env, exp_logger, eval_cb)
 
 
 def _run_sac(
     args: TrainingArgs,
     env: Any,
     exp_logger: logger.ExperimentLogger,
+    eval_cb: Optional[StepEvalCallback] = None,
 ) -> None:
     """Train standard SAC with a reward model or directly on delayed rewards."""
     reward_model = _make_reward_model(args, env)
@@ -367,7 +449,7 @@ def _run_sac(
         ent_coef="auto_0.1",
         verbose=1,
     )
-    callback = (
+    training_cb = (
         RewardModelUpdateCallback(
             reward_model=reward_model,
             update_every_n_steps=args.update_every_n_steps,
@@ -381,10 +463,15 @@ def _run_sac(
             exp_logger=exp_logger,
         )
     )
+    cb = (
+        callbacks.CallbackList([training_cb, eval_cb])
+        if eval_cb is not None
+        else training_cb
+    )
     sac.learn(
         total_timesteps=args.num_steps,
         log_interval=4,
-        callback=callback,
+        callback=cb,
         progress_bar=True,
     )
     sac.save(os.path.join(args.output_dir, "sac_model"))
@@ -396,6 +483,7 @@ def _run_hc(
     env: Any,
     exp_logger: logger.ExperimentLogger,
     delay: rewdelay.RewardDelay,
+    eval_cb: Optional[StepEvalCallback] = None,
 ) -> None:
     """Train HC-decomposition SAC."""
     # IntervalPositionWrapper depends on info["interval_end"] from ImputeMissingRewardWrapper,
@@ -419,14 +507,19 @@ def _run_hc(
         verbose=1,
         **remaining_kwargs,
     )
-    callback = _RewardObsLoggingCallback(
+    training_cb = _RewardObsLoggingCallback(
         log_episode_frequency=args.log_episode_frequency,
         exp_logger=exp_logger,
+    )
+    cb = (
+        callbacks.CallbackList([training_cb, eval_cb])
+        if eval_cb is not None
+        else training_cb
     )
     agent.learn(
         total_timesteps=args.num_steps,
         log_interval=4,
-        callback=callback,
+        callback=cb,
         progress_bar=True,
     )
     agent.save(os.path.join(args.output_dir, "hc_model"))
@@ -637,6 +730,8 @@ def _default_training_args() -> Mapping[str, Any]:
         "output_dir": tempfile.gettempdir(),
         "exp_name": "exp-000",
         "run_id": 0,
+        "eval_step_freq": 0,
+        "n_eval_episodes": 5,
         "seed": None,
         "agent_type": "sac",
         "agent_kwargs": {},
@@ -775,7 +870,6 @@ def parse_single_cli() -> Mapping[str, Any]:
     )
     args_dict["agent_kwargs"] = parse_reward_model_kwargs(args_dict["agent_kwargs"])
     args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
-    # return TrainingArgs(**args_dict)
     return args_dict
 
 
@@ -831,6 +925,18 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         type=int,
         default=None,
         help="Log to ExperimentLogger every N completed episodes (default: 1, every episode)",
+    )
+    parser.add_argument(
+        "--eval-step-freq",
+        type=int,
+        default=None,
+        help="Evaluate the greedy policy every N env steps (0 = disabled)",
+    )
+    parser.add_argument(
+        "--n-eval-episodes",
+        type=int,
+        default=None,
+        help="Number of evaluation episodes per step-based evaluation",
     )
     parser.add_argument(
         "--output-dir",

@@ -31,20 +31,23 @@ class ExperimentLogger(contextlib.AbstractContextManager):
     def __init__(
         self,
         log_dir: str,
-        params: Any,
+        params: Optional[Any] = None,
+        filename: Optional[str] = None,
     ):
-        self.log_file = os.path.join(log_dir, self.LOG_FILE_NAME)
+        filename = filename if filename is not None else self.LOG_FILE_NAME
+        self.log_file = os.path.join(log_dir, filename)
         self.param_file = os.path.join(log_dir, self.PARAM_FILE_NAME)
         if not tf.io.gfile.exists(log_dir):
             tf.io.gfile.makedirs(log_dir)
 
-        serialisable = (
-            dataclasses.asdict(params)
-            if dataclasses.is_dataclass(params) and not isinstance(params, type)
-            else params
-        )
-        with tf.io.gfile.GFile(self.param_file, "w") as writer:
-            writer.write(json.dumps(serialisable))
+        if params is not None:
+            serialisable = (
+                dataclasses.asdict(params)
+                if dataclasses.is_dataclass(params) and not isinstance(params, type)
+                else params
+            )
+            with tf.io.gfile.GFile(self.param_file, "w") as writer:
+                writer.write(json.dumps(serialisable))
 
         self._writer: Optional[tf.io.gfile.GFile] = None
 
