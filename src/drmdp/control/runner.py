@@ -71,7 +71,8 @@ class TrainingArgs:
         sac_buffer_size: Capacity of SAC's replay buffer.
         sac_batch_size: Mini-batch size for SAC gradient updates.
         sac_gradient_steps: Gradient steps per env step (-1 = match collected).
-        log_step_frequency: Log to ExperimentLogger every N environment steps.
+        log_episode_frequency: Log to ExperimentLogger every N completed episodes.
+            1 logs every episode (default); N>1 logs every Nth episode.
         output_dir: Directory for logs and the saved SAC model.
         seed: Random seed for reproducibility.
         agent_type: Agent algorithm. "sac" uses standard SAC with a reward
@@ -93,7 +94,7 @@ class TrainingArgs:
     sac_buffer_size: int
     sac_batch_size: int
     sac_gradient_steps: int
-    log_step_frequency: int
+    log_episode_frequency: int
     output_dir: str
     exp_name: str
     run_id: int
@@ -117,7 +118,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         reward_model: base.RewardModel,
         update_every_n_steps: int,
         clear_buffer_on_update: bool,
-        log_step_frequency: int,
+        log_episode_frequency: int,
         exp_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
@@ -125,7 +126,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._reward_model = reward_model
         self._update_every_n_steps = update_every_n_steps
         self._clear_buffer_on_update = clear_buffer_on_update
-        self._log_step_frequency = log_step_frequency
+        self._log_episode_frequency = log_episode_frequency
         self._exp_logger = exp_logger
 
         self._episode_obs: List[np.ndarray] = []
@@ -134,12 +135,18 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._episode_terminals: List[bool] = []
         self._episode_steps: int = 0
         self._episode_count: int = 0
-        self._last_log_steps: int = 0
+        self._last_logged_episode: int = 0
 
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
         self._reward_model_total_steps: int = 0
         self._start_time: float = 0.0
+
+        self._last_episode_trajectory: Optional[base.Trajectory] = None
+        self._last_episode_return: float = 0.0
+        self._last_episode_delayed_return: float = 0.0
+        self._last_episode_step_count: int = 0
+        self._last_episode_global_steps: int = 0
 
     def _on_training_start(self) -> None:
         self._start_time = time.time()
@@ -170,6 +177,11 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
     def _on_training_end(self) -> None:
         if len(self._pending_trajectories) > 0:
             self._flush_pending_trajectories()
+        if (
+            self._episode_count > self._last_logged_episode
+            and self._last_episode_trajectory is not None
+        ):
+            self._log_episode(training_complete=True)
 
     def _on_episode_end(self) -> None:
         """Finalise the current episode and log if on schedule."""
@@ -183,36 +195,48 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._pending_trajectories.append(trajectory)
         self._episode_count += 1
 
-        if self.num_timesteps - self._last_log_steps >= self._log_step_frequency:
-            true_episode_return = float(
-                self.locals["infos"][0].get("true_episode_return", 0.0)
-            )
-            est_rewards = self._reward_model.predict(
-                trajectory.observations,
-                trajectory.actions,
-                trajectory.terminals,
-            )
-            self._exp_logger.log(
-                episode=self._episode_count,
-                steps=self._episode_steps,
-                global_steps=self.num_timesteps,
-                returns=true_episode_return,
-                info={
-                    "sac_total_steps": self.num_timesteps,
-                    "reward_model_total_steps": self._reward_model_total_steps,
-                    "delayed_returns": trajectory.episode_return,
-                    "estimated_return": float(est_rewards.sum()),
-                    "reward_model": dict(self._last_model_metrics),
-                    "elapsed_seconds": time.time() - self._start_time,
-                },
-            )
-            self._last_log_steps = self.num_timesteps
+        true_episode_return = float(
+            self.locals["infos"][0].get("true_episode_return", 0.0)
+        )
+        self._last_episode_trajectory = trajectory
+        self._last_episode_return = true_episode_return
+        self._last_episode_delayed_return = trajectory.episode_return
+        self._last_episode_step_count = self._episode_steps
+        self._last_episode_global_steps = self.num_timesteps
+
+        if self._episode_count % self._log_episode_frequency == 0:
+            self._log_episode()
 
         self._episode_obs = []
         self._episode_actions = []
         self._episode_rewards = []
         self._episode_terminals = []
         self._episode_steps = 0
+
+    def _log_episode(self, training_complete: bool = False) -> None:
+        assert self._last_episode_trajectory is not None
+        est_rewards = self._reward_model.predict(
+            self._last_episode_trajectory.observations,
+            self._last_episode_trajectory.actions,
+            self._last_episode_trajectory.terminals,
+        )
+        info: Dict[str, Any] = {
+            "sac_total_steps": self._last_episode_global_steps,
+            "reward_model_total_steps": self._reward_model_total_steps,
+            "delayed_returns": self._last_episode_delayed_return,
+            "estimated_return": float(est_rewards.sum()),
+            "reward_model": dict(self._last_model_metrics),
+            "elapsed_seconds": time.time() - self._start_time,
+            "training_complete": training_complete,
+        }
+        self._exp_logger.log(
+            episode=self._episode_count,
+            steps=self._last_episode_step_count,
+            global_steps=self._last_episode_global_steps,
+            returns=self._last_episode_return,
+            info=info,
+        )
+        self._last_logged_episode = self._episode_count
 
     def _flush_pending_trajectories(self) -> None:
         """Pass pending trajectories to the reward model and optionally clear the buffer."""
@@ -235,18 +259,23 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
 
     def __init__(
         self,
-        log_step_frequency: int,
+        log_episode_frequency: int,
         exp_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
         super().__init__(verbose)
-        self._log_step_frequency = log_step_frequency
+        self._log_episode_frequency = log_episode_frequency
         self._exp_logger = exp_logger
         self._episode_steps: int = 0
         self._episode_count: int = 0
         self._episode_rewards: List[float] = []
-        self._last_log_steps: int = 0
+        self._last_logged_episode: int = 0
         self._start_time: float = 0.0
+
+        self._last_episode_return: float = 0.0
+        self._last_episode_delayed_return: float = 0.0
+        self._last_episode_step_count: int = 0
+        self._last_episode_global_steps: int = 0
 
     def _on_training_start(self) -> None:
         self._start_time = time.time()
@@ -258,27 +287,41 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
             self._on_episode_end()
         return True
 
+    def _on_training_end(self) -> None:
+        if self._episode_count > self._last_logged_episode:
+            self._log_episode(training_complete=True)
+
     def _on_episode_end(self) -> None:
         self._episode_count += 1
-        if self.num_timesteps - self._last_log_steps >= self._log_step_frequency:
-            true_episode_return = float(
-                self.locals["infos"][0].get("true_episode_return", 0.0)
-            )
-            delayed_returns = float(sum(self._episode_rewards))
-            self._exp_logger.log(
-                episode=self._episode_count,
-                steps=self._episode_steps,
-                global_steps=self.num_timesteps,
-                returns=true_episode_return,
-                info={
-                    "total_steps": self.num_timesteps,
-                    "delayed_returns": delayed_returns,
-                    "elapsed_seconds": time.time() - self._start_time,
-                },
-            )
-            self._last_log_steps = self.num_timesteps
+        true_episode_return = float(
+            self.locals["infos"][0].get("true_episode_return", 0.0)
+        )
+        self._last_episode_return = true_episode_return
+        self._last_episode_delayed_return = float(sum(self._episode_rewards))
+        self._last_episode_step_count = self._episode_steps
+        self._last_episode_global_steps = self.num_timesteps
+
+        if self._episode_count % self._log_episode_frequency == 0:
+            self._log_episode()
+
         self._episode_steps = 0
         self._episode_rewards = []
+
+    def _log_episode(self, training_complete: bool = False) -> None:
+        info: Dict[str, Any] = {
+            "total_steps": self._last_episode_global_steps,
+            "delayed_returns": self._last_episode_delayed_return,
+            "elapsed_seconds": time.time() - self._start_time,
+            "training_complete": training_complete,
+        }
+        self._exp_logger.log(
+            episode=self._episode_count,
+            steps=self._last_episode_step_count,
+            global_steps=self._last_episode_global_steps,
+            returns=self._last_episode_return,
+            info=info,
+        )
+        self._last_logged_episode = self._episode_count
 
 
 def run(args: TrainingArgs) -> None:
@@ -329,12 +372,12 @@ def _run_sac(
             reward_model=reward_model,
             update_every_n_steps=args.update_every_n_steps,
             clear_buffer_on_update=args.clear_buffer_on_update,
-            log_step_frequency=args.log_step_frequency,
+            log_episode_frequency=args.log_episode_frequency,
             exp_logger=exp_logger,
         )
         if reward_model
         else _RewardObsLoggingCallback(
-            log_step_frequency=args.log_step_frequency,
+            log_episode_frequency=args.log_episode_frequency,
             exp_logger=exp_logger,
         )
     )
@@ -377,7 +420,7 @@ def _run_hc(
         **remaining_kwargs,
     )
     callback = _RewardObsLoggingCallback(
-        log_step_frequency=args.log_step_frequency,
+        log_episode_frequency=args.log_episode_frequency,
         exp_logger=exp_logger,
     )
     agent.learn(
@@ -590,7 +633,7 @@ def _default_training_args() -> Mapping[str, Any]:
         "sac_buffer_size": 100_000,
         "sac_batch_size": 256,
         "sac_gradient_steps": -1,
-        "log_step_frequency": 10_000,
+        "log_episode_frequency": 1,
         "output_dir": tempfile.gettempdir(),
         "exp_name": "exp-000",
         "run_id": 0,
@@ -784,10 +827,10 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         help="Gradient steps per env step (-1 = match collected steps)",
     )
     parser.add_argument(
-        "--log-step-frequency",
+        "--log-episode-frequency",
         type=int,
         default=None,
-        help="Log to ExperimentLogger every N environment steps",
+        help="Log to ExperimentLogger every N completed episodes (default: 1, every episode)",
     )
     parser.add_argument(
         "--output-dir",

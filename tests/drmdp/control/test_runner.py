@@ -25,7 +25,7 @@ class TestRewardModelUpdateCallback:
         """Completed Trajectory has correct observations, actions, episode_return."""
         model = _TrackingRewardModel()
         callback = _build_callback(reward_model=model, update_every=1000)
-        sac = _make_mock_sac(obs_dim=3, act_dim=1)
+        sac = _make_mock_sac(obs_dim=3)
 
         rng = np.random.default_rng(0)
         obs_seq = [rng.uniform(size=3).astype(np.float32) for _ in range(4)]
@@ -112,25 +112,73 @@ class TestRewardModelUpdateCallback:
         assert sac.replay_buffer.reset_count == 0
 
     def test_logger_called_at_log_frequency(self):
-        """ExperimentLogger.log() fires at every log_step_frequency env steps.
+        """ExperimentLogger.log() fires every log_episode_frequency episodes.
 
-        4 episodes × 3 steps = 12 total steps; with log_step_frequency=6
-        the threshold is crossed at step 6 (end of ep 2) and step 12 (end of ep 4).
+        4 episodes with log_episode_frequency=2: logs at episodes 2 and 4
+        only; episodes 1 and 3 must be skipped by the modulo gate.
         """
         exp_logger = _MockLogger()
-        callback = _build_callback(log_step_freq=6, exp_logger=exp_logger)
+        callback = _build_callback(log_episode_freq=2, exp_logger=exp_logger)
         sac = _make_mock_sac()
         obs = np.zeros(3, dtype=np.float32)
         action = np.zeros(1, dtype=np.float32)
 
         timestep = 0
-        for _episode_idx in range(4):
+        for _ in range(4):
             for step_idx in range(3):
                 timestep += 1
                 done = step_idx == 2
                 _step_callback(callback, sac, obs, action, 1.0, done, timestep)
 
-        assert len(exp_logger.log_calls) == 2
+        logged_episodes = [call["episode"] for call in exp_logger.log_calls]
+        assert logged_episodes == [2, 4]
+        assert all(
+            call["info"]["training_complete"] is False for call in exp_logger.log_calls
+        )
+
+    def test_training_end_logs_final_unlogged_episode(self):
+        """_on_training_end() emits a final log for an episode skipped by the gate."""
+        exp_logger = _MockLogger()
+        callback = _build_callback(log_episode_freq=2, exp_logger=exp_logger)
+        callback._on_training_start()
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        timestep = 0
+        for _ in range(3):
+            for step_idx in range(3):
+                timestep += 1
+                done = step_idx == 2
+                _step_callback(callback, sac, obs, action, 1.0, done, timestep)
+
+        logged_during = [call["episode"] for call in exp_logger.log_calls]
+        assert logged_during == [2]
+
+        callback._on_training_end()
+
+        logged_total = [call["episode"] for call in exp_logger.log_calls]
+        assert logged_total == [2, 3]
+        final_call = exp_logger.log_calls[-1]
+        assert final_call["info"]["training_complete"] is True
+        assert final_call["steps"] == 3
+
+    def test_training_end_no_duplicate_log_when_last_episode_already_logged(self):
+        """_on_training_end() must not re-log if the final episode already passed the gate."""
+        exp_logger = _MockLogger()
+        callback = _build_callback(log_episode_freq=1, exp_logger=exp_logger)
+        callback._on_training_start()
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        for step_idx in range(1, 4):
+            done = step_idx == 3
+            _step_callback(callback, sac, obs, action, 1.0, done, step_idx)
+
+        assert len(exp_logger.log_calls) == 1
+        callback._on_training_end()
+        assert len(exp_logger.log_calls) == 1
 
     def test_training_end_flushes_pending_trajectories(self):
         """_on_training_end() passes remaining pending trajectories to the model."""
@@ -153,7 +201,7 @@ class TestRewardModelUpdateCallback:
     def test_elapsed_seconds_logged(self):
         """elapsed_seconds is present and non-negative in each logged info dict."""
         exp_logger = _MockLogger()
-        callback = _build_callback(log_step_freq=3, exp_logger=exp_logger)
+        callback = _build_callback(log_episode_freq=1, exp_logger=exp_logger)
         callback._on_training_start()
         sac = _make_mock_sac()
         obs = np.zeros(3, dtype=np.float32)
@@ -258,7 +306,7 @@ class TestRun:
             sac_buffer_size=1000,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=output_dir,
             exp_name="exp-000",
             run_id=0,
@@ -295,16 +343,16 @@ class TestRewardObsLoggingCallback:
         assert callback._episode_rewards == []
 
     def test_logger_called_at_log_frequency(self):
-        """Logs only when enough steps have elapsed since the last log.
+        """Logs only on every log_episode_frequency-th completed episode.
 
-        4 steps total, done at steps 2 and 4; with log_step_frequency=4
-        only step 4 crosses the threshold.
+        4 episodes with log_episode_frequency=2: only episodes 2 and 4 log;
+        episodes 1 and 3 must be skipped by the modulo gate.
         """
         log_mock = _MockLogger()
         callback = runner._RewardObsLoggingCallback(
-            log_step_frequency=4, exp_logger=log_mock
+            log_episode_frequency=2, exp_logger=log_mock
         )
-        for timestep in range(1, 5):
+        for timestep in range(1, 9):
             done = timestep % 2 == 0
             self._step_ro(
                 callback,
@@ -313,13 +361,66 @@ class TestRewardObsLoggingCallback:
                 return_val=1.0,
                 reward=1.0,
             )
+        logged_episodes = [call["episode"] for call in log_mock.log_calls]
+        assert logged_episodes == [2, 4]
+        assert all(
+            call["info"]["training_complete"] is False for call in log_mock.log_calls
+        )
+
+    def test_training_end_logs_final_unlogged_episode(self):
+        """_on_training_end() emits a final log for an episode skipped by the gate."""
+        log_mock = _MockLogger()
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=2, exp_logger=log_mock
+        )
+        callback._on_training_start()
+        for timestep in range(1, 7):
+            done = timestep % 2 == 0
+            self._step_ro(
+                callback,
+                done=done,
+                timestep=timestep,
+                return_val=1.0,
+                reward=1.0,
+            )
+
+        # Three episodes completed; gate=2 logs only episode 2.
+        logged_during = [call["episode"] for call in log_mock.log_calls]
+        assert logged_during == [2]
+
+        callback._on_training_end()
+
+        logged_total = [call["episode"] for call in log_mock.log_calls]
+        assert logged_total == [2, 3]
+        final_call = log_mock.log_calls[-1]
+        assert final_call["info"]["training_complete"] is True
+        assert final_call["steps"] == 2
+
+    def test_training_end_no_duplicate_log_when_last_episode_already_logged(self):
+        """_on_training_end() must not re-log if the final episode already passed the gate."""
+        log_mock = _MockLogger()
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=1, exp_logger=log_mock
+        )
+        callback._on_training_start()
+        for timestep in range(1, 3):
+            done = timestep == 2
+            self._step_ro(
+                callback,
+                done=done,
+                timestep=timestep,
+                return_val=1.0,
+                reward=1.0,
+            )
+        assert len(log_mock.log_calls) == 1
+        callback._on_training_end()
         assert len(log_mock.log_calls) == 1
 
     def test_delayed_returns_logged_as_sum_of_rewards(self):
         """delayed_returns in logged info equals sum of per-step rewards for the episode."""
         log_mock = _MockLogger()
         callback = runner._RewardObsLoggingCallback(
-            log_step_frequency=3, exp_logger=log_mock
+            log_episode_frequency=1, exp_logger=log_mock
         )
         rewards = [1.5, 2.5, 0.5]
         for idx, reward in enumerate(rewards):
@@ -341,7 +442,7 @@ class TestRewardObsLoggingCallback:
         """Each episode's delayed_returns reflects only that episode's rewards."""
         log_mock = _MockLogger()
         callback = runner._RewardObsLoggingCallback(
-            log_step_frequency=2, exp_logger=log_mock
+            log_episode_frequency=1, exp_logger=log_mock
         )
         for idx, reward in enumerate([1.0, 2.0]):
             callback.num_timesteps = idx + 1
@@ -368,7 +469,7 @@ class TestRewardObsLoggingCallback:
         """elapsed_seconds is present and non-negative in each logged info dict."""
         log_mock = _MockLogger()
         callback = runner._RewardObsLoggingCallback(
-            log_step_frequency=3, exp_logger=log_mock
+            log_episode_frequency=1, exp_logger=log_mock
         )
         callback._on_training_start()
         rewards = [1.0, 2.0, 0.5]
@@ -389,7 +490,7 @@ class TestRewardObsLoggingCallback:
     def _build_ro_callback(self, log_freq: int = 1) -> runner._RewardObsLoggingCallback:
         exp_logger = _MockLogger()
         return runner._RewardObsLoggingCallback(
-            log_step_frequency=log_freq,
+            log_episode_frequency=log_freq,
             exp_logger=exp_logger,  # type: ignore[arg-type]
         )
 
@@ -431,7 +532,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
             run_id=0,
@@ -454,7 +555,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
             run_id=0,
@@ -476,7 +577,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
             run_id=0,
@@ -499,7 +600,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
             run_id=0,
@@ -523,7 +624,7 @@ class TestMakeRewardModel:
             sac_buffer_size=100,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
             run_id=0,
@@ -678,7 +779,7 @@ class TestGenerateConfigs:
             "sac_buffer_size": 100000,
             "sac_batch_size": 256,
             "sac_gradient_steps": -1,
-            "log_step_frequency": 10000,
+            "log_episode_frequency": 1,
             "output_dir": str(tmp_path),
         }
 
@@ -987,7 +1088,7 @@ class TestRunBatch:
                 sac_buffer_size=1000,
                 sac_batch_size=32,
                 sac_gradient_steps=1,
-                log_step_frequency=50,
+                log_episode_frequency=1,
                 output_dir=str(tmp_path),
                 exp_name="exp-000",
                 run_id=idx,
@@ -1015,7 +1116,7 @@ class TestRunBatch:
                 sac_buffer_size=1000,
                 sac_batch_size=32,
                 sac_gradient_steps=1,
-                log_step_frequency=50,
+                log_episode_frequency=1,
                 output_dir=str(tmp_path),
                 exp_name="exp-000",
                 run_id=idx,
@@ -1059,7 +1160,7 @@ class TestRunBatch:
             sac_buffer_size=1000,
             sac_batch_size=32,
             sac_gradient_steps=1,
-            log_step_frequency=50,
+            log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
             run_id=0,
@@ -1125,6 +1226,7 @@ class _TrackingRewardModel(base.RewardModel):
         actions: np.ndarray,
         terminals: np.ndarray,
     ) -> np.ndarray:
+        del actions, terminals
         return np.full(len(observations), self._constant, dtype=np.float32)
 
     def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
@@ -1172,7 +1274,7 @@ def _build_callback(
     reward_model: Optional[base.RewardModel] = None,
     update_every: int = 100,
     clear_buffer: bool = False,
-    log_step_freq: int = 6,
+    log_episode_freq: int = 1,
     exp_logger: Any = None,
 ) -> runner.RewardModelUpdateCallback:
     """Construct a callback with sensible defaults for unit testing."""
@@ -1184,12 +1286,12 @@ def _build_callback(
         reward_model=reward_model,
         update_every_n_steps=update_every,
         clear_buffer_on_update=clear_buffer,
-        log_step_frequency=log_step_freq,
+        log_episode_frequency=log_episode_freq,
         exp_logger=exp_logger,
     )
 
 
-def _make_mock_sac(obs_dim: int = 3, act_dim: int = 1) -> unittest.mock.MagicMock:
+def _make_mock_sac(obs_dim: int = 3) -> unittest.mock.MagicMock:
     """Return a minimal SAC mock with _last_obs and replay_buffer."""
     sac = unittest.mock.MagicMock()
     sac._last_obs = np.zeros((1, obs_dim), dtype=np.float32)
