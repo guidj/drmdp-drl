@@ -126,7 +126,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         update_every_n_steps: int,
         clear_buffer_on_update: bool,
         log_episode_frequency: int,
-        exp_logger: logger.ExperimentLogger,
+        train_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -134,7 +134,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._update_every_n_steps = update_every_n_steps
         self._clear_buffer_on_update = clear_buffer_on_update
         self._log_episode_frequency = log_episode_frequency
-        self._exp_logger = exp_logger
+        self._train_logger = train_logger
 
         self._episode_obs: List[np.ndarray] = []
         self._episode_actions: List[np.ndarray] = []
@@ -236,7 +236,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             "elapsed_seconds": time.time() - self._start_time,
             "training_complete": training_complete,
         }
-        self._exp_logger.log(
+        self._train_logger.log(
             episode=self._episode_count,
             steps=self._last_episode_step_count,
             global_steps=self._last_episode_global_steps,
@@ -267,12 +267,12 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
     def __init__(
         self,
         log_episode_frequency: int,
-        exp_logger: logger.ExperimentLogger,
+        train_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
         super().__init__(verbose)
         self._log_episode_frequency = log_episode_frequency
-        self._exp_logger = exp_logger
+        self._train_logger = train_logger
         self._episode_steps: int = 0
         self._episode_count: int = 0
         self._episode_rewards: List[float] = []
@@ -321,7 +321,7 @@ class _RewardObsLoggingCallback(callbacks.BaseCallback):
             "elapsed_seconds": time.time() - self._start_time,
             "training_complete": training_complete,
         }
-        self._exp_logger.log(
+        self._train_logger.log(
             episode=self._episode_count,
             steps=self._last_episode_step_count,
             global_steps=self._last_episode_global_steps,
@@ -407,32 +407,28 @@ def run(args: TrainingArgs) -> None:
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
 
     with contextlib.ExitStack() as stack:
-        exp_logger = stack.enter_context(
+        train_logger = stack.enter_context(
             logger.ExperimentLogger(args.output_dir, params=args)
         )
-        eval_cb: Optional[StepEvalCallback] = None
+        eval_env: Optional[Any] = None
+        eval_logger: Optional[logger.ExperimentLogger] = None
         if args.eval_step_freq > 0:
             eval_env = core.EnvMonitorWrapper(gym.make(args.env, **args.env_kwargs))
             eval_logger = stack.enter_context(
                 logger.ExperimentLogger(args.output_dir, filename="eval-logs.jsonl")
             )
-            eval_cb = StepEvalCallback(
-                eval_env=eval_env,
-                eval_step_freq=args.eval_step_freq,
-                n_eval_episodes=args.n_eval_episodes,
-                eval_logger=eval_logger,
-            )
         if args.agent_type == "hc":
-            _run_hc(args, env, exp_logger, delay, eval_cb)
+            _run_hc(args, env, train_logger, delay, eval_env, eval_logger)
         else:
-            _run_sac(args, env, exp_logger, eval_cb)
+            _run_sac(args, env, train_logger, eval_env, eval_logger)
 
 
 def _run_sac(
     args: TrainingArgs,
     env: Any,
-    exp_logger: logger.ExperimentLogger,
-    eval_cb: Optional[StepEvalCallback] = None,
+    train_logger: logger.ExperimentLogger,
+    eval_env: Optional[Any] = None,
+    eval_logger: Optional[logger.ExperimentLogger] = None,
 ) -> None:
     """Train standard SAC with a reward model or directly on delayed rewards."""
     reward_model = _make_reward_model(args, env)
@@ -455,13 +451,20 @@ def _run_sac(
             update_every_n_steps=args.update_every_n_steps,
             clear_buffer_on_update=args.clear_buffer_on_update,
             log_episode_frequency=args.log_episode_frequency,
-            exp_logger=exp_logger,
+            train_logger=train_logger,
         )
         if reward_model
         else _RewardObsLoggingCallback(
             log_episode_frequency=args.log_episode_frequency,
-            exp_logger=exp_logger,
+            train_logger=train_logger,
         )
+    )
+    eval_cb = (
+        StepEvalCallback(
+            eval_env, args.eval_step_freq, args.n_eval_episodes, eval_logger
+        )
+        if eval_env is not None and eval_logger is not None
+        else None
     )
     cb = (
         callbacks.CallbackList([training_cb, eval_cb])
@@ -481,15 +484,18 @@ def _run_sac(
 def _run_hc(
     args: TrainingArgs,
     env: Any,
-    exp_logger: logger.ExperimentLogger,
+    train_logger: logger.ExperimentLogger,
     delay: rewdelay.RewardDelay,
-    eval_cb: Optional[StepEvalCallback] = None,
+    eval_env: Optional[Any] = None,
+    eval_logger: Optional[logger.ExperimentLogger] = None,
 ) -> None:
     """Train HC-decomposition SAC."""
     # IntervalPositionWrapper depends on info["interval_end"] from ImputeMissingRewardWrapper,
     # so it must be applied after that wrapper.
     _, max_delay = delay.range()
     env = hc.IntervalPositionWrapper(env, max_delay=max_delay)
+    if eval_env is not None:
+        eval_env = hc.IntervalPositionWrapper(eval_env, max_delay=max_delay)
     # Runner owns max_delay; strip from agent_kwargs so both IntervalPositionWrapper
     # and HCSAC (and its replay buffer) use the same value from the delay distribution.
     remaining_kwargs = {
@@ -509,7 +515,14 @@ def _run_hc(
     )
     training_cb = _RewardObsLoggingCallback(
         log_episode_frequency=args.log_episode_frequency,
-        exp_logger=exp_logger,
+        train_logger=train_logger,
+    )
+    eval_cb = (
+        StepEvalCallback(
+            eval_env, args.eval_step_freq, args.n_eval_episodes, eval_logger
+        )
+        if eval_env is not None and eval_logger is not None
+        else None
     )
     cb = (
         callbacks.CallbackList([training_cb, eval_cb])
