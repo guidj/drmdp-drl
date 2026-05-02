@@ -445,7 +445,7 @@ def _run_sac(
         ent_coef="auto_0.1",
         verbose=1,
     )
-    training_cb = (
+    training_callback = (
         RewardModelUpdateCallback(
             reward_model=reward_model,
             update_every_n_steps=args.update_every_n_steps,
@@ -459,22 +459,20 @@ def _run_sac(
             train_logger=train_logger,
         )
     )
-    eval_cb = (
+    eval_callback = (
         StepEvalCallback(
             eval_env, args.eval_step_freq, args.n_eval_episodes, eval_logger
         )
         if eval_env is not None and eval_logger is not None
         else None
     )
-    cb = (
-        callbacks.CallbackList([training_cb, eval_cb])
-        if eval_cb is not None
-        else training_cb
+    callback = callbacks.CallbackList(
+        [cb for cb in (training_callback, eval_callback) if cb is not None]
     )
     sac.learn(
         total_timesteps=args.num_steps,
         log_interval=4,
-        callback=cb,
+        callback=callback,
         progress_bar=True,
     )
     sac.save(os.path.join(args.output_dir, "sac_model"))
@@ -513,26 +511,24 @@ def _run_hc(
         verbose=1,
         **remaining_kwargs,
     )
-    training_cb = _RewardObsLoggingCallback(
+    training_callback = _RewardObsLoggingCallback(
         log_episode_frequency=args.log_episode_frequency,
         train_logger=train_logger,
     )
-    eval_cb = (
+    eval_callback = (
         StepEvalCallback(
             eval_env, args.eval_step_freq, args.n_eval_episodes, eval_logger
         )
         if eval_env is not None and eval_logger is not None
         else None
     )
-    cb = (
-        callbacks.CallbackList([training_cb, eval_cb])
-        if eval_cb is not None
-        else training_cb
+    callback = callbacks.CallbackList(
+        [cb for cb in (training_callback, eval_callback) if cb is not None]
     )
     agent.learn(
         total_timesteps=args.num_steps,
         log_interval=4,
-        callback=cb,
+        callback=callback,
         progress_bar=True,
     )
     agent.save(os.path.join(args.output_dir, "hc_model"))
