@@ -1,0 +1,101 @@
+{
+  "environments": [
+    {
+      "env": "MountainCarContinuous-v0",
+      "env_kwargs": {"max_episode_steps": 2500},
+      "delay": 3,
+      "num_steps": 125000,
+      "eval_step_freq": 5000,
+      "sac_kwargs": {
+        "learning_rate": 3e-4,
+        "buffer_size": 100000,
+        "gradient_steps": -1,
+        "ent_coef": "0.1",
+        "gamma": 0.9999,
+        "tau": 0.01,
+        "train_freq": 1,
+        "use_sde": true,
+        "verbose": 1
+      },
+      "experiments": [
+        {
+          "reward_model_type": "ircr",
+          "reward_model_kwargs": {"max_buffer_size": 200, "k_neighbors": 5}
+        },
+        {
+          "reward_model_type": "dgra",
+          "reward_model_kwargs": {
+            "max_buffer_size": 5000,
+            "train_epochs": 100,
+            "batch_size": 64,
+            "regu_lam": 1.0,
+            "learning_rate": 1e-3
+          }
+        },
+        {
+          "reward_model_type": "grd",
+          "reward_model_kwargs": {
+            "max_buffer_size": 300,
+            "train_epochs": 10,
+            "batch_size": 4,
+            "trans_batch_size": 256,
+            "dyn_weight": 1.0,
+            "sparsity_lam_diag": 1e-4,
+            "sparsity_lam_offdiag": 1e-5,
+            "learning_rate": 3e-4
+          }
+        },
+        {
+          "agent_type": "hc",
+          "agent_kwargs": {"history_hidden_size": 128, "reg_lambda": 5.0}
+        }
+      ]
+    },
+    {
+      "env": "Pendulum-v1",
+      "env_kwargs": {"max_episode_steps": 200},
+      "delay": 3,
+      "num_steps": 10000,
+      "eval_step_freq": 400,
+      "sac_kwargs": {
+        "learning_rate": 1e-3,
+        "buffer_size": 100000,
+        "gradient_steps": -1,
+        "verbose": 1
+      },
+      "experiments": [
+        {
+          "reward_model_type": "ircr",
+          "reward_model_kwargs": {"max_buffer_size": 200, "k_neighbors": 5}
+        },
+        {
+          "reward_model_type": "dgra",
+          "reward_model_kwargs": {
+            "max_buffer_size": 5000,
+            "train_epochs": 100,
+            "batch_size": 64,
+            "regu_lam": 1.0,
+            "learning_rate": 1e-3
+          }
+        },
+        {
+          "reward_model_type": "grd",
+          "reward_model_kwargs": {
+            "max_buffer_size": 300,
+            "train_epochs": 10,
+            "batch_size": 4,
+            "trans_batch_size": 256,
+            "dyn_weight": 1.0,
+            "sparsity_lam_diag": 1e-4,
+            "sparsity_lam_offdiag": 1e-5,
+            "learning_rate": 3e-4
+          }
+        },
+        {
+          "agent_type": "hc",
+          "agent_kwargs": {"history_hidden_size": 128, "reg_lambda": 5.0}
+        }
+      ]
+    }
+  ]
+}
