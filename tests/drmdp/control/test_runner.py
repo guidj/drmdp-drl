@@ -327,10 +327,14 @@ class TestRun:
             clear_buffer_on_update=False,
             reward_model_kwargs={"max_buffer_size": 20, "k_neighbors": 3},
             num_steps=200,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=1000,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={
+                "learning_rate": 3e-4,
+                "buffer_size": 1000,
+                "batch_size": 32,
+                "gradient_steps": 1,
+                "ent_coef": "auto_0.1",
+                "verbose": 1,
+            },
             log_episode_frequency=1,
             output_dir=output_dir,
             exp_name="exp-000",
@@ -736,10 +740,7 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
@@ -759,10 +760,7 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
@@ -781,10 +779,7 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
@@ -804,10 +799,7 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
@@ -828,10 +820,7 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",
@@ -913,6 +902,28 @@ class TestParseArgs:
             args = runner.parse_single_cli()
         assert args["reward_model_type"] == "none"
 
+    def test_sac_kwarg_parsed(self, tmp_path):
+        with unittest.mock.patch(
+            "sys.argv",
+            [
+                "prog",
+                "--sac-kwarg",
+                "buffer_size=100000",
+                "--sac-kwarg",
+                "ent_coef=auto_0.1",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            args = runner.parse_single_cli()
+        assert args["sac_kwargs"]["buffer_size"] == 100000
+        assert args["sac_kwargs"]["ent_coef"] == "auto_0.1"
+
+    def test_sac_kwarg_empty_when_not_provided(self, tmp_path):
+        with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
+            args = runner.parse_single_cli()
+        assert args["sac_kwargs"] == {}
+
 
 class TestGenerateConfigs:
     def test_single_run_produces_one_config(self, tmp_path):
@@ -980,13 +991,10 @@ class TestGenerateConfigs:
             "clear_buffer_on_update": False,
             "reward_model_kwargs": {},
             "agent_type": "sac",
+            "sac_kwargs": {},
             "agent_kwargs": {},
             "seed": None,
             "num_steps": 50000,
-            "sac_learning_rate": 3e-4,
-            "sac_buffer_size": 100000,
-            "sac_batch_size": 256,
-            "sac_gradient_steps": -1,
             "log_episode_frequency": 1,
             "output_dir": str(tmp_path),
         }
@@ -1251,10 +1259,7 @@ class TestRunBatch:
                 clear_buffer_on_update=False,
                 reward_model_kwargs={},
                 num_steps=100,
-                sac_learning_rate=3e-4,
-                sac_buffer_size=1000,
-                sac_batch_size=32,
-                sac_gradient_steps=1,
+                sac_kwargs={"buffer_size": 1000, "batch_size": 32, "gradient_steps": 1},
                 log_episode_frequency=1,
                 output_dir=str(tmp_path),
                 exp_name="exp-000",
@@ -1279,10 +1284,7 @@ class TestRunBatch:
                 clear_buffer_on_update=False,
                 reward_model_kwargs={},
                 num_steps=100,
-                sac_learning_rate=3e-4,
-                sac_buffer_size=1000,
-                sac_batch_size=32,
-                sac_gradient_steps=1,
+                sac_kwargs={"buffer_size": 1000, "batch_size": 32, "gradient_steps": 1},
                 log_episode_frequency=1,
                 output_dir=str(tmp_path),
                 exp_name="exp-000",
@@ -1323,10 +1325,7 @@ class TestRunBatch:
             clear_buffer_on_update=False,
             reward_model_kwargs={},
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=1000,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 1000, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
             exp_name="exp-000",

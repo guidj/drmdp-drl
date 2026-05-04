@@ -69,10 +69,10 @@ class TrainingArgs:
         reward_model_kwargs: Keyword arguments forwarded to the reward model
             constructor. Only used when ``agent_type="sac"``.
         num_steps: Total environment steps to train for.
-        sac_learning_rate: Learning rate for SAC actor and critic networks.
-        sac_buffer_size: Capacity of SAC's replay buffer.
-        sac_batch_size: Mini-batch size for SAC gradient updates.
-        sac_gradient_steps: Gradient steps per env step (-1 = match collected).
+        sac_kwargs: Keyword arguments forwarded to the SAC or HCSAC constructor
+            (e.g. ``{"buffer_size": 100_000, "ent_coef": "auto_0.1"}``).
+            ``replay_buffer_class``, ``replay_buffer_kwargs``, ``seed``, and
+            ``max_delay`` (HC) are set by the runner and cannot be overridden here.
         log_episode_frequency: Log to ExperimentLogger every N completed episodes.
             1 logs every episode (default); N>1 logs every Nth episode.
         eval_step_freq: Evaluate the greedy policy every N env steps on a clean
@@ -95,10 +95,6 @@ class TrainingArgs:
     clear_buffer_on_update: bool
     reward_model_kwargs: Mapping[str, Any]
     num_steps: int
-    sac_learning_rate: float
-    sac_buffer_size: int
-    sac_batch_size: int
-    sac_gradient_steps: int
     log_episode_frequency: int
     output_dir: str
     exp_name: str
@@ -107,6 +103,7 @@ class TrainingArgs:
     n_eval_episodes: int = 5
     seed: Optional[int] = None
     agent_type: str = "sac"
+    sac_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     env_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -435,15 +432,10 @@ def _run_sac(
     sac = stable_baselines3.SAC(
         "MlpPolicy",
         env,
-        learning_rate=args.sac_learning_rate,
-        buffer_size=args.sac_buffer_size,
-        batch_size=args.sac_batch_size,
-        gradient_steps=args.sac_gradient_steps,
         replay_buffer_class=base.RelabelingReplayBuffer,
         replay_buffer_kwargs={"reward_model": reward_model},
         seed=args.seed,
-        ent_coef="auto_0.1",
-        verbose=1,
+        **args.sac_kwargs,
     )
     training_callback = (
         RewardModelUpdateCallback(
@@ -502,14 +494,8 @@ def _run_hc(
     agent = hc.HCSAC(
         env,
         max_delay=max_delay,
-        learning_rate=args.sac_learning_rate,
-        buffer_size=args.sac_buffer_size,
-        batch_size=args.sac_batch_size,
-        gradient_steps=args.sac_gradient_steps,
         seed=args.seed,
-        ent_coef="auto_0.1",
-        verbose=1,
-        **remaining_kwargs,
+        **{**args.sac_kwargs, **remaining_kwargs},
     )
     training_callback = _RewardObsLoggingCallback(
         log_episode_frequency=args.log_episode_frequency,
@@ -731,10 +717,7 @@ def _default_training_args() -> Mapping[str, Any]:
         "clear_buffer_on_update": False,
         "reward_model_kwargs": {},
         "num_steps": 50000,
-        "sac_learning_rate": 3e-4,
-        "sac_buffer_size": 100_000,
-        "sac_batch_size": 256,
-        "sac_gradient_steps": -1,
+        "sac_kwargs": {},
         "log_episode_frequency": 1,
         "output_dir": tempfile.gettempdir(),
         "exp_name": "exp-000",
@@ -784,6 +767,9 @@ def main() -> None:
     """Parse command-line arguments and launch single or batch control loop."""
     logging.basicConfig(level=logging.INFO)
     common_args = parse_common_args()
+    common_dict = vars(common_args)
+    if common_dict.get("sac_kwargs") is not None:
+        common_dict["sac_kwargs"] = parse_reward_model_kwargs(common_dict["sac_kwargs"])
     exec_args = parse_exec_args()
     batch_cli = parse_batch_cli()
     if batch_cli.config_file is not None:
@@ -791,13 +777,13 @@ def main() -> None:
         configs = _load_configs(
             batch_cli.config_file,
             exec_kwargs=vars(exec_args),
-            common_kwargs=vars(common_args),
+            common_kwargs=common_dict,
         )
     else:
         single_cli = parse_single_cli()
         logging.info("Parsed args: %s", single_cli)
         configs = _generate_configs(
-            single_cli, exec_kwargs=vars(exec_args), common_kwargs=vars(common_args)
+            single_cli, exec_kwargs=vars(exec_args), common_kwargs=common_dict
         )
     run_batch(
         configs,
@@ -878,6 +864,9 @@ def parse_single_cli() -> Mapping[str, Any]:
         args_dict["reward_model_kwargs"]
     )
     args_dict["agent_kwargs"] = parse_reward_model_kwargs(args_dict["agent_kwargs"])
+    args_dict["sac_kwargs"] = parse_reward_model_kwargs(
+        args_dict.get("sac_kwargs") or []
+    )
     args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
     return args_dict
 
@@ -906,28 +895,14 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         help="Reset SAC replay buffer after each reward model update",
     )
     parser.add_argument(
-        "--sac-learning-rate",
-        type=float,
+        "--sac-kwarg",
+        action="append",
+        dest="sac_kwargs",
         default=None,
-        help="Learning rate for SAC actor and critic",
-    )
-    parser.add_argument(
-        "--sac-buffer-size",
-        type=int,
-        default=None,
-        help="Capacity of SAC's replay buffer",
-    )
-    parser.add_argument(
-        "--sac-batch-size",
-        type=int,
-        default=None,
-        help="Mini-batch size for SAC gradient updates",
-    )
-    parser.add_argument(
-        "--sac-gradient-steps",
-        type=int,
-        default=None,
-        help="Gradient steps per env step (-1 = match collected steps)",
+        metavar="KEY=VALUE",
+        help="SAC constructor keyword argument (repeatable). "
+        "Values are parsed via ast.literal_eval; unrecognised literals "
+        "are kept as strings. E.g. --sac-kwarg buffer_size=100000 --sac-kwarg ent_coef=auto_0.1",
     )
     parser.add_argument(
         "--log-episode-frequency",
