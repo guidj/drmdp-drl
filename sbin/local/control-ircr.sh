@@ -20,6 +20,6 @@ python $PARENT_DIR/src/$BASE/control/runner.py \
     --sac-kwarg buffer_size=100000 \
     --sac-kwarg batch_size=256 \
     --sac-kwarg gradient_steps=-1 \
-    --sac-kwarg ent_coef=auto_0.1 \
+    --sac-kwarg ent_coef=0.1 \
     --output-dir $OUTPUT_DIR \
     --seed 0
