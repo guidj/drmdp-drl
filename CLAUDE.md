@@ -25,30 +25,15 @@ Whenever you create an implementation plan — whether via `/plan`, `EnterPlanMo
 
 After completing any non-trivial implementation — new source files, refactors, or new/modified test files — spawn a dedicated subagent to audit the touched files. Do **not** rely on your own review of changes you just wrote; a fresh subagent catches violations the authoring agent overlooks.
 
-The subagent must check every file that was touched or created across four areas, and make corrections directly rather than just reporting issues:
+The subagent must check every touched file across four areas and **make corrections directly** rather than just reporting:
 
-**Style compliance** (`src/` and `tests/`):
-- Newspaper order: classes before module-level functions; within each class, `__init__` first, then public methods, then `_`-prefixed helpers last
-- All imports at module level — no inline imports inside functions or methods
-- Only modules/types imported, never bare functions or variables (`from module import function` is forbidden)
-- No single-letter variable names; no what-comments (comments must explain *why*, not *what*)
-- Fully-parameterised `typing` module annotations; mutable types (`List`, `Dict`) only when mutation is required
+**Style** (`src/` and `tests/`): newspaper order (classes before module-level functions; `__init__` first, public methods, `_`-helpers last); all imports at module level; only modules/types imported, never bare functions; no single-letter variable names; no what-comments; fully-parameterised `typing` annotations (`Mapping`/`Sequence` unless mutation required).
 
-**Test file structure** (`tests/`):
-- Every test is a method inside a class (`class TestFoo`) — no bare module-level `def test_*` functions
-- Helper functions and fixtures appear **after** all test classes, never before them
-- No inline imports; all imports at module top
+**Test structure** (`tests/`): every test is a method inside `class TestFoo` — no bare `def test_*`; helper functions and fixtures placed *after* all test classes.
 
-**Logical correctness and consistency**:
-- Tests must exercise the actual production code under test — not reimplement its logic independently. A test that rebuilds the formula it's supposed to verify is testing nothing. If a function's internals are untestable, refactor the function (e.g. add a callback, return intermediate values) rather than testing a copy of it.
-- Check for dead or unreachable code paths introduced by the change
-- Verify that related components affected by a refactor remain consistent (e.g. callers updated, related tests still valid)
-- Flag any new public API without a corresponding test
+**Logical correctness**: tests must exercise production code, not reimplement its logic; check for dead code paths; verify callers are updated after refactors; flag new public APIs without tests.
 
-**Testability and maintainability**:
-- If any logic is only testable by reimplementing it in the test, propose a refactor to expose it (callback pattern, intermediate return value, etc.)
-- Flag overly large functions that mix concerns; suggest decomposition if it improves testability
-- Identify duplicated logic across source or test files that should be extracted
+**Testability**: if logic is only testable by reimplementing it, refactor to expose it (callback pattern, intermediate return); flag overly large functions that mix concerns.
 
 ## Development Commands
 
@@ -129,26 +114,33 @@ Online policy learning via SB3 SAC with pluggable reward estimation. The policy 
 - `run_batch(configs, mode)`: Unified entry point for all execution. `mode="debug"` runs sequentially; `mode="local"` uses `ProcessPoolExecutor`; `mode="ray"` submits Ray remote tasks
 - `RewardModelUpdateCallback`: Tracks episode trajectories, calls `reward_model.update()` at a fixed step interval
 
-**CLI unification**: Both single-run and batch-run paths converge on `run_batch()`. Global flags `--mode`, `--num-runs`, `--output-dir` apply to both. Use `--config-file` for batch JSON configs; omit it for single-run via CLI args.
+**CLI parser design**: `runner.py` uses four independent parsers, each calling `parse_known_args(sys.argv[1:])`:
+- `parse_batch_cli` — `--config-file` only
+- `parse_exec_args` — `--mode`, `--num-runs`, `--max-workers`, `--ray-address`
+- `parse_common_args` — training scalars overrideable from CLI: `--num-steps`, `--sac-*`, `--log-step-frequency`, `--output-dir`
+- `parse_single_cli` — all remaining single-run flags (`--env`, `--delay`, `--reward-model-type`, `--update-every-n-steps`, etc.)
+
+**Intended CLI precedence**: `code defaults < config file (any level) < CLI args`. **Known bug**: env-level config file fields for training scalars (e.g. `num_steps`, `sac_learning_rate`) silently override CLI args because `env_defaults = {**global_defaults, **env_fields}` in `_expand_environments` applies env file fields *after* the CLI overrides that were merged into `global_defaults`. The `--num-runs` flag is handled separately via `cli_num_runs` and is not affected.
 
 **Batch config format** (`specs/control-local-batch.json`):
 ```json
 {
-  "output_dir": "...",
-  "num_runs": 3,
   "environments": [
     {
       "env": "MountainCarContinuous-v0",
+      "env_kwargs": {"max_episode_steps": 2500},
       "delay": 3,
+      "num_steps": 50000,
+      "sac_learning_rate": 3e-4,
       "experiments": [
-        { "reward_model_type": "ircr", "reward_model_kwargs": {...} },
-        { "reward_model_type": "dgra", "reward_model_kwargs": {...} }
+        { "reward_model_type": "ircr", "reward_model_kwargs": {"max_buffer_size": 200, "k_neighbors": 5} },
+        { "reward_model_type": "dgra", "reward_model_kwargs": {"train_epochs": 100} }
       ]
     }
   ]
 }
 ```
-Field precedence: top-level defaults → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`.
+File-internal precedence: top-level fields → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`. `num_runs` and `output_dir` are reserved keys excluded from the training-arg merge.
 
 ## Running Experiments
 
@@ -171,7 +163,7 @@ python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
 ### Batch via JSON Config
 ```sh
 python src/drmdp/control/runner.py --config-file specs/control-local-batch.json \
-    --mode local --output-dir /tmp/batch-out
+    --mode local --num-runs 3 --num-steps 50000 --output-dir /tmp/batch-out
 ```
 
 ### Shell Scripts
@@ -180,6 +172,7 @@ sbin/local/control-ircr.sh    # IRCR + SAC
 sbin/local/control-dgra.sh    # DGRA + SAC
 sbin/local/control-hc.sh      # HC-decomposition SAC
 sbin/local/control-delayed.sh # Delayed-rewards baseline (no reward model)
+sbin/local/control-batch.sh   # All reward models, both envs
 ```
 
 ## Critical Architectural Patterns
@@ -245,27 +238,3 @@ testpaths = ["tests"]
 ```
 
 **tox** (`tox.ini`): Environments `test`, `check-formatting`, `check-lint`, `check-lint-types`. Python 3.11/3.12, uv for dependency management.
-
-## Project Structure
-
-```
-src/drmdp/
-├── core.py, rewdelay.py, optsol.py   # Core abstractions
-├── dataproc.py, mathutils.py          # Data & utilities
-├── logger.py, metrics.py, ray_utils.py
-├── dfdrl/
-│   ├── est_o0..o4.py                  # Reward estimation models (offline)
-│   └── eval_est_o0..o4.py             # Evaluation scripts
-└── control/
-    ├── base.py      # Trajectory, RewardModel ABC, RelabelingReplayBuffer
-    ├── ircr.py      # Non-parametric KNN guidance rewards
-    ├── dgra.py      # Window-based neural reward model
-    ├── grd.py       # Graph-based causal reward model
-    ├── hc.py        # History-Corrected SAC (Han et al.)
-    └── runner.py    # TrainingArgs, run(), run_batch(), CLI
-
-tests/drmdp/           # Mirrors src/ structure
-specs/                 # Batch config JSON files
-sbin/                  # Experiment scripts (local/, rconfig/, rjobs/)
-agents/plans/          # Implementation plans (yyyy-mm-dd-{name}.md)
-```
