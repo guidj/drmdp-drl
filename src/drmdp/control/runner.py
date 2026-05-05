@@ -341,6 +341,7 @@ class StepEvalCallback(callbacks.BaseCallback):
         eval_step_freq: int,
         n_eval_episodes: int,
         eval_logger: logger.ExperimentLogger,
+        algo_name: str,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -348,6 +349,7 @@ class StepEvalCallback(callbacks.BaseCallback):
         self._eval_step_freq = eval_step_freq
         self._n_eval_episodes = n_eval_episodes
         self._eval_logger = eval_logger
+        self._algo_name = algo_name
         self._eval_count: int = 0
         self._last_eval_steps: int = 0
         self._start_time: float = 0.0
@@ -373,6 +375,17 @@ class StepEvalCallback(callbacks.BaseCallback):
             return_episode_rewards=True,
         )
         self._eval_count += 1
+        params = self._eval_logger.params
+        if params is not None:
+            logging.info(
+                "Eval env=%s algo=%s seed=%s step=%d :: mean_return=%.3f std=%.3f",
+                getattr(params, "env", "?"),
+                self._algo_name,
+                getattr(params, "seed", "?"),
+                self.num_timesteps,
+                float(np.mean(episode_rewards)),
+                float(np.std(episode_rewards)),
+            )
         self._eval_logger.log(
             episode=self._eval_count,
             steps=0,
@@ -416,7 +429,11 @@ def run(args: TrainingArgs) -> None:
         if args.eval_step_freq > 0:
             eval_env = core.EnvMonitorWrapper(gym.make(args.env, **args.env_kwargs))
             eval_logger = stack.enter_context(
-                logger.ExperimentLogger(args.output_dir, filename="eval-logs.jsonl")
+                logger.ExperimentLogger(
+                    args.output_dir,
+                    params=args,
+                    filename="eval-logs.jsonl",
+                )
             )
         if args.agent_type == "hc":
             _run_hc(args, env, train_logger, delay, eval_env, eval_logger)
@@ -457,7 +474,11 @@ def _run_sac(
     )
     eval_callback = (
         StepEvalCallback(
-            eval_env, args.eval_step_freq, args.n_eval_episodes, eval_logger
+            eval_env,
+            args.eval_step_freq,
+            args.n_eval_episodes,
+            eval_logger,
+            algo_name=f"sac/{args.reward_model_type}",
         )
         if eval_env is not None and eval_logger is not None
         else None
@@ -507,7 +528,11 @@ def _run_hc(
     )
     eval_callback = (
         StepEvalCallback(
-            eval_env, args.eval_step_freq, args.n_eval_episodes, eval_logger
+            eval_env,
+            args.eval_step_freq,
+            args.n_eval_episodes,
+            eval_logger,
+            algo_name="hc",
         )
         if eval_env is not None and eval_logger is not None
         else None

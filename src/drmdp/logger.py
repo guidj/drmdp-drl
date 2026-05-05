@@ -40,6 +40,7 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         if not tf.io.gfile.exists(log_dir):
             tf.io.gfile.makedirs(log_dir)
 
+        self.params = params
         if params is not None:
             serialisable = (
                 dataclasses.asdict(params)
@@ -85,7 +86,7 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         global_steps: int,
         returns: float,
         info: Optional[Mapping[str, Any]] = None,
-    ):
+    ) -> None:
         """
         Logs an experiment entry for an episode.
         """
@@ -102,7 +103,7 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         self._writer.write(f"{json.dumps(entry)}\n")
 
 
-def dataclass_from_dict(clazz: Callable, data: Mapping[str, Any]):  # type: ignore [arg-type]
+def dataclass_from_dict(clazz: Callable, data: Mapping[str, Any]) -> Any:  # type: ignore [arg-type]
     """
     Creates an instance of a dataclass from a dictionary.
     """
@@ -124,7 +125,7 @@ def json_from_dict(
     if dict_encode_level is None:
         return mapping
 
-    def go(data: Any, level: int):
+    def go(data: Any, level: int) -> Any:
         """Recursively encode nested dicts to JSON strings at the threshold depth."""
         if isinstance(data, Mapping):
             if level >= dict_encode_level:

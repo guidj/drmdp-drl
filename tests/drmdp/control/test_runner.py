@@ -720,6 +720,7 @@ class TestStepEvalCallback:
             eval_step_freq=eval_step_freq,
             n_eval_episodes=n_eval_episodes,
             eval_logger=eval_log,  # type: ignore[arg-type]
+            algo_name="sac/test",
         )
 
 
@@ -1411,6 +1412,7 @@ class _MockLogger:
 
     def __init__(self):
         self.log_calls: List[Mapping[str, Any]] = []
+        self.params: Optional[Any] = None
 
     def log(
         self,
