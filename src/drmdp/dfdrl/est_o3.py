@@ -929,7 +929,11 @@ def experiment(args: TrainingArgs):
     Args:
         args: Training configuration and hyperparameters.
     """
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
     logging.info("Spec: %s", args)
 
@@ -1000,7 +1004,11 @@ def _parse_kwargs(pairs: Optional[List[str]]) -> Dict[str, Any]:
 def main():
     """Parse arguments and launch experiment runs via Ray or locally."""
     args = parse_args()
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     ray_env: Dict[str, Any] = {}
     with ray.init(runtime_env=ray_env):

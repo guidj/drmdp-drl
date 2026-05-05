@@ -394,7 +394,11 @@ def run(args: TrainingArgs) -> None:
     over windows) and ImputeMissingRewardWrapper (to replace None rewards with
     0.0 so SAC always receives a numeric value).
     """
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     logging.info("Training args: %s", args)
 
     delay = rewdelay.ClippedPoissonDelay(args.delay)
@@ -765,7 +769,11 @@ def _generate_configs(
 
 def main() -> None:
     """Parse command-line arguments and launch single or batch control loop."""
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     common_args = parse_common_args()
     common_dict = vars(common_args)
     if common_dict.get("sac_kwargs") is not None:
