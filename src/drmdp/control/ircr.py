@@ -12,7 +12,7 @@ Reference: "Guidance Rewards via Trajectory Smoothing" (IRCR paper).
 from typing import List, Mapping, Optional, Sequence
 
 import numpy as np
-from scipy import spatial
+from sklearn import neighbors
 
 from drmdp.control import base
 
@@ -24,11 +24,11 @@ class IRCRRewardModel(base.RewardModel):
     the K nearest stored (s, a) pairs, normalised to [0, 1] using the
     observed return range.
 
-    Before building the KDTree and before each query, all (s, a) vectors are
-    standardised per-dimension (zero mean, unit variance) using statistics
-    computed from the stored trajectories.  This prevents high-variance
-    dimensions (e.g. MuJoCo joint velocities) from dominating the distance
-    computation and makes the lookup meaningful in high-dimensional spaces.
+    Before querying, all (s, a) vectors are standardised per-dimension
+    (zero mean, unit variance) using statistics computed from the stored
+    trajectories.  This prevents high-variance dimensions (e.g. MuJoCo joint
+    velocities) from dominating the distance computation and makes the lookup
+    meaningful in high-dimensional spaces.
 
     Attributes:
         max_buffer_size: Maximum number of trajectories to retain.
@@ -47,7 +47,8 @@ class IRCRRewardModel(base.RewardModel):
         # Per-dimension mean and std computed from _sa_matrix for standardisation.
         self._sa_mean: Optional[np.ndarray] = None  # (obs_dim + act_dim,)
         self._sa_std: Optional[np.ndarray] = None  # (obs_dim + act_dim,)
-        self._tree: Optional[spatial.KDTree] = None
+        self._nn: Optional[neighbors.NearestNeighbors] = None
+        self._traj_returns: Optional[np.ndarray] = None  # (n_trajs,)
         self._r_min: float = 0.0
         self._r_max: float = 1.0
 
@@ -62,30 +63,23 @@ class IRCRRewardModel(base.RewardModel):
         Returns zeros for all queries when the trajectory database is empty.
         """
         del terminals
-        if (
-            self._tree is None
-            or self._sa_matrix is None
-            or self._traj_indices is None
-            or self._sa_mean is None
-            or self._sa_std is None
-        ):
+        if self._nn is None:
             return np.zeros(len(observations), dtype=np.float32)
+        assert self._sa_mean is not None
+        assert self._sa_std is not None
+        assert self._sa_matrix is not None
+        assert self._traj_indices is not None
+        assert self._traj_returns is not None
 
         query = np.concatenate([observations, actions], axis=-1).astype(np.float64)
         query_normalised = (query - self._sa_mean) / self._sa_std
-        # Clamp k to the number of available (s, a) points.
         k_effective = min(self._k_neighbors, len(self._sa_matrix))
-        _, neighbor_indices = self._tree.query(query_normalised, k=k_effective)
-
-        # scipy returns shape (T,) when k=1; normalise to (T, k).
-        if k_effective == 1:
-            neighbor_indices = neighbor_indices[:, np.newaxis]
-
-        traj_returns = np.array(
-            [traj.episode_return for traj in self._trajectories], dtype=np.float64
+        # kneighbors always returns shape (T, k) — no shape fixup needed.
+        _, neighbor_indices = self._nn.kneighbors(
+            query_normalised, n_neighbors=k_effective
         )
-        # Average returns of the trajectories that own the k nearest points.
-        raw: np.ndarray = traj_returns[self._traj_indices[neighbor_indices]].mean(
+
+        raw: np.ndarray = self._traj_returns[self._traj_indices[neighbor_indices]].mean(
             axis=-1
         )
 
@@ -115,7 +109,7 @@ class IRCRRewardModel(base.RewardModel):
         }
 
     def _rebuild_index(self) -> None:
-        """Flatten all stored (s, a) pairs, standardise, and build KDTree."""
+        """Flatten all stored (s, a) pairs, standardise, and build NN index."""
         sa_parts: List[np.ndarray] = []
         traj_idx_parts: List[np.ndarray] = []
         for traj_idx, traj in enumerate(self._trajectories):
@@ -133,6 +127,14 @@ class IRCRRewardModel(base.RewardModel):
         std = self._sa_matrix.std(axis=0)
         self._sa_std = np.where(std > 1e-8, std, 1.0)
 
-        self._tree = spatial.KDTree((self._sa_matrix - self._sa_mean) / self._sa_std)
-        self._r_min = float(min(traj.episode_return for traj in self._trajectories))
-        self._r_max = float(max(traj.episode_return for traj in self._trajectories))
+        normalised = (self._sa_matrix - self._sa_mean) / self._sa_std
+        self._nn = neighbors.NearestNeighbors(
+            n_neighbors=self._k_neighbors, algorithm="auto", metric="euclidean"
+        )
+        self._nn.fit(normalised)
+
+        self._traj_returns = np.array(
+            [traj.episode_return for traj in self._trajectories], dtype=np.float64
+        )
+        self._r_min = float(self._traj_returns.min())
+        self._r_max = float(self._traj_returns.max())

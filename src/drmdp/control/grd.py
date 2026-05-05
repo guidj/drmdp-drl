@@ -104,6 +104,9 @@ class GRDRewardModel(base.RewardModel):
 
         self._traj_buffer: List[base.Trajectory] = []
         self._trans_buffer: List[_Transition] = []
+        self._cached_mask_sr: Optional[torch.Tensor] = None
+        self._cached_mask_ar: Optional[torch.Tensor] = None
+        self._cached_compact_obs_mask: Optional[np.ndarray] = None
 
     def predict(
         self,
@@ -123,14 +126,19 @@ class GRDRewardModel(base.RewardModel):
         """
         self._reward_net.eval()
         with torch.no_grad():
-            mask_sr, mask_ar, _, _ = self._causal.greedy_masks()
+            if self._cached_mask_sr is None:
+                mask_sr, mask_ar, _, _ = self._causal.greedy_masks()
+                self._cached_mask_sr = mask_sr
+                self._cached_mask_ar = mask_ar
+            assert self._cached_mask_sr is not None
+            assert self._cached_mask_ar is not None
             obs_t = torch.as_tensor(observations, dtype=torch.float32)
             act_t = torch.as_tensor(actions, dtype=torch.float32)
             term_t = torch.as_tensor(
                 terminals[:, np.newaxis].astype(np.float32), dtype=torch.float32
             )
-            masked_obs = obs_t * mask_sr.unsqueeze(0)
-            masked_act = act_t * mask_ar.unsqueeze(0)
+            masked_obs = obs_t * self._cached_mask_sr.unsqueeze(0)
+            masked_act = act_t * self._cached_mask_ar.unsqueeze(0)
             preds = self._reward_net(masked_obs, masked_act, term_t)
         result: np.ndarray = preds.squeeze(-1).cpu().numpy().astype(np.float32)
         return result
@@ -152,6 +160,10 @@ class GRDRewardModel(base.RewardModel):
             Metrics: buffer_size, training_steps, reward_loss, dyn_loss,
             sparsity_reg (averages over the final training epoch).
         """
+        self._cached_mask_sr = None
+        self._cached_mask_ar = None
+        self._cached_compact_obs_mask = None
+
         for trajectory in trajectories:
             self._traj_buffer.append(trajectory)
             self._trans_buffer.extend(_extract_transitions(trajectory))
@@ -274,11 +286,15 @@ class GRDRewardModel(base.RewardModel):
         selected by C^{s→r}, then transitively adds source dimensions via
         C^{s→s} until convergence. Shape (obs_dim,).
         """
-        with torch.no_grad():
-            mask_sr, _, mask_ss, _ = self._causal.greedy_masks()
-        mask_sr_np = mask_sr.cpu().numpy()
-        mask_ss_np = mask_ss.cpu().numpy()
-        return _compute_compact_mask(mask_sr_np, mask_ss_np)
+        if self._cached_compact_obs_mask is None:
+            with torch.no_grad():
+                mask_sr, _, mask_ss, _ = self._causal.greedy_masks()
+            mask_sr_np = mask_sr.cpu().numpy()
+            mask_ss_np = mask_ss.cpu().numpy()
+            self._cached_compact_obs_mask = _compute_compact_mask(
+                mask_sr_np, mask_ss_np
+            )
+        return self._cached_compact_obs_mask
 
     @property
     def obs_mask(self) -> Optional[np.ndarray]:
