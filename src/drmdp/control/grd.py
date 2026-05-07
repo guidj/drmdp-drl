@@ -107,6 +107,16 @@ class GRDRewardModel(base.RewardModel):
         self._cached_mask_sr: Optional[torch.Tensor] = None
         self._cached_mask_ar: Optional[torch.Tensor] = None
         self._cached_compact_obs_mask: Optional[np.ndarray] = None
+        # Stacked tensor view of self._traj_buffer, rebuilt lazily inside
+        # update() when _stacked_dirty is True. Lets the reward-loss
+        # training loop run one batched forward+backward per mini-batch
+        # instead of one per trajectory.
+        self._stacked_obs: Optional[torch.Tensor] = None
+        self._stacked_acts: Optional[torch.Tensor] = None
+        self._stacked_terms: Optional[torch.Tensor] = None
+        self._stacked_mask: Optional[torch.Tensor] = None
+        self._stacked_returns: Optional[torch.Tensor] = None
+        self._stacked_dirty = True
 
     def predict(
         self,
@@ -124,7 +134,8 @@ class GRDRewardModel(base.RewardModel):
         Returns:
             Per-step reward estimates, shape (T,), dtype float32.
         """
-        self._reward_net.eval()
+        if self._reward_net.training:
+            self._reward_net.eval()
         with torch.no_grad():
             if self._cached_mask_sr is None:
                 mask_sr, mask_ar, _, _ = self._causal.greedy_masks()
@@ -164,12 +175,15 @@ class GRDRewardModel(base.RewardModel):
         self._cached_mask_ar = None
         self._cached_compact_obs_mask = None
 
-        for trajectory in trajectories:
-            self._traj_buffer.append(trajectory)
-            self._trans_buffer.extend(_extract_transitions(trajectory))
+        if trajectories:
+            for trajectory in trajectories:
+                self._traj_buffer.append(trajectory)
+                self._trans_buffer.extend(_extract_transitions(trajectory))
+            self._stacked_dirty = True
 
         if len(self._traj_buffer) > self._max_buffer_size:
             self._traj_buffer = self._traj_buffer[-self._max_buffer_size :]
+            self._stacked_dirty = True
         if len(self._trans_buffer) > self._max_buffer_size:
             self._trans_buffer = self._trans_buffer[-self._max_buffer_size :]
 
@@ -182,7 +196,15 @@ class GRDRewardModel(base.RewardModel):
                 "sparsity_reg": 0.0,
             }
 
-        total_training_steps = 0
+        if self._stacked_dirty:
+            self._rebuild_stacked()
+
+        assert self._stacked_obs is not None
+        assert self._stacked_acts is not None
+        assert self._stacked_terms is not None
+        assert self._stacked_mask is not None
+        assert self._stacked_returns is not None
+
         last_reward_losses: List[float] = []
         last_dyn_losses: List[float] = []
         last_sparsity_regs: List[float] = []
@@ -200,33 +222,28 @@ class GRDRewardModel(base.RewardModel):
                 batch_traj_indices = traj_indices[
                     batch_start : batch_start + self._batch_size
                 ]
-                traj_batch = [self._traj_buffer[idx] for idx in batch_traj_indices]
+                idx_t = torch.as_tensor(batch_traj_indices, dtype=torch.long)
 
-                # --- reward loss (L_rew) ---
+                # --- reward loss (L_rew), batched over trajectories ---
+                obs_b = self._stacked_obs.index_select(0, idx_t)
+                act_b = self._stacked_acts.index_select(0, idx_t)
+                term_b = self._stacked_terms.index_select(0, idx_t)
+                mask_b = self._stacked_mask.index_select(0, idx_t)
+                returns_b = self._stacked_returns.index_select(0, idx_t)
+
                 mask_sr, mask_ar, _, _ = self._causal.sample_gumbel()
-                sum_preds: List[torch.Tensor] = []
-                episode_returns: List[float] = []
+                masked_obs = obs_b * mask_sr.view(1, 1, -1)
+                masked_act = act_b * mask_ar.view(1, 1, -1)
 
-                for trajectory in traj_batch:
-                    obs_t = torch.as_tensor(
-                        trajectory.observations, dtype=torch.float32
-                    )
-                    act_t = torch.as_tensor(trajectory.actions, dtype=torch.float32)
-                    term_t = torch.as_tensor(
-                        trajectory.terminals[:, np.newaxis].astype(np.float32),
-                        dtype=torch.float32,
-                    )
-                    masked_obs = obs_t * mask_sr.unsqueeze(0)
-                    masked_act = act_t * mask_ar.unsqueeze(0)
-                    preds = self._reward_net(masked_obs, masked_act, term_t)  # (T, 1)
-                    sum_preds.append(preds.sum())
-                    episode_returns.append(trajectory.episode_return)
-                    if epoch_idx == self._train_epochs - 1:
-                        total_training_steps += len(trajectory.observations)
-
-                sum_preds_t = torch.stack(sum_preds)
-                returns_t = torch.tensor(episode_returns, dtype=torch.float32)
-                reward_loss = F.mse_loss(sum_preds_t, returns_t)
+                batch_n, traj_t, _ = obs_b.shape
+                flat_preds = self._reward_net(
+                    masked_obs.reshape(batch_n * traj_t, self._obs_dim),
+                    masked_act.reshape(batch_n * traj_t, self._action_dim),
+                    term_b.reshape(batch_n * traj_t, 1),
+                )
+                preds = flat_preds.reshape(batch_n, traj_t, 1)
+                sum_preds = (preds * mask_b).sum(dim=1).squeeze(-1)
+                reward_loss = F.mse_loss(sum_preds, returns_b)
 
                 # --- dynamics loss (L_dyn) ---
                 trans_count = min(self._trans_batch_size, len(self._trans_buffer))
@@ -270,6 +287,10 @@ class GRDRewardModel(base.RewardModel):
                 last_dyn_losses = epoch_dyn_losses
                 last_sparsity_regs = epoch_sparsity_regs
 
+        # One pass over the buffer per epoch; the final epoch's count of
+        # real (non-padded) timesteps equals the sum of trajectory lengths.
+        total_training_steps = int(self._stacked_mask.sum().item())
+
         return {
             "buffer_size": float(len(self._traj_buffer)),
             "training_steps": float(total_training_steps),
@@ -277,6 +298,38 @@ class GRDRewardModel(base.RewardModel):
             "dyn_loss": float(np.mean(last_dyn_losses)),
             "sparsity_reg": float(np.mean(last_sparsity_regs)),
         }
+
+    def _rebuild_stacked(self) -> None:
+        """Materialise self._traj_buffer as (N, T_max, ...) padded torch tensors.
+
+        Trajectory length varies per episode; pad each trajectory to T_max
+        with zeros and track real-vs-padded positions in a binary mask.
+        The stacked tensors are reused across epochs of the same update().
+        """
+        trajectories = self._traj_buffer
+        num_trajs = len(trajectories)
+        traj_max = max(len(traj.observations) for traj in trajectories)
+
+        obs = np.zeros((num_trajs, traj_max, self._obs_dim), dtype=np.float32)
+        acts = np.zeros((num_trajs, traj_max, self._action_dim), dtype=np.float32)
+        terms = np.zeros((num_trajs, traj_max, 1), dtype=np.float32)
+        mask = np.zeros((num_trajs, traj_max, 1), dtype=np.float32)
+        returns = np.empty(num_trajs, dtype=np.float32)
+
+        for idx, trajectory in enumerate(trajectories):
+            length = len(trajectory.observations)
+            obs[idx, :length] = trajectory.observations
+            acts[idx, :length] = trajectory.actions
+            terms[idx, :length, 0] = trajectory.terminals
+            mask[idx, :length, 0] = 1.0
+            returns[idx] = trajectory.episode_return
+
+        self._stacked_obs = torch.from_numpy(obs)
+        self._stacked_acts = torch.from_numpy(acts)
+        self._stacked_terms = torch.from_numpy(terms)
+        self._stacked_mask = torch.from_numpy(mask)
+        self._stacked_returns = torch.from_numpy(returns)
+        self._stacked_dirty = False
 
     @property
     def compact_obs_mask(self) -> np.ndarray:

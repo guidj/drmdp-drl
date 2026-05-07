@@ -355,6 +355,145 @@ class TestComputeCompactMask:
         np.testing.assert_array_equal(result, np.zeros(4, dtype=np.float32))
 
 
+class TestGRDPredictMode:
+    def test_predict_leaves_reward_net_in_eval_mode(self):
+        """predict() always leaves _reward_net in eval mode."""
+        model = _make_model(obs_dim=4, action_dim=2)
+        model._reward_net.train()
+
+        model.predict(
+            np.zeros((3, 4), dtype=np.float32),
+            np.zeros((3, 2), dtype=np.float32),
+            np.zeros(3, dtype=bool),
+        )
+
+        assert model._reward_net.training is False
+
+    def test_predict_skips_eval_when_already_eval(self):
+        """The eval() switch is skipped when _reward_net is already in eval mode."""
+        model = _make_model(obs_dim=4, action_dim=2)
+        model._reward_net.eval()
+
+        call_counter = {"n": 0}
+        original_eval = model._reward_net.eval
+
+        def _counting_eval():
+            call_counter["n"] += 1
+            return original_eval()
+
+        model._reward_net.eval = _counting_eval  # type: ignore[method-assign]
+
+        for _ in range(3):
+            model.predict(
+                np.zeros((2, 4), dtype=np.float32),
+                np.zeros((2, 2), dtype=np.float32),
+                np.zeros(2, dtype=bool),
+            )
+
+        assert call_counter["n"] == 0
+
+
+class TestGRDVectorisedUpdate:
+    def test_buffer_invalidation_on_extend(self):
+        """_stacked_dirty resets to False after each update that adds trajectories."""
+        model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        model.update(trajs)
+        assert model._stacked_dirty is False
+        assert model._stacked_obs is not None
+
+        model.update(trajs)
+        assert model._stacked_dirty is False
+
+    def test_variable_length_trajectories_padded_correctly(self):
+        """Trajectories of different lengths are padded; mask matches real positions."""
+        traj_short = _make_trajectory(obs_dim=4, action_dim=2, num_steps=3)
+        traj_long = _make_trajectory(obs_dim=4, action_dim=2, num_steps=7)
+
+        model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
+        model.update([traj_short, traj_long])
+
+        assert model._stacked_obs.shape == (2, 7, 4)
+        assert model._stacked_mask.shape == (2, 7, 1)
+        np.testing.assert_array_equal(
+            model._stacked_mask[0, :, 0].numpy(),
+            np.array([1.0] * 3 + [0.0] * 4, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            model._stacked_mask[1, :, 0].numpy(),
+            np.ones(7, dtype=np.float32),
+        )
+
+    def test_padded_positions_excluded_from_sum_preds(self):
+        """Per-trajectory sum_preds is invariant to whatever fills padded slots."""
+        obs_dim, action_dim = 4, 2
+        traj_short = _make_trajectory(obs_dim, action_dim, num_steps=3)
+        traj_long = _make_trajectory(obs_dim, action_dim, num_steps=7)
+        model = _make_model(obs_dim=obs_dim, action_dim=action_dim, train_epochs=1)
+        model.update([traj_short, traj_long])
+
+        with torch.no_grad():
+            mask_sr, mask_ar, _, _ = model._causal.greedy_masks()
+
+        obs_a = model._stacked_obs.clone()
+        acts_a = model._stacked_acts.clone()
+        terms_a = model._stacked_terms.clone()
+        mask = model._stacked_mask
+
+        obs_b = obs_a.clone()
+        obs_b[0, 3:, :] = 1e6
+        acts_b = acts_a.clone()
+        acts_b[0, 3:, :] = 1e6
+        terms_b = terms_a.clone()
+        terms_b[0, 3:, :] = 1.0
+
+        def _sum_preds(obs_t, act_t, term_t):
+            batch_n, traj_t, _ = obs_t.shape
+            masked_o = obs_t * mask_sr.view(1, 1, -1)
+            masked_a = act_t * mask_ar.view(1, 1, -1)
+            flat = model._reward_net(
+                masked_o.reshape(batch_n * traj_t, obs_dim),
+                masked_a.reshape(batch_n * traj_t, action_dim),
+                term_t.reshape(batch_n * traj_t, 1),
+            )
+            return (flat.reshape(batch_n, traj_t, 1) * mask).sum(dim=1).squeeze(-1)
+
+        with torch.no_grad():
+            sum_a = _sum_preds(obs_a, acts_a, terms_a)
+            sum_b = _sum_preds(obs_b, acts_b, terms_b)
+
+        torch.testing.assert_close(sum_a, sum_b, atol=1e-4, rtol=0.0)
+
+    def test_update_deterministic_with_fixed_seed(self):
+        """Same buffer + same seed produces identical _reward_net params."""
+
+        def _train_once() -> List[torch.Tensor]:
+            torch.manual_seed(0)
+            np.random.seed(0)
+            model = _make_model(
+                obs_dim=4,
+                action_dim=2,
+                hidden_dim=16,
+                num_hidden_layers=1,
+                train_epochs=2,
+                batch_size=2,
+            )
+            trajs = _make_synthetic_trajectories(
+                num_trajs=4, obs_dim=4, action_dim=2, num_steps=5
+            )
+            model.update(trajs)
+            return [param.detach().clone() for param in model._reward_net.parameters()]
+
+        params_a = _train_once()
+        params_b = _train_once()
+        assert len(params_a) == len(params_b)
+        for tensor_a, tensor_b in zip(params_a, params_b):
+            torch.testing.assert_close(tensor_a, tensor_b, atol=1e-6, rtol=0.0)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

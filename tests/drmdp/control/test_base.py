@@ -250,3 +250,44 @@ class TestRelabelingReplayBufferWithMask:
         # All dims should be non-zero (stored values were in [0.5, 1.0]).
         obs_np = batch.observations.cpu().numpy()
         assert (obs_np != 0).any(axis=0).all()
+
+
+class TestRelabelingReplayBufferMaskCache:
+    def test_mask_tensor_is_cached_across_samples(self):
+        """The torch mask tensor is built once when the numpy mask is unchanged."""
+        obs_dim, act_dim = 3, 1
+        obs_mask = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        model = MaskingRewardModel(constant=0.0, obs_mask=obs_mask)
+        buf = _make_buffer(obs_dim, act_dim, capacity=100, reward_model=model)
+        _fill_buffer(
+            buf, n_transitions=20, obs_dim=obs_dim, act_dim=act_dim, reward_value=1.0
+        )
+
+        buf.sample(batch_size=8)
+        first_tensor = buf._cached_mask_t
+        buf.sample(batch_size=8)
+        second_tensor = buf._cached_mask_t
+
+        assert first_tensor is second_tensor
+
+    def test_mask_tensor_rebuilds_when_numpy_array_replaced(self):
+        """Swapping the model's mask numpy array invalidates the cached tensor."""
+        obs_dim, act_dim = 3, 1
+        mask_a = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        mask_b = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        model = MaskingRewardModel(constant=0.0, obs_mask=mask_a)
+        buf = _make_buffer(obs_dim, act_dim, capacity=100, reward_model=model)
+        _fill_buffer(
+            buf, n_transitions=20, obs_dim=obs_dim, act_dim=act_dim, reward_value=1.0
+        )
+
+        buf.sample(batch_size=8)
+        tensor_a = buf._cached_mask_t
+
+        # Swap to a new numpy array with the same shape but different values.
+        model._obs_mask = mask_b
+        buf.sample(batch_size=8)
+        tensor_b = buf._cached_mask_t
+
+        assert tensor_a is not tensor_b
+        np.testing.assert_array_equal(tensor_b.cpu().numpy(), mask_b)

@@ -6,6 +6,7 @@ from typing import List
 
 import numpy as np
 import pytest
+import torch
 
 from drmdp.control import base, dgra
 
@@ -263,6 +264,166 @@ class TestDGRARewardModel:
             last_metrics = model.update(trajectories)
 
         assert last_metrics["reward_loss"] < first_metrics["reward_loss"]
+
+
+class TestVectorisedUpdate:
+    def test_buffer_invalidation_on_extend(self):
+        """_stacked_dirty flips True after each update that adds windows."""
+        model = dgra.DGRARewardModel(obs_dim=2, action_dim=1, train_epochs=1)
+        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+
+        model.update([traj])
+        assert model._stacked_dirty is False
+
+        model.update([traj])
+        assert model._stacked_dirty is False
+        assert model._stacked_obs is not None
+
+    def test_variable_length_windows_padded_correctly(self):
+        """Windows of different lengths are padded; padded positions don't leak."""
+        # Window 1: 2 steps with reward at step 1 (length=2).
+        traj_short = _make_trajectory(
+            obs=np.ones((2, 2), dtype=np.float32),
+            actions=np.ones((2, 1), dtype=np.float32),
+            env_rewards=np.array([0.0, 1.0], dtype=np.float32),
+        )
+        # Window 2: 4 steps with reward at step 3 (length=4).
+        traj_long = _make_trajectory(
+            obs=np.ones((4, 2), dtype=np.float32),
+            actions=np.ones((4, 1), dtype=np.float32),
+            env_rewards=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        model = dgra.DGRARewardModel(obs_dim=2, action_dim=1, train_epochs=1)
+        model.update([traj_short, traj_long])
+
+        assert model._stacked_obs.shape == (2, 4, 2)
+        assert model._stacked_mask.shape == (2, 4, 1)
+        # Short window: first 2 steps real, last 2 padded.
+        np.testing.assert_array_equal(
+            model._stacked_mask[0, :, 0].numpy(),
+            np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        # Long window: all 4 steps real.
+        np.testing.assert_array_equal(
+            model._stacked_mask[1, :, 0].numpy(),
+            np.ones(4, dtype=np.float32),
+        )
+
+    def test_padded_positions_excluded_from_sum_preds(self):
+        """Per-window sum_preds is independent of padded input values.
+
+        Verifies that the (preds * mask).sum(dim=1) aggregation in
+        update() is invariant to whatever was written into padded slots —
+        the mask must zero out those contributions.
+        """
+        obs_dim, action_dim = 2, 1
+        traj_short = _make_trajectory(
+            obs=np.ones((2, obs_dim), dtype=np.float32),
+            actions=np.ones((2, action_dim), dtype=np.float32),
+            env_rewards=np.array([0.0, 1.0], dtype=np.float32),
+        )
+        traj_long = _make_trajectory(
+            obs=np.ones((4, obs_dim), dtype=np.float32),
+            actions=np.ones((4, action_dim), dtype=np.float32),
+            env_rewards=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        model = dgra.DGRARewardModel(
+            obs_dim=obs_dim, action_dim=action_dim, train_epochs=1
+        )
+        model.update([traj_short, traj_long])
+
+        # Snapshot stacked state, then perturb padded positions of the
+        # short window (indices [0, 2:, :]) with a large value.
+        obs_a = model._stacked_obs.clone()
+        acts_a = model._stacked_acts.clone()
+        terms_a = model._stacked_terms.clone()
+        mask = model._stacked_mask
+
+        obs_b = obs_a.clone()
+        obs_b[0, 2:, :] = 1e6
+        acts_b = acts_a.clone()
+        acts_b[0, 2:, :] = 1e6
+        terms_b = terms_a.clone()
+        terms_b[0, 2:, :] = 1.0
+
+        def _sum_preds(obs_t, act_t, term_t):
+            batch_n, window_w, _ = obs_t.shape
+            flat = model._net(
+                obs_t.reshape(batch_n * window_w, obs_dim),
+                act_t.reshape(batch_n * window_w, action_dim),
+                term_t.reshape(batch_n * window_w, 1),
+            )
+            return (flat.reshape(batch_n, window_w, 1) * mask).sum(dim=1).squeeze(-1)
+
+        with torch.no_grad():
+            sum_a = _sum_preds(obs_a, acts_a, terms_a)
+            sum_b = _sum_preds(obs_b, acts_b, terms_b)
+
+        torch.testing.assert_close(sum_a, sum_b, atol=1e-5, rtol=0.0)
+
+    def test_update_deterministic_with_fixed_seed(self):
+        """Same buffer + same torch seed produces identical _net parameters."""
+
+        def _train_once() -> List[torch.Tensor]:
+            torch.manual_seed(0)
+            np.random.seed(0)
+            model = dgra.DGRARewardModel(
+                obs_dim=2,
+                action_dim=1,
+                hidden_dim=16,
+                num_hidden_layers=1,
+                train_epochs=2,
+                batch_size=2,
+            )
+            trajectories = [
+                _make_trajectory_with_window(obs_dim=2, action_dim=1) for _ in range(4)
+            ]
+            model.update(trajectories)
+            return [param.detach().clone() for param in model._net.parameters()]
+
+        params_a = _train_once()
+        params_b = _train_once()
+        assert len(params_a) == len(params_b)
+        for tensor_a, tensor_b in zip(params_a, params_b):
+            torch.testing.assert_close(tensor_a, tensor_b, atol=1e-6, rtol=0.0)
+
+
+class TestPredictMode:
+    def test_predict_leaves_net_in_eval_mode(self):
+        """predict() always leaves the net in eval mode regardless of starting state."""
+        model = dgra.DGRARewardModel(obs_dim=2, action_dim=1)
+        model._net.train()  # force train mode
+
+        model.predict(
+            np.zeros((3, 2), dtype=np.float32),
+            np.zeros((3, 1), dtype=np.float32),
+            np.zeros(3, dtype=bool),
+        )
+
+        assert model._net.training is False
+
+    def test_predict_skips_eval_when_already_eval(self):
+        """The eval() switch is skipped when the net is already in eval mode."""
+        model = dgra.DGRARewardModel(obs_dim=2, action_dim=1)
+        model._net.eval()
+
+        call_counter = {"n": 0}
+        original_eval = model._net.eval
+
+        def _counting_eval():
+            call_counter["n"] += 1
+            return original_eval()
+
+        model._net.eval = _counting_eval  # type: ignore[method-assign]
+
+        for _ in range(3):
+            model.predict(
+                np.zeros((2, 2), dtype=np.float32),
+                np.zeros((2, 1), dtype=np.float32),
+                np.zeros(2, dtype=bool),
+            )
+
+        assert call_counter["n"] == 0
 
 
 # ---------------------------------------------------------------------------

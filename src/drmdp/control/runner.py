@@ -100,7 +100,7 @@ class TrainingArgs:
     exp_name: str
     run_id: int
     eval_step_freq: int = 0
-    n_eval_episodes: int = 5
+    n_eval_episodes: int = 10
     seed: Optional[int] = None
     agent_type: str = "sac"
     sac_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
@@ -751,7 +751,7 @@ def _default_training_args() -> Mapping[str, Any]:
         "output_dir": tempfile.gettempdir(),
         "exp_name": "exp-000",
         "run_id": 0,
-        "eval_step_freq": 0,
+        "eval_step_freq": 500,
         "n_eval_episodes": 5,
         "seed": None,
         "agent_type": "sac",
