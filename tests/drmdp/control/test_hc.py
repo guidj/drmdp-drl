@@ -182,6 +182,53 @@ class TestHCReplayBuffer:
 # ---------------------------------------------------------------------------
 
 
+class TestHistoryEncoderArchitecture:
+    """Tests for _HistoryEncoder FC projection and GRU."""
+
+    def test_fc_projection_output_shape(self):
+        """FC layer projects (batch, max_delay, sa_dim) → (batch, max_delay, projection_dim)."""
+        sa_dim, hidden, proj = 10, 48, 48
+        encoder = hc._HistoryEncoder(sa_dim, hidden, proj)
+        history = torch.randn(4, 5, sa_dim)
+        output, h_n = encoder(history)
+        assert output.shape == (4, 5, hidden)
+
+    def test_gru_hidden_shape_default(self):
+        """Final hidden state has shape (1, batch, hidden_size) with default 48."""
+        sa_dim = 10
+        encoder = hc._HistoryEncoder(sa_dim)
+        history = torch.randn(4, 5, sa_dim)
+        _, h_n = encoder(history)
+        assert h_n.shape == (1, 4, 48)
+
+    def test_custom_projection_dim(self):
+        """Non-default projection_dim changes the FC layer width."""
+        sa_dim, hidden, proj = 10, 32, 24
+        encoder = hc._HistoryEncoder(sa_dim, hidden, proj)
+        assert encoder._proj.in_features == sa_dim
+        assert encoder._proj.out_features == proj
+        assert encoder._gru.input_size == proj
+        assert encoder._gru.hidden_size == hidden
+
+
+class TestHeadNetworkArchitecture:
+    """Tests for _HeadNetwork single linear layer."""
+
+    def test_single_linear_layer(self):
+        """Head network is a single nn.Linear, not an MLP."""
+        head = hc._HeadNetwork(48)
+        assert isinstance(head._linear, torch.nn.Linear)
+        assert head._linear.in_features == 48
+        assert head._linear.out_features == 1
+
+    def test_output_shape(self):
+        """Output shape is (batch, 1)."""
+        head = hc._HeadNetwork(48)
+        hidden = torch.randn(8, 48)
+        output = head(hidden)
+        assert output.shape == (8, 1)
+
+
 class TestHCSACPolicy:
     """Tests for HCSACPolicy attribute existence after _setup_model."""
 
@@ -203,6 +250,14 @@ class TestHCSACPolicy:
         agent = self._make_agent()
         assert hasattr(agent.policy, "head_optimizer")
         assert isinstance(agent.policy.head_optimizer, torch.optim.Optimizer)
+
+    def test_encoder_has_fc_projection(self):
+        """Encoder has FC projection layer before GRU."""
+        agent = self._make_agent()
+        encoder = agent.policy.history_encoder
+        assert hasattr(encoder, "_proj")
+        assert hasattr(encoder, "_gru")
+        assert encoder._gru.input_size == 48
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +319,34 @@ class TestHCSAC:
             env,
             max_delay=3,
             reg_lambda=0.0,
+            verbose=0,
+            buffer_size=500,
+            batch_size=32,
+            learning_starts=50,
+        )
+        agent.learn(total_timesteps=200)
+
+    def test_grad_clip_disabled_by_default(self):
+        """Default grad_clip_norm=None trains without error."""
+        env = self._make_hc_env(delay=3)
+        agent = hc.HCSAC(
+            env,
+            max_delay=3,
+            verbose=0,
+            buffer_size=500,
+            batch_size=32,
+            learning_starts=50,
+        )
+        assert agent._grad_clip_norm is None
+        agent.learn(total_timesteps=200)
+
+    def test_grad_clip_enabled(self):
+        """Training with explicit grad_clip_norm completes."""
+        env = self._make_hc_env(delay=3)
+        agent = hc.HCSAC(
+            env,
+            max_delay=3,
+            grad_clip_norm=1.0,
             verbose=0,
             buffer_size=500,
             batch_size=32,
