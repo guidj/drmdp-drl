@@ -494,6 +494,87 @@ class TestGRDVectorisedUpdate:
             torch.testing.assert_close(tensor_a, tensor_b, atol=1e-6, rtol=0.0)
 
 
+class TestGRDTrainEpochsDecay:
+    def test_default_decay_is_no_op(self):
+        train_epochs = 4
+        model = _make_model(obs_dim=4, action_dim=2, train_epochs=train_epochs)
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        epochs_run = _count_epochs_per_update(model, trajs, num_updates=3)
+
+        assert epochs_run == [train_epochs] * 3
+
+    def test_decay_reduces_epochs_geometrically(self):
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=10,
+            train_epochs_decay=0.5,
+        )
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        epochs_run = _count_epochs_per_update(model, trajs, num_updates=3)
+
+        assert epochs_run == [10, 5, 2]
+
+    def test_decay_floors_at_one(self):
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=2,
+            train_epochs_decay=0.1,
+        )
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        epochs_run = _count_epochs_per_update(model, trajs, num_updates=5)
+
+        assert epochs_run == [2, 1, 1, 1, 1]
+
+    def test_update_idx_does_not_increment_on_empty_buffer(self):
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=4,
+            train_epochs_decay=0.5,
+        )
+
+        # Fully empty path: no trajectories and no buffer state.
+        model.update([])
+        assert model._update_idx == 0
+
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+        epochs_run = _count_epochs_per_update(model, trajs, num_updates=1)
+        assert epochs_run == [4]
+
+    def test_metrics_reflect_effective_epochs(self):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=4,
+            train_epochs_decay=0.5,
+            batch_size=2,
+        )
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        m1 = model.update(trajs)
+        m2 = model.update(trajs)
+
+        assert np.isfinite(m1["reward_loss"])
+        assert np.isfinite(m2["reward_loss"])
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -505,6 +586,7 @@ def _make_model(
     hidden_dim: int = 16,
     num_hidden_layers: int = 1,
     train_epochs: int = 2,
+    train_epochs_decay: float = 1.0,
     batch_size: int = 4,
     trans_batch_size: int = 8,
     dyn_weight: float = 1.0,
@@ -517,11 +599,37 @@ def _make_model(
         hidden_dim=hidden_dim,
         num_hidden_layers=num_hidden_layers,
         train_epochs=train_epochs,
+        train_epochs_decay=train_epochs_decay,
         batch_size=batch_size,
         trans_batch_size=trans_batch_size,
         dyn_weight=dyn_weight,
         max_buffer_size=max_buffer_size,
     )
+
+
+def _count_epochs_per_update(
+    model: grd.GRDRewardModel,
+    trajs: List[base.Trajectory],
+    num_updates: int,
+) -> List[int]:
+    """Count epochs per update by intercepting np.random.permutation."""
+    counts: List[int] = []
+    call_counter = {"n": 0}
+    original_permutation = np.random.permutation
+
+    def _counting_permutation(*args, **kwargs):
+        call_counter["n"] += 1
+        return original_permutation(*args, **kwargs)
+
+    np.random.permutation = _counting_permutation  # type: ignore[assignment]
+    try:
+        for _ in range(num_updates):
+            before = call_counter["n"]
+            model.update(trajs)
+            counts.append(call_counter["n"] - before)
+    finally:
+        np.random.permutation = original_permutation  # type: ignore[assignment]
+    return counts
 
 
 def _make_trajectory(

@@ -426,6 +426,102 @@ class TestPredictMode:
         assert call_counter["n"] == 0
 
 
+class TestTrainEpochsDecay:
+    def test_default_decay_is_no_op(self):
+        """train_epochs_decay=1.0 (default) keeps a constant epoch count per update."""
+        train_epochs = 4
+        model = dgra.DGRARewardModel(obs_dim=2, action_dim=1, train_epochs=train_epochs)
+        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+
+        epochs_run = _count_epochs_per_update(model, [traj], num_updates=3)
+
+        assert epochs_run == [train_epochs] * 3
+
+    def test_decay_reduces_epochs_geometrically(self):
+        """Each successive update runs floor(train_epochs * decay**idx) epochs."""
+        model = dgra.DGRARewardModel(
+            obs_dim=2,
+            action_dim=1,
+            train_epochs=10,
+            train_epochs_decay=0.5,
+        )
+        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+
+        epochs_run = _count_epochs_per_update(model, [traj], num_updates=3)
+
+        assert epochs_run == [10, 5, 2]
+
+    def test_decay_floors_at_one(self):
+        """effective_epochs never drops below 1 once train_epochs * decay**idx < 1."""
+        model = dgra.DGRARewardModel(
+            obs_dim=2,
+            action_dim=1,
+            train_epochs=2,
+            train_epochs_decay=0.1,
+        )
+        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+
+        epochs_run = _count_epochs_per_update(model, [traj], num_updates=5)
+
+        assert epochs_run == [2, 1, 1, 1, 1]
+
+    def test_update_idx_does_not_increment_on_empty_buffer(self):
+        """Calls that early-return (empty buffer) leave _update_idx at 0."""
+        model = dgra.DGRARewardModel(
+            obs_dim=2,
+            action_dim=1,
+            train_epochs=4,
+            train_epochs_decay=0.5,
+        )
+
+        # Empty trajectories AND empty buffer → early-return path.
+        empty_traj = _make_trajectory(
+            obs=np.zeros((4, 2), dtype=np.float32),
+            actions=np.zeros((4, 1), dtype=np.float32),
+            env_rewards=np.zeros(4, dtype=np.float32),
+        )
+        model.update([empty_traj])
+        assert model._update_idx == 0
+
+        # First training-effective update; should still use the full 4 epochs
+        # (decay**0 == 1.0).
+        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+        epochs_run = _count_epochs_per_update(model, [traj], num_updates=1)
+        assert epochs_run == [4]
+
+    def test_metrics_reflect_effective_epochs(self):
+        """The last-losses capture targets epoch_idx = effective_epochs - 1.
+
+        Verifies that update() returns the average over the actual final
+        epoch rather than the (now unreached) original train_epochs - 1.
+        """
+        torch.manual_seed(0)
+        np.random.seed(0)
+        model = dgra.DGRARewardModel(
+            obs_dim=2,
+            action_dim=1,
+            train_epochs=4,
+            train_epochs_decay=0.5,
+            batch_size=1,
+        )
+        # Two separate trajectories give two windows = two mini-batches per epoch.
+        trajs = [
+            _make_trajectory_with_window(obs_dim=2, action_dim=1),
+            _make_trajectory_with_window(obs_dim=2, action_dim=1),
+        ]
+
+        # First update: 4 epochs.  Second update: 2 epochs.
+        m1 = model.update(trajs)
+        m2 = model.update([])
+
+        assert m1["reward_loss"] >= 0.0
+        assert m2["reward_loss"] >= 0.0
+        # Both must be finite (would be NaN if the wrong epoch_idx guard
+        # was used and last_*_losses stayed empty).
+        assert np.isfinite(m1["reward_loss"])
+        assert np.isfinite(m2["reward_loss"])
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -472,3 +568,36 @@ def _make_synthetic_trajectories(
         env_rewards = np.array([0.0, 0.0, 3.0, 0.0, 0.0, 3.0], dtype=np.float32)
         trajs.append(_make_trajectory(obs, actions, env_rewards))
     return trajs
+
+
+def _count_epochs_per_update(
+    model: dgra.DGRARewardModel,
+    trajs: List[base.Trajectory],
+    num_updates: int,
+) -> List[int]:
+    """Run `num_updates` updates and return the per-call epoch count.
+
+    Patches np.random.permutation (called once per epoch inside update())
+    to count invocations and bin them per update call.
+    """
+    counts: List[int] = []
+
+    def _run_one() -> None:
+        before = call_counter["n"]
+        model.update(trajs)
+        counts.append(call_counter["n"] - before)
+
+    call_counter = {"n": 0}
+    original_permutation = np.random.permutation
+
+    def _counting_permutation(*args, **kwargs):
+        call_counter["n"] += 1
+        return original_permutation(*args, **kwargs)
+
+    np.random.permutation = _counting_permutation  # type: ignore[assignment]
+    try:
+        for _ in range(num_updates):
+            _run_one()
+    finally:
+        np.random.permutation = original_permutation  # type: ignore[assignment]
+    return counts

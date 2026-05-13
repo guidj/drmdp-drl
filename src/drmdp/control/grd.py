@@ -70,6 +70,7 @@ class GRDRewardModel(base.RewardModel):
         num_hidden_layers: int = 4,
         learning_rate: float = 3e-4,
         train_epochs: int = 10,
+        train_epochs_decay: float = 1.0,
         batch_size: int = 4,
         trans_batch_size: int = 256,
         dyn_weight: float = 1.0,
@@ -80,6 +81,8 @@ class GRDRewardModel(base.RewardModel):
         self._obs_dim = obs_dim
         self._action_dim = action_dim
         self._train_epochs = train_epochs
+        self._train_epochs_decay = train_epochs_decay
+        self._update_idx = 0
         self._batch_size = batch_size
         self._trans_batch_size = trans_batch_size
         self._dyn_weight = dyn_weight
@@ -209,10 +212,15 @@ class GRDRewardModel(base.RewardModel):
         last_dyn_losses: List[float] = []
         last_sparsity_regs: List[float] = []
 
+        effective_epochs = max(
+            int(self._train_epochs * self._train_epochs_decay**self._update_idx),
+            1,
+        )
+
         self._reward_net.train()
         self._dyn_net.train()
 
-        for epoch_idx in range(self._train_epochs):
+        for epoch_idx in range(effective_epochs):
             traj_indices = np.random.permutation(len(self._traj_buffer))
             epoch_reward_losses: List[float] = []
             epoch_dyn_losses: List[float] = []
@@ -282,7 +290,7 @@ class GRDRewardModel(base.RewardModel):
                 epoch_dyn_losses.append(dyn_loss.item())
                 epoch_sparsity_regs.append(sparsity_reg.item())
 
-            if epoch_idx == self._train_epochs - 1:
+            if epoch_idx == effective_epochs - 1:
                 last_reward_losses = epoch_reward_losses
                 last_dyn_losses = epoch_dyn_losses
                 last_sparsity_regs = epoch_sparsity_regs
@@ -290,6 +298,8 @@ class GRDRewardModel(base.RewardModel):
         # One pass over the buffer per epoch; the final epoch's count of
         # real (non-padded) timesteps equals the sum of trajectory lengths.
         total_training_steps = int(self._stacked_mask.sum().item())
+
+        self._update_idx += 1
 
         return {
             "buffer_size": float(len(self._traj_buffer)),

@@ -128,6 +128,7 @@ class DGRARewardModel(base.RewardModel):
         num_hidden_layers: int = 4,
         learning_rate: float = 1e-3,
         train_epochs: int = 10,
+        train_epochs_decay: float = 1.0,
         batch_size: int = 64,
         regu_lam: float = 1.0,
         max_buffer_size: int = 500,
@@ -137,6 +138,8 @@ class DGRARewardModel(base.RewardModel):
         self._net = _RNetwork(obs_dim, action_dim, hidden_dim, num_hidden_layers)
         self._optimizer = torch.optim.Adam(self._net.parameters(), lr=learning_rate)
         self._train_epochs = train_epochs
+        self._train_epochs_decay = train_epochs_decay
+        self._update_idx = 0
         self._batch_size = batch_size
         self._regu_lam = regu_lam
         self._max_buffer_size = max_buffer_size
@@ -232,8 +235,13 @@ class DGRARewardModel(base.RewardModel):
         last_epoch_reward_losses: List[float] = []
         last_epoch_regu_losses: List[float] = []
 
+        effective_epochs = max(
+            int(self._train_epochs * self._train_epochs_decay**self._update_idx),
+            1,
+        )
+
         self._net.train()
-        for epoch_idx in range(self._train_epochs):
+        for epoch_idx in range(effective_epochs):
             indices = np.random.permutation(len(self._buffer))
             epoch_reward_losses: List[float] = []
             epoch_regu_losses: List[float] = []
@@ -272,13 +280,15 @@ class DGRARewardModel(base.RewardModel):
                 epoch_reward_losses.append(reward_loss.item())
                 epoch_regu_losses.append(regu_loss.item())
 
-            if epoch_idx == self._train_epochs - 1:
+            if epoch_idx == effective_epochs - 1:
                 last_epoch_reward_losses = epoch_reward_losses
                 last_epoch_regu_losses = epoch_regu_losses
 
         # Total training step count = number of real (non-padded) timesteps
         # touched in the final epoch — equals one full pass over the buffer.
         total_training_steps = int(self._stacked_mask.sum().item())
+
+        self._update_idx += 1
 
         return {
             "buffer_size": float(len(self._buffer)),
