@@ -42,7 +42,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import gymnasium as gym
 import numpy as np
 import ray
-import stable_baselines3
 from stable_baselines3.common import callbacks
 from stable_baselines3.common import evaluation as sb3_evaluation
 
@@ -456,8 +455,10 @@ def _run_sac(
     eval_logger: Optional[logger.ExperimentLogger] = None,
 ) -> None:
     """Train standard SAC with a reward model or directly on delayed rewards."""
+    import sbx
+
     reward_model = _make_reward_model(args, env)
-    sac = stable_baselines3.SAC(
+    sac = sbx.SAC(
         "MlpPolicy",
         env,
         replay_buffer_class=base.RelabelingReplayBuffer,
