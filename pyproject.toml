@@ -35,6 +35,8 @@ dependencies = [
     "gym-electric-motor>=2.0.0",
     "seaborn>=0.13.1",
     "tabulate",
+    "sbx-rl>=0.26.0",
+    "mujoco-mjx>=3.8.1",
 ]
 
 [tool.distutils.bdist_wheel]
