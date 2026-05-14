@@ -145,6 +145,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
         self._reward_model_total_steps: int = 0
+        self._last_update_step: int = 0
         self._start_time: float = 0.0
 
         self._last_episode_trajectory: Optional[base.Trajectory] = None
@@ -174,10 +175,11 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             self._on_episode_end()
 
         if (
-            self.num_timesteps % self._update_every_n_steps == 0
+            self.num_timesteps >= self._last_update_step + self._update_every_n_steps
             and len(self._pending_trajectories) > 0
         ):
             self._flush_pending_trajectories()
+            self._last_update_step = self.num_timesteps
 
         return True
 

@@ -78,6 +78,22 @@ class TestRewardModelUpdateCallback:
 
         assert model.update_calls == 0
 
+    def test_update_fires_when_episode_completes_after_modulo_boundary(self):
+        """Update fires at the step an episode completes, even if that step
+        is not an exact multiple of update_every_n_steps."""
+        model = _TrackingRewardModel()
+        update_every = 5
+        callback = _build_callback(reward_model=model, update_every=update_every)
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        for step_idx in range(1, 8):
+            done = step_idx == 6
+            _step_callback(callback, sac, obs, action, 1.0, done, step_idx)
+
+        assert model.update_calls == 1
+
     def test_clear_buffer_on_update(self):
         """replay_buffer.reset() is called after the reward model update when flag is set."""
         model = _TrackingRewardModel()

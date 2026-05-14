@@ -79,11 +79,11 @@ class IntervalPositionWrapper(gym.Wrapper):
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._position = min(self._position + 1, self._max_delay)
+        augmented = self._augment(obs)
         if info.get("interval_end", False) or terminated or truncated:
             self._position = 0
-        else:
-            self._position = min(self._position + 1, self._max_delay)
-        return self._augment(obs), reward, terminated, truncated, info
+        return augmented, reward, terminated, truncated, info
 
     def _augment(self, obs: np.ndarray) -> np.ndarray:
         pos = np.array([self._position / self._max_delay], dtype=np.float32)
