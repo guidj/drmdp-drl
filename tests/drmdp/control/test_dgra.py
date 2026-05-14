@@ -13,12 +13,14 @@ from drmdp.control import base, dgra
 
 class TestExtractWindows:
     def test_single_interval_produces_one_window(self):
-        """Trajectory with one non-zero reward produces exactly one window."""
+        """Trajectory with one interval_end produces exactly one window."""
         env_rewards = np.array([0.0, 0.0, 3.0], dtype=np.float32)
+        interval_ends = np.array([False, False, True])
         traj = _make_trajectory(
             obs=np.zeros((3, 2), dtype=np.float32),
             actions=np.zeros((3, 1), dtype=np.float32),
             env_rewards=env_rewards,
+            interval_ends=interval_ends,
         )
 
         windows = dgra._extract_windows(traj)
@@ -30,12 +32,14 @@ class TestExtractWindows:
         assert windows[0].observations.shape == (3, 2)
 
     def test_two_intervals_produce_two_windows(self):
-        """Trajectory with two non-zero rewards produces two windows in order."""
+        """Trajectory with two interval_ends produces two windows in order."""
         env_rewards = np.array([0.0, 0.0, 1.5, 0.0, 0.0, 2.5], dtype=np.float32)
+        interval_ends = np.array([False, False, True, False, False, True])
         traj = _make_trajectory(
             obs=np.arange(12, dtype=np.float32).reshape(6, 2),
             actions=np.zeros((6, 1), dtype=np.float32),
             env_rewards=env_rewards,
+            interval_ends=interval_ends,
         )
 
         windows = dgra._extract_windows(traj)
@@ -49,12 +53,14 @@ class TestExtractWindows:
         assert windows[1].end_return == pytest.approx(4.0)
 
     def test_partial_tail_skipped(self):
-        """Steps after the last non-zero reward are not included in any window."""
+        """Steps after the last interval_end are not included in any window."""
         env_rewards = np.array([0.0, 2.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        interval_ends = np.array([False, True, False, False, False])
         traj = _make_trajectory(
             obs=np.zeros((5, 2), dtype=np.float32),
             actions=np.zeros((5, 1), dtype=np.float32),
             env_rewards=env_rewards,
+            interval_ends=interval_ends,
         )
 
         windows = dgra._extract_windows(traj)
@@ -62,15 +68,39 @@ class TestExtractWindows:
         assert len(windows) == 1
         assert windows[0].observations.shape == (2, 2)  # steps 0 and 1 only
 
-    def test_all_zero_rewards_returns_empty(self):
-        """All-zero env_rewards produce no windows."""
+    def test_no_interval_ends_returns_empty(self):
+        """No interval_end flags produce no windows."""
         traj = _make_trajectory(
             obs=np.zeros((4, 2), dtype=np.float32),
             actions=np.zeros((4, 1), dtype=np.float32),
             env_rewards=np.zeros(4, dtype=np.float32),
+            interval_ends=np.zeros(4, dtype=bool),
         )
 
         assert dgra._extract_windows(traj) == []
+
+    def test_zero_aggregate_window_not_skipped(self):
+        """A window whose per-step rewards cancel out (sum=0) is still extracted."""
+        env_rewards = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 3.0], dtype=np.float32)
+        interval_ends = np.array([False, False, True, False, False, True])
+        traj = base.Trajectory(
+            observations=np.zeros((6, 2), dtype=np.float32),
+            actions=np.zeros((6, 1), dtype=np.float32),
+            env_rewards=env_rewards,
+            terminals=np.array([False, False, False, False, False, True]),
+            infos=tuple({"interval_end": bool(ie)} for ie in interval_ends),
+            episode_return=3.0,
+        )
+
+        windows = dgra._extract_windows(traj)
+
+        assert len(windows) == 2
+        assert windows[0].aggregate_reward == pytest.approx(0.0)
+        assert windows[0].start_return == pytest.approx(0.0)
+        assert windows[0].end_return == pytest.approx(0.0)
+        assert windows[1].aggregate_reward == pytest.approx(3.0)
+        assert windows[1].start_return == pytest.approx(0.0)
+        assert windows[1].end_return == pytest.approx(3.0)
 
     def test_cumulative_return_chains_across_windows(self):
         """Each window's start_return equals the preceding window's end_return.
@@ -79,10 +109,12 @@ class TestExtractWindows:
         return through consecutive windows rather than resetting it between them.
         """
         env_rewards = np.array([0.0, 1.0, 0.0, -0.5, 0.0, 3.0], dtype=np.float32)
+        interval_ends = np.array([False, True, False, True, False, True])
         traj = _make_trajectory(
             obs=np.zeros((6, 2), dtype=np.float32),
             actions=np.zeros((6, 1), dtype=np.float32),
             env_rewards=env_rewards,
+            interval_ends=interval_ends,
         )
 
         windows = dgra._extract_windows(traj)
@@ -103,12 +135,14 @@ class TestExtractWindows:
     def test_terminal_flag_preserved_in_window(self):
         """terminals in each window match the corresponding trajectory slice."""
         env_rewards = np.array([0.0, 1.0, 0.0, 2.0], dtype=np.float32)
+        interval_ends = np.array([False, True, False, True])
         terminals = np.array([False, False, False, True])
         traj = base.Trajectory(
             observations=np.zeros((4, 2), dtype=np.float32),
             actions=np.zeros((4, 1), dtype=np.float32),
             env_rewards=env_rewards,
             terminals=terminals,
+            infos=tuple({"interval_end": bool(ie)} for ie in interval_ends),
             episode_return=float(env_rewards.sum()),
         )
 
@@ -122,8 +156,12 @@ class TestExtractWindows:
         """observations in each window match the corresponding trajectory slice."""
         obs = np.arange(8, dtype=np.float32).reshape(4, 2)
         env_rewards = np.array([0.0, 1.0, 0.0, 2.0], dtype=np.float32)
+        interval_ends = np.array([False, True, False, True])
         traj = _make_trajectory(
-            obs=obs, actions=np.zeros((4, 1)), env_rewards=env_rewards
+            obs=obs,
+            actions=np.zeros((4, 1)),
+            env_rewards=env_rewards,
+            interval_ends=interval_ends,
         )
 
         windows = dgra._extract_windows(traj)
@@ -221,12 +259,13 @@ class TestDGRARewardModel:
         assert metrics["training_steps"] > 0
 
     def test_update_with_no_windows_returns_safely(self):
-        """Trajectory with all-zero rewards causes no exception; returns empty metrics."""
+        """Trajectory with no interval_ends causes no exception; returns empty metrics."""
         model = dgra.DGRARewardModel(obs_dim=2, action_dim=1)
         traj = _make_trajectory(
             obs=np.zeros((4, 2), dtype=np.float32),
             actions=np.zeros((4, 1), dtype=np.float32),
             env_rewards=np.zeros(4, dtype=np.float32),
+            interval_ends=np.zeros(4, dtype=bool),
         )
 
         metrics = model.update([traj])
@@ -281,17 +320,17 @@ class TestVectorisedUpdate:
 
     def test_variable_length_windows_padded_correctly(self):
         """Windows of different lengths are padded; padded positions don't leak."""
-        # Window 1: 2 steps with reward at step 1 (length=2).
         traj_short = _make_trajectory(
             obs=np.ones((2, 2), dtype=np.float32),
             actions=np.ones((2, 1), dtype=np.float32),
             env_rewards=np.array([0.0, 1.0], dtype=np.float32),
+            interval_ends=np.array([False, True]),
         )
-        # Window 2: 4 steps with reward at step 3 (length=4).
         traj_long = _make_trajectory(
             obs=np.ones((4, 2), dtype=np.float32),
             actions=np.ones((4, 1), dtype=np.float32),
             env_rewards=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            interval_ends=np.array([False, False, False, True]),
         )
         model = dgra.DGRARewardModel(obs_dim=2, action_dim=1, train_epochs=1)
         model.update([traj_short, traj_long])
@@ -321,11 +360,13 @@ class TestVectorisedUpdate:
             obs=np.ones((2, obs_dim), dtype=np.float32),
             actions=np.ones((2, action_dim), dtype=np.float32),
             env_rewards=np.array([0.0, 1.0], dtype=np.float32),
+            interval_ends=np.array([False, True]),
         )
         traj_long = _make_trajectory(
             obs=np.ones((4, obs_dim), dtype=np.float32),
             actions=np.ones((4, action_dim), dtype=np.float32),
             env_rewards=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            interval_ends=np.array([False, False, False, True]),
         )
         model = dgra.DGRARewardModel(
             obs_dim=obs_dim, action_dim=action_dim, train_epochs=1
@@ -474,11 +515,11 @@ class TestTrainEpochsDecay:
             train_epochs_decay=0.5,
         )
 
-        # Empty trajectories AND empty buffer → early-return path.
         empty_traj = _make_trajectory(
             obs=np.zeros((4, 2), dtype=np.float32),
             actions=np.zeros((4, 1), dtype=np.float32),
             env_rewards=np.zeros(4, dtype=np.float32),
+            interval_ends=np.zeros(4, dtype=bool),
         )
         model.update([empty_traj])
         assert model._update_idx == 0
@@ -531,15 +572,18 @@ def _make_trajectory(
     obs: np.ndarray,
     actions: np.ndarray,
     env_rewards: np.ndarray,
+    interval_ends: np.ndarray,
 ) -> base.Trajectory:
     """Build a Trajectory with the given imputed reward signal."""
     terminals = np.zeros(len(obs), dtype=bool)
     terminals[-1] = True
+    infos = tuple({"interval_end": bool(ie)} for ie in interval_ends)
     return base.Trajectory(
         observations=obs.astype(np.float32),
         actions=actions.astype(np.float32),
         env_rewards=env_rewards.astype(np.float32),
         terminals=terminals,
+        infos=infos,
         episode_return=float(env_rewards.sum()),
     )
 
@@ -548,9 +592,9 @@ def _make_trajectory_with_window(obs_dim: int, action_dim: int) -> base.Trajecto
     """Build a minimal 3-step trajectory with one complete delay window."""
     obs = np.zeros((3, obs_dim), dtype=np.float32)
     actions = np.zeros((3, action_dim), dtype=np.float32)
-    # Non-zero reward at the last step marks one complete interval.
     env_rewards = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    return _make_trajectory(obs, actions, env_rewards)
+    interval_ends = np.array([False, False, True])
+    return _make_trajectory(obs, actions, env_rewards, interval_ends)
 
 
 def _make_synthetic_trajectories(
@@ -561,12 +605,12 @@ def _make_synthetic_trajectories(
 ) -> List[base.Trajectory]:
     """Build trajectories where every step reward is 1.0 and window size is 3."""
     trajs = []
+    interval_ends = np.array([False, False, True, False, False, True])
     for _ in range(n_trajs):
         obs = rng.uniform(size=(6, obs_dim)).astype(np.float32)
         actions = rng.uniform(size=(6, action_dim)).astype(np.float32)
-        # Two complete windows of 3 steps each; aggregate = 3.0 per window.
         env_rewards = np.array([0.0, 0.0, 3.0, 0.0, 0.0, 3.0], dtype=np.float32)
-        trajs.append(_make_trajectory(obs, actions, env_rewards))
+        trajs.append(_make_trajectory(obs, actions, env_rewards, interval_ends))
     return trajs
 
 

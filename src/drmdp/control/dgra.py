@@ -12,15 +12,12 @@ progression of cumulative episode returns, encouraging predictions that are
 globally consistent with the return trajectory rather than just locally
 consistent with each delayed window.
 
-Windows are extracted from completed episode trajectories by scanning the
-imputed reward signal: a non-zero env_reward marks the end of a delay
-interval and provides the aggregate reward label for that window. Partial
-windows at episode termination (where no aggregate reward was received) are
-discarded.
-
-Note: delay intervals whose true aggregate reward is exactly 0 are not
-detectable from the imputed reward signal alone and will be skipped. This
-is a known limitation of the Trajectory schema.
+Windows are extracted from completed episode trajectories using the
+per-step ``infos[t]["interval_end"]`` flag injected by
+``ImputeMissingRewardWrapper``.  A ``True`` flag marks the end of a delay
+interval; the corresponding ``env_rewards[t]`` provides the aggregate
+reward label.  Partial windows at episode termination (where no aggregate
+reward was received) are discarded.
 """
 
 import dataclasses
@@ -339,10 +336,11 @@ class DGRARewardModel(base.RewardModel):
 def _extract_windows(trajectory: base.Trajectory) -> List[_Window]:
     """Extract delay-interval windows from a completed episode trajectory.
 
-    A window spans the steps between consecutive non-zero env_rewards. The
-    non-zero env_reward marks the interval end and provides the aggregate
-    reward label. A partial tail at episode termination (env_reward == 0 at
-    the terminal step) is discarded because no aggregate signal was received.
+    A window spans the steps between consecutive ``interval_end`` flags
+    (from ``trajectory.infos``).  The flag marks the interval end; the
+    corresponding ``env_rewards`` entry provides the aggregate reward
+    label.  A partial tail without an ``interval_end`` flag is discarded
+    because no aggregate signal was received.
 
     Args:
         trajectory: A completed episode trajectory from the control loop.
@@ -355,10 +353,10 @@ def _extract_windows(trajectory: base.Trajectory) -> List[_Window]:
     window_start = 0
     cumulative_return = 0.0
 
-    for step_idx, reward in enumerate(trajectory.env_rewards):
-        if reward == 0.0:
+    for step_idx in range(len(trajectory.env_rewards)):
+        if not trajectory.infos[step_idx].get("interval_end", False):
             continue
-        aggregate_reward = float(reward)
+        aggregate_reward = float(trajectory.env_rewards[step_idx])
         start_return = cumulative_return
         end_return = cumulative_return + aggregate_reward
         windows.append(

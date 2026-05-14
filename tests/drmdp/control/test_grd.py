@@ -3,7 +3,7 @@ Tests for drmdp.control.grd: GRDRewardModel, _CausalStructure, _RewardNetwork,
 _DynamicsNetwork, _extract_transitions, _compute_compact_mask, _sparsity_reg.
 """
 
-from typing import List
+from typing import Any, List, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -168,6 +168,7 @@ class TestExtractTransitions:
             actions=np.zeros((3, 1), dtype=np.float32),
             env_rewards=np.zeros(3, dtype=np.float32),
             terminals=np.array([True, True, True]),
+            infos=({}, {}, {}),
             episode_return=0.0,
         )
         assert grd._extract_transitions(traj) == []
@@ -178,6 +179,7 @@ class TestExtractTransitions:
             actions=np.zeros((1, 1), dtype=np.float32),
             env_rewards=np.zeros(1, dtype=np.float32),
             terminals=np.array([True]),
+            infos=({},),
             episode_return=0.0,
         )
         assert grd._extract_transitions(traj) == []
@@ -642,11 +644,13 @@ def _make_trajectory(
     rng = np.random.default_rng(0)
     terminals = np.zeros(num_steps, dtype=bool)
     terminals[-1] = True
+    infos: Sequence[Mapping[str, Any]] = tuple({} for _ in range(num_steps))
     return base.Trajectory(
         observations=rng.standard_normal((num_steps, obs_dim)).astype(np.float32),
         actions=rng.standard_normal((num_steps, action_dim)).astype(np.float32),
         env_rewards=np.zeros(num_steps, dtype=np.float32),
         terminals=terminals,
+        infos=infos,
         episode_return=episode_return,
     )
 

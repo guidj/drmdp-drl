@@ -21,6 +21,10 @@ class Trajectory:
         actions: Actions taken at each step, shape (T, action_dim).
         env_rewards: Raw environment rewards (delayed aggregate or 0-imputed), shape (T,).
         terminals: Episode-end flags per step, shape (T,).
+        infos: Per-step info dicts from the environment wrappers.  Contains
+            at minimum ``interval_end`` (from ``ImputeMissingRewardWrapper``),
+            ``delay``, ``segment``, ``segment_step`` (from
+            ``DelayedRewardWrapper``).
         episode_return: Sum of env_rewards over the episode.
     """
 
@@ -28,6 +32,7 @@ class Trajectory:
     actions: np.ndarray
     env_rewards: np.ndarray
     terminals: np.ndarray
+    infos: Sequence[Mapping[str, Any]]
     episode_return: float
 
 

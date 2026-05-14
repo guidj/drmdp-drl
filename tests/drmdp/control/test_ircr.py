@@ -21,11 +21,13 @@ def _make_trajectory(
     env_rewards = np.full(n_steps, episode_return / max(n_steps, 1), dtype=np.float32)
     terminals = np.zeros(n_steps, dtype=bool)
     terminals[-1] = True
+    infos = tuple({"interval_end": False} for _ in range(n_steps))
     return base.Trajectory(
         observations=obs.astype(np.float32),
         actions=actions.astype(np.float32),
         env_rewards=env_rewards,
         terminals=terminals,
+        infos=infos,
         episode_return=episode_return,
     )
 

@@ -137,6 +137,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._episode_actions: List[np.ndarray] = []
         self._episode_rewards: List[float] = []
         self._episode_terminals: List[bool] = []
+        self._episode_infos: List[Mapping[str, Any]] = []
         self._episode_steps: int = 0
         self._episode_count: int = 0
         self._last_logged_episode: int = 0
@@ -160,11 +161,13 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         action = self.locals["actions"][0]
         reward = float(self.locals["rewards"][0])
         done = bool(self.locals["dones"][0])
+        info = dict(self.locals["infos"][0])
 
         self._episode_obs.append(obs_before.copy())
         self._episode_actions.append(action.copy())
         self._episode_rewards.append(reward)
         self._episode_terminals.append(done)
+        self._episode_infos.append(info)
         self._episode_steps += 1
 
         if done:
@@ -194,6 +197,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             actions=np.stack(self._episode_actions),
             env_rewards=np.array(self._episode_rewards, dtype=np.float32),
             terminals=np.array(self._episode_terminals),
+            infos=tuple(self._episode_infos),
             episode_return=float(sum(self._episode_rewards)),
         )
         self._pending_trajectories.append(trajectory)
@@ -215,6 +219,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._episode_actions = []
         self._episode_rewards = []
         self._episode_terminals = []
+        self._episode_infos = []
         self._episode_steps = 0
 
     def _log_episode(self, training_complete: bool = False) -> None:
