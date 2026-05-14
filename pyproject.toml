@@ -37,6 +37,7 @@ dependencies = [
     "tabulate",
     "sbx-rl>=0.26.0",
     "mujoco-mjx>=3.8.1",
+    "tf-keras>=2.18.0",
 ]
 
 [tool.distutils.bdist_wheel]
