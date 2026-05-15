@@ -2,9 +2,9 @@
   "environments": [
     {
       "env": "Hopper-v5",
-      "env_kwargs": {"max_episode_steps": 1000, "exclude_current_positions_from_observation": true},
+      "env_kwargs": {"max_episode_steps": 1000},
       "delay": 3,
-      "num_steps": 5e5,
+      "num_steps": 1e5,
       "eval_step_freq": 400,
       "sac_kwargs": {
         "learning_rate": 3e-4,
@@ -19,7 +19,7 @@
         },
         {
           "reward_model_type": "ircr",
-          "reward_model_kwargs": {"max_buffer_size": 200, "k_neighbors": 5}
+          "reward_model_kwargs": {"max_buffer_size": 10000, "k_neighbors": 5}
         },
         {
           "reward_model_type": "dgra",
