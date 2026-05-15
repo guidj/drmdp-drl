@@ -1,6 +1,6 @@
 """
 Tests for drmdp.control.grd: GRDRewardModel, _CausalStructure, _RewardNetwork,
-_DynamicsNetwork, _extract_transitions, _compute_compact_mask, _sparsity_reg.
+_DynamicsNetwork, _extract_transition_arrays, _compute_compact_mask, _sparsity_reg.
 """
 
 from typing import Any, List, Mapping, Sequence
@@ -148,19 +148,20 @@ class TestDynamicsNetwork:
         np.testing.assert_allclose(pi.sum(dim=-1).numpy(), np.ones((5, 3)), atol=1e-5)
 
 
-class TestExtractTransitions:
+class TestExtractTransitionArrays:
     def test_terminal_step_skipped(self):
         traj = _make_trajectory(obs_dim=2, action_dim=1, num_steps=4)
-        transitions = grd._extract_transitions(traj)
-        # The terminal step (last) should be skipped.
-        assert len(transitions) == 3
+        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        assert len(obs) == 3
 
     def test_obs_next_obs_slices_are_consecutive(self):
         traj = _make_trajectory(obs_dim=2, action_dim=1, num_steps=4)
-        transitions = grd._extract_transitions(traj)
-        for step_idx, tr in enumerate(transitions):
-            np.testing.assert_array_equal(tr.obs, traj.observations[step_idx])
-            np.testing.assert_array_equal(tr.next_obs, traj.observations[step_idx + 1])
+        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        for step_idx in range(len(obs)):
+            np.testing.assert_array_equal(obs[step_idx], traj.observations[step_idx])
+            np.testing.assert_array_equal(
+                nxt[step_idx], traj.observations[step_idx + 1]
+            )
 
     def test_all_terminal_trajectory_yields_no_transitions(self):
         traj = base.Trajectory(
@@ -171,7 +172,8 @@ class TestExtractTransitions:
             infos=({}, {}, {}),
             episode_return=0.0,
         )
-        assert grd._extract_transitions(traj) == []
+        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        assert len(obs) == 0
 
     def test_single_step_episode_yields_no_transitions(self):
         traj = base.Trajectory(
@@ -182,7 +184,8 @@ class TestExtractTransitions:
             infos=({},),
             episode_return=0.0,
         )
-        assert grd._extract_transitions(traj) == []
+        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        assert len(obs) == 0
 
 
 class TestSparsityReg:

@@ -24,7 +24,6 @@ time via RelabelingReplayBuffer.obs_mask so the policy trains on only the
 causally relevant dimensions.
 """
 
-import dataclasses
 import math
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -106,7 +105,10 @@ class GRDRewardModel(base.RewardModel):
         )
 
         self._traj_buffer: List[base.Trajectory] = []
-        self._trans_buffer: List[_Transition] = []
+        self._trans_obs = np.empty((0, obs_dim), dtype=np.float32)
+        self._trans_act = np.empty((0, action_dim), dtype=np.float32)
+        self._trans_next = np.empty((0, obs_dim), dtype=np.float32)
+        self._trans_count: int = 0
         self._cached_mask_sr: Optional[torch.Tensor] = None
         self._cached_mask_ar: Optional[torch.Tensor] = None
         self._cached_compact_obs_mask: Optional[np.ndarray] = None
@@ -181,14 +183,22 @@ class GRDRewardModel(base.RewardModel):
         if trajectories:
             for trajectory in trajectories:
                 self._traj_buffer.append(trajectory)
-                self._trans_buffer.extend(_extract_transitions(trajectory))
+                obs, act, nxt = _extract_transition_arrays(trajectory)
+                if len(obs) > 0:
+                    self._trans_obs = np.concatenate([self._trans_obs, obs])
+                    self._trans_act = np.concatenate([self._trans_act, act])
+                    self._trans_next = np.concatenate([self._trans_next, nxt])
+                    self._trans_count = len(self._trans_obs)
             self._stacked_dirty = True
 
         if len(self._traj_buffer) > self._max_buffer_size:
             self._traj_buffer = self._traj_buffer[-self._max_buffer_size :]
             self._stacked_dirty = True
-        if len(self._trans_buffer) > self._max_buffer_size:
-            self._trans_buffer = self._trans_buffer[-self._max_buffer_size :]
+        if self._trans_count > self._max_buffer_size:
+            self._trans_obs = self._trans_obs[-self._max_buffer_size :]
+            self._trans_act = self._trans_act[-self._max_buffer_size :]
+            self._trans_next = self._trans_next[-self._max_buffer_size :]
+            self._trans_count = len(self._trans_obs)
 
         if not self._traj_buffer:
             return {
@@ -239,7 +249,7 @@ class GRDRewardModel(base.RewardModel):
                 mask_b = self._stacked_mask.index_select(0, idx_t)
                 returns_b = self._stacked_returns.index_select(0, idx_t)
 
-                mask_sr, mask_ar, _, _ = self._causal.sample_gumbel()
+                mask_sr, mask_ar, mask_ss, mask_as = self._causal.sample_gumbel()
                 masked_obs = obs_b * mask_sr.view(1, 1, -1)
                 masked_act = act_b * mask_ar.view(1, 1, -1)
 
@@ -254,23 +264,20 @@ class GRDRewardModel(base.RewardModel):
                 reward_loss = F.mse_loss(sum_preds, returns_b)
 
                 # --- dynamics loss (L_dyn) ---
-                trans_count = min(self._trans_batch_size, len(self._trans_buffer))
+                trans_count = min(self._trans_batch_size, self._trans_count)
                 trans_indices = np.random.choice(
-                    len(self._trans_buffer), size=trans_count, replace=False
+                    self._trans_count, size=trans_count, replace=False
                 )
-                trans_batch = [self._trans_buffer[idx] for idx in trans_indices]
 
                 obs_batch = torch.as_tensor(
-                    np.stack([tr.obs for tr in trans_batch]), dtype=torch.float32
+                    self._trans_obs[trans_indices], dtype=torch.float32
                 )
                 act_batch = torch.as_tensor(
-                    np.stack([tr.action for tr in trans_batch]), dtype=torch.float32
+                    self._trans_act[trans_indices], dtype=torch.float32
                 )
                 next_obs_batch = torch.as_tensor(
-                    np.stack([tr.next_obs for tr in trans_batch]), dtype=torch.float32
+                    self._trans_next[trans_indices], dtype=torch.float32
                 )
-
-                _, _, mask_ss, mask_as = self._causal.sample_gumbel()
                 dyn_loss = self._dyn_net.nll(
                     obs_batch, act_batch, next_obs_batch, mask_ss, mask_as
                 )
@@ -576,23 +583,10 @@ class _DynamicsNetwork(nn.Module):
         return -torch.logsumexp(log_mix, dim=-1).mean()
 
 
-@dataclasses.dataclass(frozen=True)
-class _Transition:
-    """A single (s_t, a_t, s_{t+1}) transition.
-
-    Attributes:
-        obs: Observation at step t, shape (obs_dim,).
-        action: Action taken at step t, shape (action_dim,).
-        next_obs: Observation at step t+1, shape (obs_dim,).
-    """
-
-    obs: np.ndarray
-    action: np.ndarray
-    next_obs: np.ndarray
-
-
-def _extract_transitions(trajectory: base.Trajectory) -> List[_Transition]:
-    """Extract (s_t, a_t, s_{t+1}) triples from a completed trajectory.
+def _extract_transition_arrays(
+    trajectory: base.Trajectory,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract (s_t, a_t, s_{t+1}) arrays from a completed trajectory.
 
     The terminal step has no valid next observation, so it is skipped.
 
@@ -600,23 +594,18 @@ def _extract_transitions(trajectory: base.Trajectory) -> List[_Transition]:
         trajectory: A completed episode trajectory.
 
     Returns:
-        List of transitions in chronological order.
+        (obs, actions, next_obs) arrays, each shape (N, dim) where N is
+        the number of non-terminal steps with a valid successor.
     """
-    transitions: List[_Transition] = []
-    num_steps = len(trajectory.observations)
-    for step_idx in range(num_steps):
-        if trajectory.terminals[step_idx]:
-            continue
-        if step_idx + 1 >= num_steps:
-            continue
-        transitions.append(
-            _Transition(
-                obs=trajectory.observations[step_idx],
-                action=trajectory.actions[step_idx],
-                next_obs=trajectory.observations[step_idx + 1],
-            )
-        )
-    return transitions
+    non_terminal = ~trajectory.terminals
+    has_successor = np.ones(len(trajectory.observations), dtype=bool)
+    has_successor[-1] = False
+    valid = non_terminal & has_successor
+    obs = trajectory.observations[valid]
+    actions = trajectory.actions[valid]
+    next_indices = np.where(valid)[0] + 1
+    next_obs = trajectory.observations[next_indices]
+    return obs, actions, next_obs
 
 
 def _compute_compact_mask(
