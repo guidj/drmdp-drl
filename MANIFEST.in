@@ -18,6 +18,7 @@ include pyproject.toml
 include Makefile
 recursive-include src *.typed
 include tox.ini
+recursive-include specs *.json
 
 # deps
 include uv.lock
