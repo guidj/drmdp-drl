@@ -129,7 +129,7 @@ class IRCRRewardModel(base.RewardModel):
 
         normalised = (self._sa_matrix - self._sa_mean) / self._sa_std
         self._nn = neighbors.NearestNeighbors(
-            n_neighbors=self._k_neighbors, algorithm="auto", metric="euclidean"
+            n_neighbors=self._k_neighbors, algorithm="brute", metric="euclidean"
         )
         self._nn.fit(normalised)
 
