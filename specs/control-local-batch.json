@@ -4,7 +4,7 @@
       "env": "Hopper-v5",
       "env_kwargs": {"max_episode_steps": 1000},
       "delay": 3,
-      "num_steps": 1e5,
+      "num_steps": 1e6,
       "eval_step_freq": 400,
       "sac_kwargs": {
         "learning_rate": 3e-4,
@@ -29,7 +29,7 @@
             "batch_size": 64,
             "regu_lam": 1.0,
             "learning_rate": 1e-3,
-            "train_epochs_decay": 0.99
+            "train_epochs_decay": 1.0
           }
         },
         {
@@ -43,7 +43,7 @@
             "sparsity_lam_diag": 1e-4,
             "sparsity_lam_offdiag": 1e-5,
             "learning_rate": 3e-4,
-            "train_epochs_decay": 0.99
+            "train_epochs_decay": 1.0
           }
         },        
         {
