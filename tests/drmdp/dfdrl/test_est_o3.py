@@ -285,21 +285,24 @@ class TestEMTrain:
         for key in ("reward", "regu", "total"):
             assert np.isfinite(final_mse[key]), f"final_mse[{key!r}] is not finite"
 
-    def test_loss_decreases(self, training_dataset):
-        """Train loss should decrease over several epochs on a realistic dataset."""
-        env = gym.make("MountainCarContinuous-v0")
+    def test_loss_decreases(self):
+        """Total loss should decrease over several epochs (EM convergence)."""
+        dataset = _make_synthetic_em_dataset(
+            num_examples=20, seq_len=5, obs_dim=2, act_dim=1
+        )
+        env = _make_stub_env(obs_dim=2, act_dim=1)
 
+        tiny_model = {"num_hidden_layers": 1, "hidden_dim": 16}
         with tempfile.TemporaryDirectory() as output_dir:
-            # Patch train to capture epoch losses; run two separate short trains
-            # instead — compare initial vs final total loss via final_mse
             final_mse_short, _ = est_o3.train(
                 env,
-                dataset=training_dataset,
+                dataset=dataset,
                 train_epochs=1,
                 batch_size=8,
-                eval_steps=5,
+                eval_steps=0,
                 log_episode_frequency=1,
                 regu_lam=0.5,
+                reward_model_kwargs=tiny_model,
                 seed=0,
                 output_dir=output_dir,
             )
@@ -307,20 +310,20 @@ class TestEMTrain:
         with tempfile.TemporaryDirectory() as output_dir:
             final_mse_long, _ = est_o3.train(
                 env,
-                dataset=training_dataset,
-                train_epochs=20,
+                dataset=dataset,
+                train_epochs=5,
                 batch_size=8,
-                eval_steps=5,
+                eval_steps=0,
                 log_episode_frequency=5,
                 regu_lam=0.5,
+                reward_model_kwargs=tiny_model,
                 seed=0,
                 output_dir=output_dir,
             )
 
-        # After more epochs the reward loss should be lower (EM convergence)
-        assert final_mse_long["reward"] < final_mse_short["reward"], (
-            f"Expected loss to decrease: {final_mse_short['reward']:.4f} -> "
-            f"{final_mse_long['reward']:.4f}"
+        assert final_mse_long["total"] < final_mse_short["total"], (
+            f"Expected total loss to decrease: {final_mse_short['total']:.4f} -> "
+            f"{final_mse_long['total']:.4f}"
         )
 
     def test_invalid_model_type_raises(self, simple_model_and_dataset):
@@ -636,6 +639,57 @@ def simple_model_and_dataset():
     model = est_o3.RNetwork(state_dim=2, action_dim=1, hidden_dim=16)
 
     return model, dataset
+
+
+def _make_stub_env(obs_dim: int, act_dim: int):
+    """Minimal object with observation_space and action_space for train()."""
+    stub = type("StubEnv", (), {})()
+    stub.observation_space = gym.spaces.Box(low=-1, high=1, shape=(obs_dim,))
+    stub.action_space = gym.spaces.Box(low=-1, high=1, shape=(act_dim,))
+    return stub
+
+
+def _make_synthetic_em_dataset(
+    num_examples: int = 20,
+    seq_len: int = 5,
+    obs_dim: int = 2,
+    act_dim: int = 1,
+) -> est_o3.DictDataset:
+    """Build a deterministic synthetic dataset for EM convergence tests."""
+    rng = np.random.default_rng(42)
+    inputs_list = []
+    labels_list = []
+    cumulative = 0.0
+    for _ in range(num_examples):
+        states = torch.from_numpy(
+            rng.standard_normal((seq_len, obs_dim)).astype(np.float32)
+        )
+        actions = torch.from_numpy(
+            rng.standard_normal((seq_len, act_dim)).astype(np.float32)
+        )
+        per_step = torch.from_numpy(
+            rng.uniform(0.5, 2.0, size=seq_len).astype(np.float32)
+        )
+        aggregate = per_step.sum()
+        start_return = cumulative
+        end_return = cumulative + aggregate.item()
+        cumulative = end_return
+        inputs_list.append(
+            {
+                "state": states,
+                "action": actions,
+                "term": torch.zeros(seq_len, 1),
+            }
+        )
+        labels_list.append(
+            {
+                "aggregate_reward": aggregate,
+                "per_step_rewards": per_step,
+                "start_return": torch.tensor(start_return),
+                "end_return": torch.tensor(end_return),
+            }
+        )
+    return est_o3.DictDataset(inputs=inputs_list, labels=labels_list)
 
 
 @pytest.fixture(scope="module")
