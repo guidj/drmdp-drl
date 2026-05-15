@@ -10,30 +10,15 @@ Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous
 
 ### Post-Change Verification
 
-After **any** code change, run:
-
-```sh
-make format && make check && make test
-```
-
-Identify all issues found. If the issues are minor (formatting, a missing annotation, a small logic fix), address them directly. If they are moderate — for example, they require changes to interfaces, public APIs, or multiple files — propose a plan for review before proceeding.
+After **any** code change, run `/verify-change` (see Skills). Do not skip it for small changes.
 
 ### Planning Mode
-Whenever you create an implementation plan — whether via `/plan`, `EnterPlanMode`, or in response to any non-trivial task request — **always write the plan to `agents/plans/yyyy-mm-dd-{plan-name}.md` before starting implementation**. This is required unconditionally; do not defer it or skip it because the task seems small. Use the Write tool to create the file.
+
+Whenever you create an implementation plan — whether via `/plan`, `EnterPlanMode`, or in response to any non-trivial task request — **always write the plan to `agents/plans/yyyy-mm-dd-{plan-name}.md` before starting implementation**. This is required unconditionally. Use the Write tool to create the file.
 
 ### Code Review After Implementation
 
-After completing any non-trivial implementation — new source files, refactors, or new/modified test files — spawn a dedicated subagent to audit the touched files. Do **not** rely on your own review of changes you just wrote; a fresh subagent catches violations the authoring agent overlooks.
-
-The subagent must check every touched file across four areas and **make corrections directly** rather than just reporting:
-
-**Style** (`src/` and `tests/`): newspaper order (classes before module-level functions; `__init__` first, public methods, `_`-helpers last); all imports at module level; only modules/types imported, never bare functions; no single-letter variable names; no what-comments; fully-parameterised `typing` annotations (`Mapping`/`Sequence` unless mutation required).
-
-**Test structure** (`tests/`): every test is a method inside `class TestFoo` — no bare `def test_*`; helper functions and fixtures placed *after* all test classes.
-
-**Logical correctness**: tests must exercise production code, not reimplement its logic; check for dead code paths; verify callers are updated after refactors; flag new public APIs without tests.
-
-**Testability**: if logic is only testable by reimplementing it, refactor to expose it (callback pattern, intermediate return); flag overly large functions that mix concerns.
+After completing any non-trivial implementation, run `/post-impl-review` on the touched files (see Skills). Do not rely on self-review of code you just wrote.
 
 ## Development Commands
 
@@ -142,6 +127,46 @@ Online policy learning via SB3 SAC with pluggable reward estimation. The policy 
 ```
 File-internal precedence: top-level fields → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`. `num_runs` and `output_dir` are reserved keys excluded from the training-arg merge.
 
+## Skills
+
+Four project-specific skills are available. Use them by name — the skill list in the system prompt shows when they are loaded.
+
+### `/verify-change` — post-change quality gate
+
+Runs `make format && make check && make test`, triages failures, and chains to `/post-impl-review` on success. The single command that replaces the manual post-change workflow.
+
+```
+/verify-change                          # auto-detects touched files from git diff
+/verify-change src/drmdp/control/grd.py tests/drmdp/control/test_grd.py
+```
+
+### `/post-impl-review` — drmdp style and correctness review
+
+Reads every touched file and applies the project's four-area checklist, making corrections directly. Triggered automatically by `/verify-change`; also useful after targeted edits.
+
+```
+/post-impl-review src/drmdp/rewdelay.py tests/drmdp/test_rewdelay.py
+/post-impl-review src/drmdp/dfdrl/est_o1.py   # episode-boundary check auto-activates
+```
+
+### `/add-reward-model <name>` — reward model scaffold
+
+Creates `src/drmdp/control/{name}.py` (implementing `RewardModel` ABC), wires it into `runner.py` (import + `--reward-model-type` choices + `_make_reward_model` branch), and creates `tests/drmdp/control/test_{name}.py` with the minimum three tests. Asks for a plan confirmation before writing any files.
+
+```
+/add-reward-model contrastive   # → ContrastiveRewardModel, --reward-model-type contrastive
+/add-reward-model oracle
+```
+
+### `/research-to-impl <paper-path-or-url>` — paper to reviewed toy implementation
+
+Chains `/summarize-ml-paper` → `/implement-ml-paper-toy` → `/post-impl-review` → `make format && make check && make test`. Asks framework (torch / sklearn) and module name before generating code.
+
+```
+/research-to-impl papers/han2022hc.pdf
+/research-to-impl https://arxiv.org/abs/2206.15474
+```
+
 ## Running Experiments
 
 ### Single-Run CLI
@@ -229,12 +254,3 @@ from module import function_name
 
 **Parameterized tests**: `@pytest.mark.parametrize()` for multiple inputs; `@pytest.fixture` for shared setup.
 
-## Configuration
-
-**pytest** (`pyproject.toml`):
-```toml
-addopts = "-v --cov=drmdp --cov-report=xml:cobertura/coverage.xml --cov-report=term-missing"
-testpaths = ["tests"]
-```
-
-**tox** (`tox.ini`): Environments `test`, `check-formatting`, `check-lint`, `check-lint-types`. Python 3.11/3.12, uv for dependency management.
