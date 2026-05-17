@@ -15,8 +15,8 @@ python $PARENT_DIR/src/$BASE/control/runner.py \
     --num-steps 50000 \
     --reward-model-type ircr \
     --update-every-n-steps 1000 \
-    --reward-model-kwarg max_buffer_size=200 \
-    --reward-model-kwarg k_neighbors=5 \
+    --reward-model-kwarg fifo_capacity=300000 \
+    --reward-model-kwarg heap_capacity=10 \
     --sac-kwarg buffer_size=100000 \
     --sac-kwarg batch_size=256 \
     --sac-kwarg gradient_steps=-1 \

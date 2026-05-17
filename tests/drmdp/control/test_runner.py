@@ -341,7 +341,7 @@ class TestRun:
             reward_model_type="ircr",
             update_every_n_steps=50,
             clear_buffer_on_update=False,
-            reward_model_kwargs={"max_buffer_size": 20, "k_neighbors": 3},
+            reward_model_kwargs={"fifo_capacity": 500, "heap_capacity": 3},
             num_steps=200,
             sac_kwargs={
                 "learning_rate": 3e-4,
@@ -753,7 +753,7 @@ class TestMakeRewardModel:
             delay=1,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="ircr",
-            reward_model_kwargs={"max_buffer_size": 10, "k_neighbors": 1},
+            reward_model_kwargs={"fifo_capacity": 500, "heap_capacity": 3},
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
@@ -887,13 +887,13 @@ class TestParseArgs:
             [
                 "prog",
                 "--reward-model-kwarg",
-                "max_buffer_size=50",
+                "fifo_capacity=500",
                 "--output-dir",
                 str(tmp_path),
             ],
         ):
             args = runner.parse_single_cli()
-        assert args["reward_model_kwargs"]["max_buffer_size"] == 50
+        assert args["reward_model_kwargs"]["fifo_capacity"] == 500
 
     def test_agent_type_hc(self, tmp_path):
         with unittest.mock.patch(
@@ -1361,9 +1361,9 @@ class TestParseRewardModelKwargs:
 
     def test_int_value_parsed(self):
         """Integer strings are coerced to int."""
-        result = runner.parse_reward_model_kwargs(["max_buffer_size=200"])
-        assert result["max_buffer_size"] == 200
-        assert isinstance(result["max_buffer_size"], int)
+        result = runner.parse_reward_model_kwargs(["fifo_capacity=300000"])
+        assert result["fifo_capacity"] == 300000
+        assert isinstance(result["fifo_capacity"], int)
 
     def test_float_value_parsed(self):
         """Float strings are coerced to float."""
@@ -1385,9 +1385,9 @@ class TestParseRewardModelKwargs:
     def test_multiple_pairs(self):
         """Multiple key=value pairs are all parsed into the same mapping."""
         result = runner.parse_reward_model_kwargs(
-            ["max_buffer_size=200", "k_neighbors=5"]
+            ["fifo_capacity=300000", "heap_capacity=10"]
         )
-        assert result == {"max_buffer_size": 200, "k_neighbors": 5}
+        assert result == {"fifo_capacity": 300000, "heap_capacity": 10}
 
 
 class _TrackingRewardModel(base.RewardModel):

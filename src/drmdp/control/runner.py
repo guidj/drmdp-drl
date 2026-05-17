@@ -458,10 +458,14 @@ def _run_sac(
     import sbx
 
     reward_model = _make_reward_model(args, env)
+    if isinstance(reward_model, ircr.IRCRRewardModel):
+        replay_buffer_class = ircr.IRCRReplayBuffer
+    else:
+        replay_buffer_class = base.RelabelingReplayBuffer
     sac = sbx.SAC(
         "MlpPolicy",
         env,
-        replay_buffer_class=base.RelabelingReplayBuffer,
+        replay_buffer_class=replay_buffer_class,
         replay_buffer_kwargs={"reward_model": reward_model},
         seed=args.seed,
         **args.sac_kwargs,
@@ -567,7 +571,13 @@ def _make_reward_model(args: TrainingArgs, env: Any) -> Optional[base.RewardMode
             action_dim for parametric models such as DGRA.
     """
     if args.reward_model_type == "ircr":
-        return ircr.IRCRRewardModel(**args.reward_model_kwargs)
+        obs_dim = int(np.prod(env.observation_space.shape))
+        action_dim = int(np.prod(env.action_space.shape))
+        return ircr.IRCRRewardModel(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            **args.reward_model_kwargs,
+        )
     if args.reward_model_type == "dgra":
         obs_dim = int(np.prod(env.observation_space.shape))
         action_dim = int(np.prod(env.action_space.shape))

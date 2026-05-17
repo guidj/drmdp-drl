@@ -19,7 +19,7 @@
         },
         {
           "reward_model_type": "ircr",
-          "reward_model_kwargs": {"max_buffer_size": 10000, "k_neighbors": 5}
+          "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10}
         },
         {
           "reward_model_type": "dgra",
