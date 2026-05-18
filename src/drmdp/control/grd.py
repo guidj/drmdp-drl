@@ -204,6 +204,7 @@ class GRDRewardModel(base.RewardModel):
             return {
                 "buffer_size": 0.0,
                 "training_steps": 0.0,
+                "epochs": 0,
                 "reward_loss": 0.0,
                 "dyn_loss": 0.0,
                 "sparsity_reg": 0.0,
@@ -304,13 +305,14 @@ class GRDRewardModel(base.RewardModel):
 
         # One pass over the buffer per epoch; the final epoch's count of
         # real (non-padded) timesteps equals the sum of trajectory lengths.
-        total_training_steps = int(self._stacked_mask.sum().item())
+        total_training_steps = int(self._stacked_mask.sum().item()) * effective_epochs
 
         self._update_idx += 1
 
         return {
             "buffer_size": float(len(self._traj_buffer)),
             "training_steps": float(total_training_steps),
+            "epochs": effective_epochs,
             "reward_loss": float(np.mean(last_reward_losses)),
             "dyn_loss": float(np.mean(last_dyn_losses)),
             "sparsity_reg": float(np.mean(last_sparsity_regs)),

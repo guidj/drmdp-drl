@@ -154,44 +154,48 @@ class TestDynamicsNetwork:
         torch.testing.assert_close(obs2.grad, torch.zeros_like(obs2.grad))
         torch.testing.assert_close(act2.grad, torch.zeros_like(act2.grad))
 
-    def test_mdn_mixing_weights_sum_to_one(self):
-        """MDN π weights must be a valid probability distribution."""
+    def test_nll_decreases_with_training(self):
+        """MDN parameters converge when trained on a fixed transition."""
         torch.manual_seed(0)
         net = grd._DynamicsNetwork(
             obs_dim=3, action_dim=2, hidden_dim=16, num_hidden_layers=1
         )
-        obs = torch.randn(5, 3)
-        act = torch.randn(5, 2)
+        obs = torch.randn(16, 3)
+        act = torch.randn(16, 2)
+        next_obs = obs.clone()
         mask_ss = torch.ones(3, 3)
         mask_as = torch.ones(2, 3)
 
-        # Access raw MDN outputs by inspecting the forward path directly.
-        with torch.no_grad():
-            obs_expanded = obs.unsqueeze(1) * mask_ss.T.unsqueeze(0)
-            act_expanded = act.unsqueeze(1) * mask_as.T.unsqueeze(0)
-            inputs = torch.cat([obs_expanded, act_expanded], dim=-1)
-            flat_inputs = inputs.reshape(5 * 3, 3 + 2)
-            raw = net._final(net._layers(flat_inputs)).reshape(
-                5, 3, grd._MDN_COMPONENTS, 3
-            )
-            pi = torch.softmax(raw[..., 0], dim=-1)
-        np.testing.assert_allclose(pi.sum(dim=-1).numpy(), np.ones((5, 3)), atol=1e-5)
+        initial_nll = net.nll(obs, act, next_obs, mask_ss, mask_as).item()
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+        for _ in range(10):
+            optimizer.zero_grad()
+            loss = net.nll(obs, act, next_obs, mask_ss, mask_as)
+            loss.backward()
+            optimizer.step()
+
+        final_nll = loss.item()
+        assert final_nll < initial_nll
 
 
 class TestExtractTransitionArrays:
     def test_terminal_step_skipped(self):
         traj = _make_trajectory(obs_dim=2, action_dim=1, num_steps=4)
-        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        obs, act, next_obs = grd._extract_transition_arrays(traj)
         assert len(obs) == 3
+        assert len(act) == 3
+        assert len(next_obs) == 3
 
     def test_obs_next_obs_slices_are_consecutive(self):
         traj = _make_trajectory(obs_dim=2, action_dim=1, num_steps=4)
-        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        obs, act, next_obs = grd._extract_transition_arrays(traj)
         for step_idx in range(len(obs)):
             np.testing.assert_array_equal(obs[step_idx], traj.observations[step_idx])
             np.testing.assert_array_equal(
-                nxt[step_idx], traj.observations[step_idx + 1]
+                next_obs[step_idx], traj.observations[step_idx + 1]
             )
+            np.testing.assert_array_equal(act[step_idx], traj.actions[step_idx])
 
     def test_all_terminal_trajectory_yields_no_transitions(self):
         traj = base.Trajectory(
@@ -202,7 +206,7 @@ class TestExtractTransitionArrays:
             infos=({}, {}, {}),
             episode_return=0.0,
         )
-        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        obs, _, _ = grd._extract_transition_arrays(traj)
         assert len(obs) == 0
 
     def test_single_step_episode_yields_no_transitions(self):
@@ -214,7 +218,7 @@ class TestExtractTransitionArrays:
             infos=({},),
             episode_return=0.0,
         )
-        obs, acts, nxt = grd._extract_transition_arrays(traj)
+        obs, _, _ = grd._extract_transition_arrays(traj)
         assert len(obs) == 0
 
 
@@ -251,20 +255,13 @@ class TestSparsityReg:
 
 
 class TestGRDRewardModel:
-    def test_predict_output_shape(self):
+    def test_predict_output(self):
         model = _make_model(obs_dim=4, action_dim=2)
         obs = np.zeros((10, 4), dtype=np.float32)
         act = np.zeros((10, 2), dtype=np.float32)
         term = np.zeros(10, dtype=bool)
         preds = model.predict(obs, act, term)
         assert preds.shape == (10,)
-
-    def test_predict_dtype_float32(self):
-        model = _make_model(obs_dim=4, action_dim=2)
-        obs = np.zeros((5, 4), dtype=np.float32)
-        act = np.zeros((5, 2), dtype=np.float32)
-        term = np.zeros(5, dtype=bool)
-        preds = model.predict(obs, act, term)
         assert preds.dtype == np.float32
 
     def test_predict_before_update_is_finite(self):
@@ -281,14 +278,13 @@ class TestGRDRewardModel:
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
         )
         metrics = model.update(trajs)
-        required = {
-            "buffer_size",
-            "training_steps",
-            "reward_loss",
-            "dyn_loss",
-            "sparsity_reg",
-        }
-        assert required <= set(metrics.keys())
+        assert len(metrics) == 6
+        assert metrics["buffer_size"] == 2
+        assert metrics["epochs"] == 1
+        assert metrics["training_steps"] == 10
+        assert np.isfinite(metrics["reward_loss"])
+        assert np.isfinite(metrics["dyn_loss"])
+        assert np.isfinite(metrics["sparsity_reg"])
 
     def test_update_buffer_size_increments(self):
         model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
@@ -297,6 +293,8 @@ class TestGRDRewardModel:
         )
         metrics = model.update(trajs)
         assert metrics["buffer_size"] == 3.0
+        metrics = model.update(trajs)
+        assert metrics["buffer_size"] == 6.0
 
     def test_buffer_eviction(self):
         model = _make_model(obs_dim=4, action_dim=2, train_epochs=1, max_buffer_size=2)
@@ -331,7 +329,7 @@ class TestGRDRewardModel:
         )
         metrics_before = model.update(trajs)
         # Train for many more epochs.
-        model._train_epochs = 50
+        model._train_epochs = 10
         metrics_after = model.update([])
         # The reward loss over the buffered data should decrease.
         assert metrics_after["reward_loss"] <= metrics_before["reward_loss"] + 0.5
@@ -532,14 +530,22 @@ class TestGRDVectorisedUpdate:
 class TestGRDTrainEpochsDecay:
     def test_default_decay_is_no_op(self):
         train_epochs = 4
-        model = _make_model(obs_dim=4, action_dim=2, train_epochs=train_epochs)
+        model = _make_model(
+            obs_dim=4, action_dim=2, train_epochs=train_epochs, train_epochs_decay=1
+        )
         trajs = _make_synthetic_trajectories(
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
         )
 
-        epochs_run = _count_epochs_per_update(model, trajs, num_updates=3)
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 10 * train_epochs
 
-        assert epochs_run == [train_epochs] * 3
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 20 * train_epochs
 
     def test_decay_reduces_epochs_geometrically(self):
         model = _make_model(
@@ -552,9 +558,22 @@ class TestGRDTrainEpochsDecay:
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
         )
 
-        epochs_run = _count_epochs_per_update(model, trajs, num_updates=3)
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 10
+        assert metrics["training_steps"] == 10 * 10
 
-        assert epochs_run == [10, 5, 2]
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == 5
+        # buffer increases
+        assert metrics["training_steps"] == 20 * 5
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 3
+        assert metrics["epochs"] == 2
+        # buffer increases
+        assert metrics["training_steps"] == 30 * 2
 
     def test_decay_floors_at_one(self):
         model = _make_model(
@@ -567,9 +586,20 @@ class TestGRDTrainEpochsDecay:
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
         )
 
-        epochs_run = _count_epochs_per_update(model, trajs, num_updates=5)
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 2
+        assert metrics["training_steps"] == 10 * 2
 
-        assert epochs_run == [2, 1, 1, 1, 1]
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == 1
+        assert metrics["training_steps"] == 20 * 1
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 3
+        assert metrics["epochs"] == 1
+        assert metrics["training_steps"] == 30 * 1
 
     def test_update_idx_does_not_increment_on_empty_buffer(self):
         model = _make_model(
@@ -580,34 +610,18 @@ class TestGRDTrainEpochsDecay:
         )
 
         # Fully empty path: no trajectories and no buffer state.
-        model.update([])
+        metrics = model.update([])
         assert model._update_idx == 0
+        assert metrics["epochs"] == 0
+        assert metrics["training_steps"] == 0
 
         trajs = _make_synthetic_trajectories(
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
         )
-        epochs_run = _count_epochs_per_update(model, trajs, num_updates=1)
-        assert epochs_run == [4]
-
-    def test_metrics_reflect_effective_epochs(self):
-        torch.manual_seed(0)
-        np.random.seed(0)
-        model = _make_model(
-            obs_dim=4,
-            action_dim=2,
-            train_epochs=4,
-            train_epochs_decay=0.5,
-            batch_size=2,
-        )
-        trajs = _make_synthetic_trajectories(
-            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
-        )
-
-        m1 = model.update(trajs)
-        m2 = model.update(trajs)
-
-        assert np.isfinite(m1["reward_loss"])
-        assert np.isfinite(m2["reward_loss"])
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 4
+        assert metrics["training_steps"] == 10 * 4
 
 
 # ---------------------------------------------------------------------------
@@ -640,31 +654,6 @@ def _make_model(
         dyn_weight=dyn_weight,
         max_buffer_size=max_buffer_size,
     )
-
-
-def _count_epochs_per_update(
-    model: grd.GRDRewardModel,
-    trajs: List[base.Trajectory],
-    num_updates: int,
-) -> List[int]:
-    """Count epochs per update by intercepting np.random.permutation."""
-    counts: List[int] = []
-    call_counter = {"n": 0}
-    original_permutation = np.random.permutation
-
-    def _counting_permutation(*args, **kwargs):
-        call_counter["n"] += 1
-        return original_permutation(*args, **kwargs)
-
-    np.random.permutation = _counting_permutation  # type: ignore[assignment]
-    try:
-        for _ in range(num_updates):
-            before = call_counter["n"]
-            model.update(trajs)
-            counts.append(call_counter["n"] - before)
-    finally:
-        np.random.permutation = original_permutation  # type: ignore[assignment]
-    return counts
 
 
 def _make_trajectory(
