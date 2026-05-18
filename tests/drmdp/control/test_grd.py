@@ -44,11 +44,11 @@ class TestCausalStructure:
 
     def test_gumbel_has_gradient(self):
         causal = grd._CausalStructure(obs_dim=3, action_dim=2)
-        mask_sr, _, _, _ = causal.sample_gumbel()
-        # Gumbel output must carry gradients back to phi parameters.
-        loss = mask_sr.sum()
+        mask_sr, mask_ar, mask_ss, mask_as = causal.sample_gumbel()
+        loss = mask_sr.sum() + mask_ar.sum() + mask_ss.sum() + mask_as.sum()
         loss.backward()
-        assert causal.phi_sr.grad is not None
+        for name, param in causal.named_parameters():
+            assert param.grad is not None, f"{name} has no gradient"
 
 
 class TestRewardNetwork:
@@ -105,24 +105,54 @@ class TestDynamicsNetwork:
             assert param.grad is not None
 
     def test_column_masking_isolates_target_gradient(self):
-        """Zeroing column i of mask_ss blocks gradient to that target dim."""
+        """Zeroing column i of mask_ss/mask_as blocks obs/act gradient for that dim."""
         torch.manual_seed(42)
+        masked_dim = 1
         net = grd._DynamicsNetwork(
             obs_dim=3, action_dim=2, hidden_dim=16, num_hidden_layers=1
         )
-        obs = torch.randn(4, 3)
-        act = torch.randn(4, 2)
+        obs = torch.randn(4, 3, requires_grad=True)
+        act = torch.randn(4, 2, requires_grad=True)
         next_obs = torch.randn(4, 3)
 
-        # Mask that zeros out all edges to target dim 1.
         mask_ss = torch.ones(3, 3)
-        mask_ss[:, 1] = 0.0
+        # `masked_dim` in obs has no influence on any state dim
+        mask_ss[masked_dim, :] = 0.0
         mask_as = torch.ones(2, 3)
-        mask_as[:, 1] = 0.0
+        # `masked_dim` in action has no influence on any state dim
+        mask_as[masked_dim::] = 0.0
 
-        # NLL should still be finite even with zero-masked inputs for dim 1.
         nll = net.nll(obs, act, next_obs, mask_ss, mask_as)
-        assert torch.isfinite(nll)
+        nll.backward()
+        assert obs.grad is not None
+        assert act.grad is not None
+        expected_obs_grad = torch.ones_like(obs.grad)
+        expected_obs_grad[:, masked_dim] = 0.0
+        expected_act_grad = torch.ones_like(act.grad)
+        expected_act_grad[:, masked_dim] = 0.0
+
+        # Gradients should be zero for the masked_dim
+        # and non-zero otherwise.
+        torch.testing.assert_close(
+            torch.where(obs.grad == 0.0, 0.0, 1.0), expected_obs_grad
+        )
+        torch.testing.assert_close(
+            torch.where(act.grad == 0.0, 0.0, 1.0), expected_act_grad
+        )
+
+        # If none of the dimensions are relevant
+        # the gradients are zero.
+        obs2 = torch.randn(4, 3, requires_grad=True)
+        act2 = torch.randn(4, 2, requires_grad=True)
+        mask_ss_nr = torch.zeros(3, 3)
+        mask_as_nr = torch.zeros(2, 3)
+
+        nll2 = net.nll(obs2, act2, next_obs, mask_ss_nr, mask_as_nr)
+        nll2.backward()
+        assert obs2.grad is not None
+        assert act2.grad is not None
+        torch.testing.assert_close(obs2.grad, torch.zeros_like(obs2.grad))
+        torch.testing.assert_close(act2.grad, torch.zeros_like(act2.grad))
 
     def test_mdn_mixing_weights_sum_to_one(self):
         """MDN π weights must be a valid probability distribution."""
