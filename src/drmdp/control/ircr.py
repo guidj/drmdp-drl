@@ -1,55 +1,297 @@
 """
 IRCR: Iterative Relative Credit Refinement reward model.
 
-Non-parametric guidance rewards computed as the normalised mean episode
-return of the K nearest stored (state, action) pairs (KNN over a trajectory
-database).  No neural network is required; the model improves as more
-trajectories are added to the database.
+Guidance rewards via dual-buffer credit assignment: a FIFO ring buffer of
+recent transitions and a min-heap buffer of the best trajectories by total
+return.  Each transition carries a credit equal to the mean per-step return
+of its source trajectory.  Guidance rewards are the min-max normalised
+credits drawn 50/50 from both buffers.
 
-Reference: "Guidance Rewards via Trajectory Smoothing" (IRCR paper).
+Reference: Gangwani & Peng, "Learning Guidance Rewards with
+Trajectory-space Smoothing", NeurIPS 2020.
 """
 
-from typing import List, Mapping, Optional, Sequence
+import heapq
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
-from scipy import spatial
+import torch
+from stable_baselines3.common import buffers
+from stable_baselines3.common.type_aliases import ReplayBufferSamples
 
 from drmdp.control import base
 
 
-class IRCRRewardModel(base.RewardModel):
-    """Guidance rewards via KNN lookup over a trajectory database.
+class FIFOTransitionBuffer:
+    """Fixed-capacity ring buffer of individual transitions.
 
-    For a query (s, a), the guidance reward is the mean episode return of
-    the K nearest stored (s, a) pairs, normalised to [0, 1] using the
-    observed return range.
-
-    Before building the KDTree and before each query, all (s, a) vectors are
-    standardised per-dimension (zero mean, unit variance) using statistics
-    computed from the stored trajectories.  This prevents high-variance
-    dimensions (e.g. MuJoCo joint velocities) from dominating the distance
-    computation and makes the lookup meaningful in high-dimensional spaces.
-
-    Attributes:
-        max_buffer_size: Maximum number of trajectories to retain.
-        k_neighbors: Number of nearest neighbours used to compute the
-            guidance reward for each query point.
+    Each transition stores (obs, next_obs, action, done, credit) where
+    credit = episode_return / episode_length for the source trajectory.
     """
 
-    def __init__(self, max_buffer_size: int = 200, k_neighbors: int = 5):
-        self._max_buffer_size = max_buffer_size
-        self._k_neighbors = k_neighbors
-        self._trajectories: List[base.Trajectory] = []
-        # Flat matrix of all (s, a) pairs across stored trajectories.
-        self._sa_matrix: Optional[np.ndarray] = None  # (N_total, obs_dim + act_dim)
-        # Maps each row in _sa_matrix back to its trajectory index.
-        self._traj_indices: Optional[np.ndarray] = None  # (N_total,)
-        # Per-dimension mean and std computed from _sa_matrix for standardisation.
-        self._sa_mean: Optional[np.ndarray] = None  # (obs_dim + act_dim,)
-        self._sa_std: Optional[np.ndarray] = None  # (obs_dim + act_dim,)
-        self._tree: Optional[spatial.KDTree] = None
-        self._r_min: float = 0.0
-        self._r_max: float = 1.0
+    def __init__(self, obs_dim: int, action_dim: int, max_steps: int):
+        self._obs_dim = obs_dim
+        self._action_dim = action_dim
+        self._max_steps = max_steps
+
+        self.obs = np.zeros((max_steps, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((max_steps, obs_dim), dtype=np.float32)
+        self.actions = np.zeros((max_steps, action_dim), dtype=np.float32)
+        self.dones = np.zeros((max_steps, 1), dtype=np.uint8)
+        self.credits = np.zeros((max_steps, 1), dtype=np.float32)
+
+        self.min_credit_val: Optional[float] = None
+        self.max_credit_val: Optional[float] = None
+
+        self._filled_i = 0
+        self._curr_i = 0
+
+    def __len__(self) -> int:
+        return self._filled_i
+
+    def add_trajectories(self, trajectories: Sequence[base.Trajectory]) -> None:
+        """Flatten trajectories to transitions and append to the ring buffer.
+
+        Each transition receives credit = episode_return / episode_length.
+        When the new batch exceeds remaining capacity the buffer rolls so
+        the write cursor resets to zero and the oldest data is overwritten.
+        """
+        all_obs: List[np.ndarray] = []
+        all_next_obs: List[np.ndarray] = []
+        all_actions: List[np.ndarray] = []
+        all_dones: List[np.ndarray] = []
+        all_credits: List[np.ndarray] = []
+
+        for traj in trajectories:
+            num_steps = len(traj.observations)
+            next_obs = np.concatenate(
+                [traj.observations[1:], traj.observations[-1:]], axis=0
+            )
+            dones = np.zeros((num_steps, 1), dtype=np.uint8)
+            if traj.terminals[-1]:
+                dones[-1] = 1
+
+            credit = traj.episode_return / max(num_steps, 1)
+            credits = np.full((num_steps, 1), credit, dtype=np.float32)
+
+            all_obs.append(traj.observations)
+            all_next_obs.append(next_obs)
+            all_actions.append(traj.actions)
+            all_dones.append(dones)
+            all_credits.append(credits)
+
+        if len(all_obs) == 0:
+            return
+
+        concat_obs = np.concatenate(all_obs, axis=0)
+        concat_next_obs = np.concatenate(all_next_obs, axis=0)
+        concat_actions = np.concatenate(all_actions, axis=0)
+        concat_dones = np.concatenate(all_dones, axis=0)
+        concat_credits = np.concatenate(all_credits, axis=0)
+
+        nentries = concat_obs.shape[0]
+        if self._curr_i + nentries > self._max_steps:
+            rollover = self._max_steps - self._curr_i
+            self.obs = np.roll(self.obs, rollover, axis=0)
+            self.next_obs = np.roll(self.next_obs, rollover, axis=0)
+            self.actions = np.roll(self.actions, rollover, axis=0)
+            self.dones = np.roll(self.dones, rollover, axis=0)
+            self.credits = np.roll(self.credits, rollover, axis=0)
+            self._curr_i = 0
+            self._filled_i = self._max_steps
+
+        self.obs[self._curr_i : self._curr_i + nentries] = concat_obs
+        self.next_obs[self._curr_i : self._curr_i + nentries] = concat_next_obs
+        self.actions[self._curr_i : self._curr_i + nentries] = concat_actions
+        self.dones[self._curr_i : self._curr_i + nentries] = concat_dones
+        self.credits[self._curr_i : self._curr_i + nentries] = concat_credits
+
+        self._curr_i += nentries
+        if self._filled_i < self._max_steps:
+            self._filled_i = min(self._filled_i + nentries, self._max_steps)
+        if self._curr_i >= self._max_steps:
+            self._curr_i = 0
+
+        self.min_credit_val = float(self.credits[: len(self)].min())
+        self.max_credit_val = float(self.credits[: len(self)].max())
+
+    def sample(self, batch_size: int) -> Optional[Mapping[str, np.ndarray]]:
+        """Sample transitions uniformly. Returns None if too few stored."""
+        if len(self) < batch_size:
+            return None
+        inds = np.random.choice(np.arange(len(self)), size=batch_size, replace=False)
+        return {
+            "observations": self.obs[inds],
+            "next_observations": self.next_obs[inds],
+            "actions": self.actions[inds],
+            "dones": self.dones[inds],
+            "credits": self.credits[inds],
+        }
+
+
+class MinHeapTrajectoryBuffer:
+    """Priority buffer retaining the best trajectories by total return.
+
+    Uses a min-heap: incoming trajectories replace the lowest-return stored
+    trajectory when their return exceeds it.  Flattened to transitions for
+    sampling.
+    """
+
+    def __init__(self, obs_dim: int, action_dim: int, max_trajs: int):
+        self._obs_dim = obs_dim
+        self._action_dim = action_dim
+        self._max_trajs = max_trajs
+
+        self._heap: List[List[Any]] = []
+        self._traj_data: Dict[int, base.Trajectory] = {}
+        self._num_trajs = 0
+
+        self.obs: Optional[np.ndarray] = None
+        self.next_obs: Optional[np.ndarray] = None
+        self.actions: Optional[np.ndarray] = None
+        self.dones: Optional[np.ndarray] = None
+        self.credits: Optional[np.ndarray] = None
+
+        self.min_credit_val: Optional[float] = None
+        self.max_credit_val: Optional[float] = None
+
+    def __len__(self) -> int:
+        return self.obs.shape[0] if self.obs is not None else 0
+
+    def add_trajectories(self, trajectories: Sequence[base.Trajectory]) -> None:
+        """Insert trajectories, evicting the lowest-return entry when full.
+
+        Rebuilds the flattened transition arrays only when the stored set
+        actually changes.
+        """
+        updated = False
+
+        for traj in trajectories:
+            priority = traj.episode_return
+
+            if self._num_trajs < self._max_trajs:
+                heapq.heappush(self._heap, [priority, self._num_trajs])
+                loc = self._num_trajs
+                self._num_trajs += 1
+            else:
+                min_priority, loc = self._heap[0]
+                if priority < min_priority:
+                    continue
+                heapq.heappushpop(self._heap, [priority, loc])
+
+            if loc in self._traj_data:
+                del self._traj_data[loc]
+            self._traj_data[loc] = traj
+            updated = True
+
+        if updated:
+            self._rebuild_flat_arrays()
+
+    def _rebuild_flat_arrays(self) -> None:
+        """Flatten all heap-stored trajectories into contiguous arrays for sampling."""
+        obs_parts: List[np.ndarray] = []
+        next_obs_parts: List[np.ndarray] = []
+        action_parts: List[np.ndarray] = []
+        done_parts: List[np.ndarray] = []
+        credit_parts: List[np.ndarray] = []
+
+        for _, traj in sorted(self._traj_data.items()):
+            num_steps = len(traj.observations)
+            next_obs = np.concatenate(
+                [traj.observations[1:], traj.observations[-1:]], axis=0
+            )
+            dones = np.zeros((num_steps, 1), dtype=np.uint8)
+            if traj.terminals[-1]:
+                dones[-1] = 1
+
+            credit = traj.episode_return / max(num_steps, 1)
+            credits = np.full((num_steps, 1), credit, dtype=np.float32)
+
+            obs_parts.append(traj.observations)
+            next_obs_parts.append(next_obs)
+            action_parts.append(traj.actions)
+            done_parts.append(dones)
+            credit_parts.append(credits)
+
+        if len(obs_parts) == 0:
+            self.obs = None
+            self.next_obs = None
+            self.actions = None
+            self.dones = None
+            self.credits = None
+            self.min_credit_val = None
+            self.max_credit_val = None
+            return
+
+        self.obs = np.concatenate(obs_parts, axis=0)
+        self.next_obs = np.concatenate(next_obs_parts, axis=0)
+        self.actions = np.concatenate(action_parts, axis=0)
+        self.dones = np.concatenate(done_parts, axis=0)
+        self.credits = np.concatenate(credit_parts, axis=0)
+
+        self.min_credit_val = float(self.credits.min())
+        self.max_credit_val = float(self.credits.max())
+
+    def sample(self, batch_size: int) -> Optional[Mapping[str, np.ndarray]]:
+        """Sample transitions, with replacement when fewer than batch_size."""
+        if len(self) == 0:
+            return None
+        assert self.obs is not None
+        assert self.next_obs is not None
+        assert self.actions is not None
+        assert self.dones is not None
+        assert self.credits is not None
+        replace = len(self) < batch_size
+        inds = np.random.choice(np.arange(len(self)), size=batch_size, replace=replace)
+        return {
+            "observations": self.obs[inds],
+            "next_observations": self.next_obs[inds],
+            "actions": self.actions[inds],
+            "dones": self.dones[inds],
+            "credits": self.credits[inds],
+        }
+
+
+class IRCRRewardModel(base.RewardModel):
+    """Guidance rewards via dual-buffer credit assignment.
+
+    Manages a FIFO transition buffer (recent experience) and a min-heap
+    trajectory buffer (best trajectories).  Each transition carries a
+    credit equal to its trajectory's mean per-step return.  Guidance
+    rewards are min-max normalised credits.
+
+    Attributes:
+        fifo_capacity: Maximum transitions in the FIFO ring buffer.
+        heap_capacity: Maximum trajectories in the min-heap buffer.
+    """
+
+    def __init__(
+        self,
+        fifo_capacity: int = 300_000,
+        heap_capacity: int = 10,
+        obs_dim: int = 1,
+        action_dim: int = 1,
+    ):
+        self._fifo = FIFOTransitionBuffer(obs_dim, action_dim, fifo_capacity)
+        self._heap = MinHeapTrajectoryBuffer(obs_dim, action_dim, heap_capacity)
+
+    @property
+    def r_min(self) -> float:
+        vals = [
+            buf.min_credit_val
+            for buf in (self._fifo, self._heap)
+            if buf.min_credit_val is not None
+        ]
+        return min(vals) if vals else 0.0
+
+    @property
+    def r_max(self) -> float:
+        vals = [
+            buf.max_credit_val
+            for buf in (self._fifo, self._heap)
+            if buf.max_credit_val is not None
+        ]
+        return max(vals) if vals else 1.0
 
     def predict(
         self,
@@ -57,82 +299,117 @@ class IRCRRewardModel(base.RewardModel):
         actions: np.ndarray,
         terminals: np.ndarray,
     ) -> np.ndarray:
-        """Return normalised guidance rewards for a batch of (s, a) pairs.
+        """Return uniform guidance reward for each query transition.
 
-        Returns zeros for all queries when the trajectory database is empty.
+        With flat credit assignment every transition receives the same
+        normalised value.  This method is used for logging; the primary
+        training path goes through ``IRCRReplayBuffer.sample()``.
         """
-        del terminals
-        if (
-            self._tree is None
-            or self._sa_matrix is None
-            or self._traj_indices is None
-            or self._sa_mean is None
-            or self._sa_std is None
-        ):
-            return np.zeros(len(observations), dtype=np.float32)
+        del actions, terminals
+        n_queries = len(observations)
+        if self._fifo.min_credit_val is None:
+            return np.zeros(n_queries, dtype=np.float32)
 
-        query = np.concatenate([observations, actions], axis=-1).astype(np.float64)
-        query_normalised = (query - self._sa_mean) / self._sa_std
-        # Clamp k to the number of available (s, a) points.
-        k_effective = min(self._k_neighbors, len(self._sa_matrix))
-        _, neighbor_indices = self._tree.query(query_normalised, k=k_effective)
-
-        # scipy returns shape (T,) when k=1; normalise to (T, k).
-        if k_effective == 1:
-            neighbor_indices = neighbor_indices[:, np.newaxis]
-
-        traj_returns = np.array(
-            [traj.episode_return for traj in self._trajectories], dtype=np.float64
-        )
-        # Average returns of the trajectories that own the k nearest points.
-        raw: np.ndarray = traj_returns[self._traj_indices[neighbor_indices]].mean(
-            axis=-1
-        )
-
-        denom = max(self._r_max - self._r_min, 1e-8)
-        return ((raw - self._r_min) / denom).astype(np.float32)
+        mean_credit = float(self._fifo.credits[: len(self._fifo)].mean())
+        denom = max(self.r_max - self.r_min, 1e-8)
+        value = (mean_credit - self.r_min) / denom
+        return np.full(n_queries, value, dtype=np.float32)
 
     def update(
         self,
         trajectories: Sequence[base.Trajectory],
     ) -> Mapping[str, float]:
-        """Add trajectories to the database and rebuild the KNN index.
-
-        Oldest trajectories are evicted when the database exceeds
-        `max_buffer_size`.
-        """
-        self._trajectories.extend(trajectories)
-        if len(self._trajectories) > self._max_buffer_size:
-            self._trajectories = self._trajectories[-self._max_buffer_size :]
-        self._rebuild_index()
+        """Add trajectories to both buffers."""
+        self._fifo.add_trajectories(trajectories)
+        self._heap.add_trajectories(trajectories)
         return {
-            "buffer_size": float(len(self._trajectories)),
-            "r_min": self._r_min,
-            "r_max": self._r_max,
-            "training_steps": float(
-                sum(len(traj.observations) for traj in trajectories)
-            ),
+            "fifo_size": float(len(self._fifo)),
+            "heap_size": float(len(self._heap)),
+            "r_min": self.r_min,
+            "r_max": self.r_max,
         }
 
-    def _rebuild_index(self) -> None:
-        """Flatten all stored (s, a) pairs, standardise, and build KDTree."""
-        sa_parts: List[np.ndarray] = []
-        traj_idx_parts: List[np.ndarray] = []
-        for traj_idx, traj in enumerate(self._trajectories):
-            sa = np.concatenate([traj.observations, traj.actions], axis=-1)
-            sa_parts.append(sa)
-            traj_idx_parts.append(
-                np.full(len(traj.observations), traj_idx, dtype=np.int64)
-            )
-        self._sa_matrix = np.concatenate(sa_parts, axis=0).astype(np.float64)
-        self._traj_indices = np.concatenate(traj_idx_parts, axis=0)
+    def compute_guidance_rewards(self, credits: np.ndarray) -> np.ndarray:
+        """Normalise raw credits to [0, 1] using global min/max."""
+        r_min = self.r_min
+        r_max = self.r_max
+        denom = max(r_max - r_min, 1e-8)
+        result = ((credits - r_min) / denom).astype(np.float32)
+        return result.squeeze(-1) if result.ndim > 1 else result
 
-        # Standardise per dimension; clamp near-zero std to 1.0 so constant
-        # dimensions (e.g. unused action channels) do not blow up distances.
-        self._sa_mean = self._sa_matrix.mean(axis=0)
-        std = self._sa_matrix.std(axis=0)
-        self._sa_std = np.where(std > 1e-8, std, 1.0)
+    def sample(self, batch_size: int) -> Optional[Mapping[str, np.ndarray]]:
+        """Draw transitions 50/50 from FIFO and MinHeap.
 
-        self._tree = spatial.KDTree((self._sa_matrix - self._sa_mean) / self._sa_std)
-        self._r_min = float(min(traj.episode_return for traj in self._trajectories))
-        self._r_max = float(max(traj.episode_return for traj in self._trajectories))
+        Returns None when either buffer has insufficient data (FIFO must
+        have at least half_batch entries; MinHeap may use replacement
+        sampling).
+        """
+        half = batch_size // 2
+        remainder = batch_size - half
+
+        fifo_sample = self._fifo.sample(half)
+        if fifo_sample is None:
+            return None
+        heap_sample = self._heap.sample(remainder)
+        if heap_sample is None:
+            return None
+
+        merged: Dict[str, np.ndarray] = {}
+        for key in fifo_sample:
+            merged[key] = np.concatenate([fifo_sample[key], heap_sample[key]], axis=0)
+
+        merged["guidance_rewards"] = self.compute_guidance_rewards(merged["credits"])
+        return merged
+
+
+class IRCRReplayBuffer(buffers.ReplayBuffer):
+    """Replay buffer that draws training batches from IRCR's dual buffers.
+
+    Overrides ``sample()`` to draw 50/50 from the FIFO and MinHeap
+    buffers managed by ``IRCRRewardModel``, computing normalised guidance
+    rewards as the training reward signal.
+
+    Falls back to standard replay buffer sampling (with zero rewards)
+    when the IRCR buffers don't have enough transitions yet.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        reward_model: Optional[IRCRRewardModel] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.reward_model = reward_model
+
+    def sample(
+        self,
+        batch_size: int,
+        env: Optional[Any] = None,
+    ) -> ReplayBufferSamples:
+        if self.reward_model is not None:
+            ircr_batch = self.reward_model.sample(batch_size)
+            if ircr_batch is not None:
+                return self._to_replay_buffer_samples(ircr_batch)
+
+        batch = super().sample(batch_size, env)
+        zeroed = torch.zeros_like(batch.rewards)
+        return batch._replace(rewards=zeroed)
+
+    def _to_replay_buffer_samples(
+        self, batch: Mapping[str, np.ndarray]
+    ) -> ReplayBufferSamples:
+        obs = torch.as_tensor(batch["observations"], device=self.device)
+        next_obs = torch.as_tensor(batch["next_observations"], device=self.device)
+        actions = torch.as_tensor(batch["actions"], device=self.device)
+        dones = torch.as_tensor(batch["dones"], device=self.device).float()
+        rewards = torch.as_tensor(
+            batch["guidance_rewards"][:, np.newaxis], device=self.device
+        )
+        return ReplayBufferSamples(
+            observations=obs,
+            actions=actions,
+            next_observations=next_obs,
+            dones=dones,
+            rewards=rewards,
+        )

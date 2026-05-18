@@ -1,13 +1,16 @@
 """
-Tests for drmdp.control.runner: RewardModelUpdateCallback and run().
+Tests for drmdp.control.runner: TrainingArgs, RewardModelUpdateCallback,
+_RewardObsLoggingCallback, StepEvalCallback, run(), run_batch(),
+_make_reward_model, parse_single_cli, _generate_configs, _load_configs,
+and parse_reward_model_kwargs.
 """
 
 import dataclasses
 import json
 import os
 import tempfile
+import unittest.mock
 from typing import Any, Dict, List, Mapping, Optional, Sequence
-from unittest.mock import MagicMock, patch
 
 import gymnasium as gym
 import numpy as np
@@ -15,17 +18,13 @@ import pytest
 
 from drmdp.control import base, dgra, ircr, runner
 
-# ---------------------------------------------------------------------------
-# TestRewardModelUpdateCallback
-# ---------------------------------------------------------------------------
-
 
 class TestRewardModelUpdateCallback:
     def test_trajectory_built_correctly_across_episode(self):
         """Completed Trajectory has correct observations, actions, episode_return."""
         model = _TrackingRewardModel()
         callback = _build_callback(reward_model=model, update_every=1000)
-        sac = _make_mock_sac(obs_dim=3, act_dim=1)
+        sac = _make_mock_sac(obs_dim=3)
 
         rng = np.random.default_rng(0)
         obs_seq = [rng.uniform(size=3).astype(np.float32) for _ in range(4)]
@@ -79,6 +78,22 @@ class TestRewardModelUpdateCallback:
 
         assert model.update_calls == 0
 
+    def test_update_fires_when_episode_completes_after_modulo_boundary(self):
+        """Update fires at the step an episode completes, even if that step
+        is not an exact multiple of update_every_n_steps."""
+        model = _TrackingRewardModel()
+        update_every = 5
+        callback = _build_callback(reward_model=model, update_every=update_every)
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        for step_idx in range(1, 8):
+            done = step_idx == 6
+            _step_callback(callback, sac, obs, action, 1.0, done, step_idx)
+
+        assert model.update_calls == 1
+
     def test_clear_buffer_on_update(self):
         """replay_buffer.reset() is called after the reward model update when flag is set."""
         model = _TrackingRewardModel()
@@ -112,21 +127,74 @@ class TestRewardModelUpdateCallback:
         assert sac.replay_buffer.reset_count == 0
 
     def test_logger_called_at_log_frequency(self):
-        """ExperimentLogger.log() is called every log_episode_frequency episodes."""
-        exp_logger = _MockLogger()
-        callback = _build_callback(log_freq=2, exp_logger=exp_logger)
+        """ExperimentLogger.log() fires every log_episode_frequency episodes.
+
+        4 episodes with log_episode_frequency=2: logs at episodes 2 and 4
+        only; episodes 1 and 3 must be skipped by the modulo gate.
+        """
+        train_logger = _MockLogger()
+        callback = _build_callback(log_episode_freq=2, train_logger=train_logger)
         sac = _make_mock_sac()
         obs = np.zeros(3, dtype=np.float32)
         action = np.zeros(1, dtype=np.float32)
 
         timestep = 0
-        for _episode_idx in range(4):
+        for _ in range(4):
             for step_idx in range(3):
                 timestep += 1
                 done = step_idx == 2
                 _step_callback(callback, sac, obs, action, 1.0, done, timestep)
 
-        assert len(exp_logger.log_calls) == 2
+        logged_episodes = [call["episode"] for call in train_logger.log_calls]
+        assert logged_episodes == [2, 4]
+        assert all(
+            call["info"]["training_complete"] is False
+            for call in train_logger.log_calls
+        )
+
+    def test_training_end_logs_final_unlogged_episode(self):
+        """_on_training_end() emits a final log for an episode skipped by the gate."""
+        train_logger = _MockLogger()
+        callback = _build_callback(log_episode_freq=2, train_logger=train_logger)
+        callback._on_training_start()
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        timestep = 0
+        for _ in range(3):
+            for step_idx in range(3):
+                timestep += 1
+                done = step_idx == 2
+                _step_callback(callback, sac, obs, action, 1.0, done, timestep)
+
+        logged_during = [call["episode"] for call in train_logger.log_calls]
+        assert logged_during == [2]
+
+        callback._on_training_end()
+
+        logged_total = [call["episode"] for call in train_logger.log_calls]
+        assert logged_total == [2, 3]
+        final_call = train_logger.log_calls[-1]
+        assert final_call["info"]["training_complete"] is True
+        assert final_call["steps"] == 3
+
+    def test_training_end_no_duplicate_log_when_last_episode_already_logged(self):
+        """_on_training_end() must not re-log if the final episode already passed the gate."""
+        train_logger = _MockLogger()
+        callback = _build_callback(log_episode_freq=1, train_logger=train_logger)
+        callback._on_training_start()
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
+
+        for step_idx in range(1, 4):
+            done = step_idx == 3
+            _step_callback(callback, sac, obs, action, 1.0, done, step_idx)
+
+        assert len(train_logger.log_calls) == 1
+        callback._on_training_end()
+        assert len(train_logger.log_calls) == 1
 
     def test_training_end_flushes_pending_trajectories(self):
         """_on_training_end() passes remaining pending trajectories to the model."""
@@ -146,10 +214,22 @@ class TestRewardModelUpdateCallback:
 
         assert model.update_calls == 1
 
+    def test_elapsed_seconds_logged(self):
+        """elapsed_seconds is present and non-negative in each logged info dict."""
+        train_logger = _MockLogger()
+        callback = _build_callback(log_episode_freq=1, train_logger=train_logger)
+        callback._on_training_start()
+        sac = _make_mock_sac()
+        obs = np.zeros(3, dtype=np.float32)
+        action = np.zeros(1, dtype=np.float32)
 
-# ---------------------------------------------------------------------------
-# TestRun (integration)
-# ---------------------------------------------------------------------------
+        for step_idx in range(1, 4):
+            done = step_idx == 3
+            _step_callback(callback, sac, obs, action, 1.0, done, step_idx)
+
+        assert len(train_logger.log_calls) == 1
+        assert "elapsed_seconds" in train_logger.log_calls[0]["info"]
+        assert train_logger.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
 
 
 class TestRun:
@@ -200,6 +280,59 @@ class TestRun:
         runner.run(args)
         assert os.path.isfile(os.path.join(output_dir, "hc_model.zip"))
 
+    def test_hc_eval_log_created_when_eval_step_freq_set(self, output_dir):
+        """HC run with eval_step_freq > 0 completes and produces eval-logs.jsonl.
+
+        Without IntervalPositionWrapper on the eval env this would raise a shape
+        error inside evaluate_policy because the actor expects obs_dim + 1 inputs.
+        """
+        args = dataclasses.replace(
+            self._base_args(output_dir),
+            agent_type="hc",
+            num_steps=200,
+            eval_step_freq=100,
+            n_eval_episodes=2,
+        )
+        runner.run(args)
+        assert os.path.isfile(os.path.join(output_dir, "eval-logs.jsonl"))
+
+    def test_run_delayed_baseline(self, output_dir):
+        """run() with reward_model_type='none' completes and produces output files."""
+        args = dataclasses.replace(
+            self._base_args(output_dir),
+            reward_model_type="none",
+            reward_model_kwargs={},
+        )
+        runner.run(args)
+        assert os.path.isfile(os.path.join(output_dir, "experiment-logs.jsonl"))
+        assert os.path.isfile(os.path.join(output_dir, "sac_model.zip"))
+
+    def test_eval_log_created_when_eval_step_freq_set(self, output_dir):
+        """When eval_step_freq > 0, eval-logs.jsonl is created in output_dir."""
+        args = dataclasses.replace(
+            self._base_args(output_dir), eval_step_freq=100, n_eval_episodes=2
+        )
+        runner.run(args)
+        assert os.path.isfile(os.path.join(output_dir, "eval-logs.jsonl"))
+
+    def test_no_eval_log_when_eval_step_freq_zero(self, output_dir):
+        """When eval_step_freq=0 (default), eval-logs.jsonl is not created."""
+        args = self._base_args(output_dir)
+        runner.run(args)
+        assert not os.path.isfile(os.path.join(output_dir, "eval-logs.jsonl"))
+
+    def test_exp_name_and_run_id_in_params_file(self, output_dir):
+        """experiment-params.json contains exp_name and run_id fields."""
+        args = dataclasses.replace(
+            self._base_args(output_dir), exp_name="exp-007", run_id=3
+        )
+        runner.run(args)
+        params_path = os.path.join(output_dir, "experiment-params.json")
+        with open(params_path, encoding="utf-8") as params_file:
+            params = json.load(params_file)
+        assert params["exp_name"] == "exp-007"
+        assert params["run_id"] == 3
+
     def _base_args(self, output_dir: str) -> runner.TrainingArgs:
         return runner.TrainingArgs(
             env="Pendulum-v1",
@@ -208,54 +341,111 @@ class TestRun:
             reward_model_type="ircr",
             update_every_n_steps=50,
             clear_buffer_on_update=False,
-            reward_model_kwargs={"max_buffer_size": 20, "k_neighbors": 3},
+            reward_model_kwargs={"fifo_capacity": 500, "heap_capacity": 3},
             num_steps=200,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=1000,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={
+                "learning_rate": 3e-4,
+                "buffer_size": 1000,
+                "batch_size": 32,
+                "gradient_steps": 1,
+                "ent_coef": "auto_0.1",
+                "verbose": 1,
+            },
             log_episode_frequency=1,
             output_dir=output_dir,
+            exp_name="exp-000",
+            run_id=0,
             seed=42,
         )
 
 
-# ---------------------------------------------------------------------------
-# TestHCLoggingCallback
-# ---------------------------------------------------------------------------
-
-
-class TestHCLoggingCallback:
+class TestRewardObsLoggingCallback:
     def test_on_step_returns_true(self):
-        callback = self._build_hc_callback()
-        result = self._step_hc(callback, done=False, timestep=1)
+        callback = self._build_ro_callback()
+        result = self._step_ro(callback, done=False, timestep=1)
         assert result is True
 
     def test_episode_count_increments_on_done(self):
-        callback = self._build_hc_callback()
-        self._step_hc(callback, done=True, timestep=1)
+        callback = self._build_ro_callback()
+        self._step_ro(callback, done=True, timestep=1)
         assert callback._episode_count == 1
 
     def test_episode_steps_reset_after_done(self):
-        callback = self._build_hc_callback()
-        self._step_hc(callback, done=False, timestep=1)
-        self._step_hc(callback, done=True, timestep=2)
+        callback = self._build_ro_callback()
+        self._step_ro(callback, done=False, timestep=1)
+        self._step_ro(callback, done=True, timestep=2)
         assert callback._episode_steps == 0
 
     def test_episode_rewards_reset_after_done(self):
-        callback = self._build_hc_callback()
-        self._step_hc(callback, done=False, timestep=1, reward=2.0)
-        self._step_hc(callback, done=True, timestep=2, reward=3.0)
+        callback = self._build_ro_callback()
+        self._step_ro(callback, done=False, timestep=1, reward=2.0)
+        self._step_ro(callback, done=True, timestep=2, reward=3.0)
         assert callback._episode_rewards == []
 
     def test_logger_called_at_log_frequency(self):
+        """Logs only on every log_episode_frequency-th completed episode.
+
+        4 episodes with log_episode_frequency=2: only episodes 2 and 4 log;
+        episodes 1 and 3 must be skipped by the modulo gate.
+        """
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(
-            log_episode_frequency=2, exp_logger=log_mock
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=2, train_logger=log_mock
         )
-        for timestep in range(1, 5):
+        for timestep in range(1, 9):
             done = timestep % 2 == 0
-            self._step_hc(
+            self._step_ro(
+                callback,
+                done=done,
+                timestep=timestep,
+                return_val=1.0,
+                reward=1.0,
+            )
+        logged_episodes = [call["episode"] for call in log_mock.log_calls]
+        assert logged_episodes == [2, 4]
+        assert all(
+            call["info"]["training_complete"] is False for call in log_mock.log_calls
+        )
+
+    def test_training_end_logs_final_unlogged_episode(self):
+        """_on_training_end() emits a final log for an episode skipped by the gate."""
+        log_mock = _MockLogger()
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=2, train_logger=log_mock
+        )
+        callback._on_training_start()
+        for timestep in range(1, 7):
+            done = timestep % 2 == 0
+            self._step_ro(
+                callback,
+                done=done,
+                timestep=timestep,
+                return_val=1.0,
+                reward=1.0,
+            )
+
+        # Three episodes completed; gate=2 logs only episode 2.
+        logged_during = [call["episode"] for call in log_mock.log_calls]
+        assert logged_during == [2]
+
+        callback._on_training_end()
+
+        logged_total = [call["episode"] for call in log_mock.log_calls]
+        assert logged_total == [2, 3]
+        final_call = log_mock.log_calls[-1]
+        assert final_call["info"]["training_complete"] is True
+        assert final_call["steps"] == 2
+
+    def test_training_end_no_duplicate_log_when_last_episode_already_logged(self):
+        """_on_training_end() must not re-log if the final episode already passed the gate."""
+        log_mock = _MockLogger()
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=1, train_logger=log_mock
+        )
+        callback._on_training_start()
+        for timestep in range(1, 3):
+            done = timestep == 2
+            self._step_ro(
                 callback,
                 done=done,
                 timestep=timestep,
@@ -263,12 +453,14 @@ class TestHCLoggingCallback:
                 reward=1.0,
             )
         assert len(log_mock.log_calls) == 1
+        callback._on_training_end()
+        assert len(log_mock.log_calls) == 1
 
     def test_delayed_returns_logged_as_sum_of_rewards(self):
         """delayed_returns in logged info equals sum of per-step rewards for the episode."""
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(
-            log_episode_frequency=1, exp_logger=log_mock
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=1, train_logger=log_mock
         )
         rewards = [1.5, 2.5, 0.5]
         for idx, reward in enumerate(rewards):
@@ -289,8 +481,8 @@ class TestHCLoggingCallback:
     def test_delayed_returns_reset_between_episodes(self):
         """Each episode's delayed_returns reflects only that episode's rewards."""
         log_mock = _MockLogger()
-        callback = runner._HCLoggingCallback(
-            log_episode_frequency=1, exp_logger=log_mock
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=1, train_logger=log_mock
         )
         for idx, reward in enumerate([1.0, 2.0]):
             callback.num_timesteps = idx + 1
@@ -313,16 +505,38 @@ class TestHCLoggingCallback:
         assert log_mock.log_calls[0]["info"]["delayed_returns"] == 3.0
         assert log_mock.log_calls[1]["info"]["delayed_returns"] == 10.0
 
-    def _build_hc_callback(self, log_freq: int = 1) -> runner._HCLoggingCallback:
-        exp_logger = _MockLogger()
-        return runner._HCLoggingCallback(
+    def test_elapsed_seconds_logged(self):
+        """elapsed_seconds is present and non-negative in each logged info dict."""
+        log_mock = _MockLogger()
+        callback = runner._RewardObsLoggingCallback(
+            log_episode_frequency=1, train_logger=log_mock
+        )
+        callback._on_training_start()
+        rewards = [1.0, 2.0, 0.5]
+        for idx, reward in enumerate(rewards):
+            done = idx == len(rewards) - 1
+            callback.num_timesteps = idx + 1
+            callback.locals = {
+                "dones": np.array([done]),
+                "infos": [{"true_episode_return": 5.0}],
+                "rewards": np.array([reward]),
+            }
+            callback._on_step()
+
+        assert len(log_mock.log_calls) == 1
+        assert "elapsed_seconds" in log_mock.log_calls[0]["info"]
+        assert log_mock.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
+
+    def _build_ro_callback(self, log_freq: int = 1) -> runner._RewardObsLoggingCallback:
+        train_logger = _MockLogger()
+        return runner._RewardObsLoggingCallback(
             log_episode_frequency=log_freq,
-            exp_logger=exp_logger,  # type: ignore[arg-type]
+            train_logger=train_logger,  # type: ignore[arg-type]
         )
 
-    def _step_hc(
+    def _step_ro(
         self,
-        callback: runner._HCLoggingCallback,
+        callback: runner._RewardObsLoggingCallback,
         done: bool,
         timestep: int,
         return_val: float = 1.0,
@@ -335,6 +549,195 @@ class TestHCLoggingCallback:
             "rewards": np.array([reward]),
         }
         return callback._on_step()
+
+
+class TestStepEvalCallback:
+    def test_eval_fires_at_each_interval(self):
+        """_on_step triggers evaluation at every eval_step_freq multiple."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=5, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 2.0, 3.0], [10, 10, 10]),
+        ):
+            for step in range(1, 11):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        assert len(eval_log.log_calls) == 2
+
+    def test_eval_does_not_fire_between_intervals(self):
+        """No eval fires on steps that are not multiples of eval_step_freq."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=10, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([0.0], [5])
+        ):
+            for step in range(1, 9):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        assert len(eval_log.log_calls) == 0
+
+    def test_training_end_fires_if_final_step_not_evaluated(self):
+        """_on_training_end triggers an extra eval when the final step was not on the interval."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=5, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 2.0], [10, 10]),
+        ):
+            for step in range(1, 8):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+            callback._on_training_end()
+
+        # Eval at step 5 and then at training_end (step 7).
+        assert len(eval_log.log_calls) == 2
+
+    def test_training_end_skips_if_already_evaluated_at_final_step(self):
+        """_on_training_end does not duplicate an eval when the final step was on the interval."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=5, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 2.0], [10, 10]),
+        ):
+            for step in range(1, 11):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+            callback._on_training_end()
+
+        # Evals at 5 and 10; training_end sees last_eval_steps == 10, skips.
+        assert len(eval_log.log_calls) == 2
+
+    def test_logged_entry_contains_mean_return(self):
+        """Log entry returns field is the mean of episode_rewards."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=1, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 3.0], [10, 10]),
+        ):
+            callback.model = model
+            callback.num_timesteps = 1
+            callback._on_step()
+
+        assert eval_log.log_calls[0]["returns"] == pytest.approx(2.0)
+
+    def test_logged_entry_contains_std_and_n_eval_episodes(self):
+        """Log entry info contains std_return and n_eval_episodes."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(
+            eval_step_freq=1, n_eval_episodes=2, eval_log=eval_log
+        )
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation,
+            "evaluate_policy",
+            return_value=([1.0, 3.0], [10, 10]),
+        ):
+            callback.model = model
+            callback.num_timesteps = 1
+            callback._on_step()
+
+        info = eval_log.log_calls[0]["info"]
+        assert info["std_return"] == pytest.approx(1.0)
+        assert info["n_eval_episodes"] == 2
+
+    def test_global_steps_matches_num_timesteps(self):
+        """global_steps in the log entry equals num_timesteps at eval time."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=7, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([2.0], [5])
+        ):
+            for step in range(1, 8):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        assert eval_log.log_calls[0]["global_steps"] == 7
+
+    def test_eval_count_increments(self):
+        """_eval_count tracks the number of evaluations performed."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=3, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([1.0], [5])
+        ):
+            for step in range(1, 10):
+                callback.model = model
+                callback.num_timesteps = step
+                callback._on_step()
+
+        # Evals at steps 3, 6, 9.
+        assert callback._eval_count == 3
+        assert [call["episode"] for call in eval_log.log_calls] == [1, 2, 3]
+
+    def test_elapsed_seconds_in_info(self):
+        """elapsed_seconds is present and non-negative in eval log info."""
+        eval_log = _MockLogger()
+        callback = self._build_eval_cb(eval_step_freq=1, eval_log=eval_log)
+        callback._on_training_start()
+        model = _make_mock_sac()
+
+        with unittest.mock.patch.object(
+            runner.sb3_evaluation, "evaluate_policy", return_value=([1.0], [5])
+        ):
+            callback.model = model
+            callback.num_timesteps = 1
+            callback._on_step()
+
+        assert "elapsed_seconds" in eval_log.log_calls[0]["info"]
+        assert eval_log.log_calls[0]["info"]["elapsed_seconds"] >= 0.0
+
+    def _build_eval_cb(
+        self,
+        eval_step_freq: int = 10,
+        n_eval_episodes: int = 3,
+        eval_log: Optional[Any] = None,
+    ) -> runner.StepEvalCallback:
+        if eval_log is None:
+            eval_log = _MockLogger()
+        return runner.StepEvalCallback(
+            eval_env=unittest.mock.MagicMock(),
+            eval_step_freq=eval_step_freq,
+            n_eval_episodes=n_eval_episodes,
+            eval_logger=eval_log,  # type: ignore[arg-type]
+            algo_name="sac/test",
+        )
 
 
 class TestMakeRewardModel:
@@ -350,20 +753,38 @@ class TestMakeRewardModel:
             delay=1,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="ircr",
-            reward_model_kwargs={"max_buffer_size": 10, "k_neighbors": 1},
+            reward_model_kwargs={"fifo_capacity": 500, "heap_capacity": 3},
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         model = runner._make_reward_model(args, pendulum_env)
         assert isinstance(model, ircr.IRCRRewardModel)
+
+    def test_none_type_returns_none(self, tmp_path, pendulum_env):
+        args = runner.TrainingArgs(
+            env="Pendulum-v1",
+            delay=1,
+            env_kwargs={"max_episode_steps": 50},
+            reward_model_type="none",
+            reward_model_kwargs={},
+            update_every_n_steps=100,
+            clear_buffer_on_update=False,
+            num_steps=100,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
+            log_episode_frequency=1,
+            output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
+            seed=None,
+        )
+        assert runner._make_reward_model(args, pendulum_env) is None
 
     def test_unknown_type_raises_value_error(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
@@ -375,12 +796,11 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         with pytest.raises(ValueError):
@@ -396,12 +816,11 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         model = runner._make_reward_model(args, pendulum_env)
@@ -418,12 +837,11 @@ class TestMakeRewardModel:
             update_every_n_steps=100,
             clear_buffer_on_update=False,
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=100,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 100, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
             seed=None,
         )
         model = runner._make_reward_model(args, pendulum_env)
@@ -439,15 +857,15 @@ class TestMakeRewardModel:
 
 
 class TestParseArgs:
-    def test_defaults_are_valid_training_args(self, tmp_path):
-        with patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
-            args = runner.parse_args()
-        assert isinstance(args, runner.TrainingArgs)
-        assert args.env == "MountainCarContinuous-v0"
-        assert args.delay == 3
+    def test_defaults_are_valid_mapping(self, tmp_path):
+        with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
+            args = runner.parse_single_cli()
+        assert isinstance(args, dict)
+        assert args["env"] == "MountainCarContinuous-v0"
+        assert args["delay"] == 3
 
     def test_custom_env_and_delay(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             [
                 "prog",
@@ -459,58 +877,163 @@ class TestParseArgs:
                 str(tmp_path),
             ],
         ):
-            args = runner.parse_args()
-        assert args.env == "Pendulum-v1"
-        assert args.delay == 5
+            args = runner.parse_single_cli()
+        assert args["env"] == "Pendulum-v1"
+        assert args["delay"] == 5
 
     def test_reward_model_kwarg_parsed(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             [
                 "prog",
                 "--reward-model-kwarg",
-                "max_buffer_size=50",
+                "fifo_capacity=500",
                 "--output-dir",
                 str(tmp_path),
             ],
         ):
-            args = runner.parse_args()
-        assert args.reward_model_kwargs["max_buffer_size"] == 50
+            args = runner.parse_single_cli()
+        assert args["reward_model_kwargs"]["fifo_capacity"] == 500
 
     def test_agent_type_hc(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             ["prog", "--agent-type", "hc", "--output-dir", str(tmp_path)],
         ):
-            args = runner.parse_args()
-        assert args.agent_type == "hc"
+            args = runner.parse_single_cli()
+        assert args["agent_type"] == "hc"
 
     def test_clear_buffer_flag(self, tmp_path):
-        with patch(
+        with unittest.mock.patch(
             "sys.argv",
             ["prog", "--clear-buffer-on-update", "--output-dir", str(tmp_path)],
         ):
-            args = runner.parse_args()
-        assert args.clear_buffer_on_update is True
+            args = runner.parse_single_cli()
+        assert args["clear_buffer_on_update"] is True
+
+    def test_none_reward_model_type_accepted(self, tmp_path):
+        with unittest.mock.patch(
+            "sys.argv",
+            ["prog", "--reward-model-type", "none", "--output-dir", str(tmp_path)],
+        ):
+            args = runner.parse_single_cli()
+        assert args["reward_model_type"] == "none"
+
+    def test_sac_kwarg_parsed(self, tmp_path):
+        with unittest.mock.patch(
+            "sys.argv",
+            [
+                "prog",
+                "--sac-kwarg",
+                "buffer_size=100000",
+                "--sac-kwarg",
+                "ent_coef=auto_0.1",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            args = runner.parse_single_cli()
+        assert args["sac_kwargs"]["buffer_size"] == 100000
+        assert args["sac_kwargs"]["ent_coef"] == "auto_0.1"
+
+    def test_sac_kwarg_empty_when_not_provided(self, tmp_path):
+        with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
+            args = runner.parse_single_cli()
+        assert args["sac_kwargs"] == {}
+
+
+class TestGenerateConfigs:
+    def test_single_run_produces_one_config(self, tmp_path):
+        """num_runs=1 produces exactly one TrainingArgs."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert len(configs) == 1
+        assert isinstance(configs[0], runner.TrainingArgs)
+
+    def test_multi_run_produces_correct_count(self, tmp_path):
+        """num_runs=3 produces three TrainingArgs instances."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        assert len(configs) == 3
+
+    def test_multi_run_produces_unique_output_dirs(self, tmp_path):
+        """Each run gets a distinct output_dir containing its run index."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        dirs = [cfg.output_dir for cfg in configs]
+        assert len(set(dirs)) == 3
+        assert "run-000" in dirs[0]
+        assert "run-001" in dirs[1]
+        assert "run-002" in dirs[2]
+
+    def test_multi_run_produces_unique_seeds(self, tmp_path):
+        """Each run receives a distinct seed when num_runs > 1."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        seeds = [cfg.seed for cfg in configs]
+        assert len(set(seeds)) == 3
+
+    def test_cli_args_override_defaults(self, tmp_path):
+        """Custom env, delay, and reward_model_type are preserved in produced configs."""
+        single_cli = {
+            **self._make_single_cli(tmp_path),
+            "env": "Pendulum-v1",
+            "delay": 7,
+            "reward_model_type": "none",
+        }
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert configs[0].env == "Pendulum-v1"
+        assert configs[0].delay == 7
+        assert configs[0].reward_model_type == "none"
+
+    def test_exp_name_and_run_id_set_in_single_cli_mode(self, tmp_path):
+        """Single-CLI mode always uses exp-000; run_id increments per run."""
+        single_cli = self._make_single_cli(tmp_path)
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 3})
+        assert all(cfg.exp_name == "exp-000" for cfg in configs)
+        assert [cfg.run_id for cfg in configs] == [0, 1, 2]
+
+    def _make_single_cli(self, tmp_path: Any) -> Mapping[str, Any]:
+        """Minimal single_cli dict equivalent to a parsed CLI invocation.
+
+        Mirrors what parse_single_cli() returns: max_episode_steps has been
+        folded into env_kwargs, and output_dir / seed are present as top-level keys.
+        """
+        return {
+            "env": "MountainCarContinuous-v0",
+            "delay": 3,
+            "env_kwargs": {"max_episode_steps": 2500},
+            "reward_model_type": "ircr",
+            "update_every_n_steps": 1000,
+            "clear_buffer_on_update": False,
+            "reward_model_kwargs": {},
+            "agent_type": "sac",
+            "sac_kwargs": {},
+            "agent_kwargs": {},
+            "seed": None,
+            "num_steps": 50000,
+            "log_episode_frequency": 1,
+            "output_dir": str(tmp_path),
+        }
 
 
 class TestLoadConfigs:
     def test_single_experiment_single_run(self, tmp_path):
         """One experiment with num_runs=1 produces exactly one TrainingArgs."""
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_env_fields={"delay": 2},
             output_dir=str(tmp_path),
             num_runs=1,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 1
         assert configs[0].env == "Pendulum-v1"
         assert configs[0].delay == 2
 
     def test_num_runs_expands_entries(self, tmp_path):
         """num_runs=3 expands one experiment into three TrainingArgs."""
-        config = self._single_env(output_dir=str(tmp_path), num_runs=3)
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 3
 
     def test_multiple_experiments_expanded(self, tmp_path):
@@ -520,13 +1043,12 @@ class TestLoadConfigs:
             "num_runs": 2,
             "environments": [
                 {
-                    "name": "pendulum",
                     "env": "Pendulum-v1",
                     "experiments": [{}, {}],
                 }
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 4
 
     def test_multiple_environments_expanded(self, tmp_path):
@@ -535,31 +1057,31 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "num_runs": 2,
             "environments": [
-                {"name": "pendulum", "env": "Pendulum-v1", "experiments": [{}]},
-                {"name": "mcc", "env": "MountainCarContinuous-v0", "experiments": [{}]},
+                {"env": "Pendulum-v1", "experiments": [{}]},
+                {"env": "MountainCarContinuous-v0", "experiments": [{}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 4
 
     def test_explicit_seed_passed_through_for_single_run(self, tmp_path):
         """An explicit seed with num_runs=1 is kept verbatim, not run through Seeder."""
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_exp_fields={"seed": 99},
             output_dir=str(tmp_path),
             num_runs=1,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].seed == 99
 
     def test_seeds_differ_across_runs(self, tmp_path):
         """Multiple runs for the same experiment receive different seeds."""
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_exp_fields={"seed": 7},
             output_dir=str(tmp_path),
             num_runs=3,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         seeds = [cfg.seed for cfg in configs]
         assert len(set(seeds)) == 3, "All seeds should be distinct across runs"
 
@@ -569,44 +1091,44 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "num_runs": 2,
             "environments": [
-                {"name": "e1", "env": "Pendulum-v1", "experiments": [{}]},
-                {"name": "e2", "env": "Pendulum-v1", "experiments": [{}]},
+                {"env": "Pendulum-v1", "experiments": [{}]},
+                {"env": "Pendulum-v1", "experiments": [{}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         seeds = [cfg.seed for cfg in configs]
         assert len(set(seeds)) == len(seeds), "Seeds must be unique across environments"
 
     def test_output_dirs_include_env_label(self, tmp_path):
-        """Output dirs embed the env name and then exp/run indices."""
-        config = self._single_env(output_dir=str(tmp_path), num_runs=2)
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        """Output dirs embed the gym env ID and then exp/run indices."""
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=2)
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].output_dir == str(
-            tmp_path / "pendulum" / "exp-000" / "run-000"
+            tmp_path / "Pendulum-v1" / "exp-000" / "run-000"
         )
         assert configs[1].output_dir == str(
-            tmp_path / "pendulum" / "exp-000" / "run-001"
+            tmp_path / "Pendulum-v1" / "exp-000" / "run-001"
         )
 
-    def test_env_name_falls_back_to_env_id_when_absent(self, tmp_path):
-        """When no name is given, the gym env id is used as the directory label."""
+    def test_output_dirs_use_env_id_directly(self, tmp_path):
+        """The gym env ID is used as-is as the directory label."""
         config = {
             "output_dir": str(tmp_path),
             "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert "Pendulum-v1" in configs[0].output_dir
 
     def test_experiment_output_dir_overrides_top_level(self, tmp_path):
-        """An experiment-level output_dir is used verbatim for all its runs."""
+        """An experiment-level output_dir is used as the base path (env/exp/run subdirs are still appended)."""
         exp_dir = str(tmp_path / "custom")
-        config = self._single_env(
+        config = _make_single_env_config(
             extra_exp_fields={"output_dir": exp_dir},
             output_dir=str(tmp_path),
             num_runs=2,
         )
-        configs = runner._load_configs(self._write_config(tmp_path, config))
-        assert all(cfg.output_dir == exp_dir for cfg in configs)
+        configs = runner._load_configs(_write_config(tmp_path, config))
+        assert all(cfg.output_dir.startswith(exp_dir) for cfg in configs)
 
     def test_top_level_shared_fields_applied_to_all(self, tmp_path):
         """Top-level fields serve as defaults for all environments and experiments."""
@@ -614,10 +1136,10 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "delay": 10,
             "environments": [
-                {"name": "e1", "env": "Pendulum-v1", "experiments": [{}, {}]},
+                {"env": "Pendulum-v1", "experiments": [{}, {}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert all(cfg.delay == 10 for cfg in configs)
 
     def test_env_field_overrides_top_level_default(self, tmp_path):
@@ -626,10 +1148,10 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "delay": 5,
             "environments": [
-                {"name": "e1", "env": "Pendulum-v1", "delay": 2, "experiments": [{}]},
+                {"env": "Pendulum-v1", "delay": 2, "experiments": [{}]},
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].delay == 2
 
     def test_experiment_field_overrides_env_default(self, tmp_path):
@@ -638,42 +1160,107 @@ class TestLoadConfigs:
             "output_dir": str(tmp_path),
             "environments": [
                 {
-                    "name": "e1",
                     "env": "Pendulum-v1",
                     "delay": 5,
                     "experiments": [{"delay": 1}],
                 }
             ],
         }
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert configs[0].delay == 1
 
     def test_returns_training_args_instances(self, tmp_path):
         """All returned objects are TrainingArgs dataclass instances."""
-        config = self._single_env(output_dir=str(tmp_path))
-        configs = runner._load_configs(self._write_config(tmp_path, config))
+        config = _make_single_env_config(output_dir=str(tmp_path))
+        configs = runner._load_configs(_write_config(tmp_path, config))
         assert all(isinstance(cfg, runner.TrainingArgs) for cfg in configs)
 
-    def _write_config(self, tmp_path, data: Mapping[str, Any]) -> str:
-        config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps(data))
-        return str(config_file)
+    def test_exp_name_and_run_id_set_correctly(self, tmp_path):
+        """exp_name is shared across runs; run_id is unique within an experiment."""
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(_write_config(tmp_path, config))
+        assert all(cfg.exp_name == "exp-000" for cfg in configs)
+        assert [cfg.run_id for cfg in configs] == [0, 1, 2]
 
-    def _single_env(
-        self,
-        extra_env_fields: Optional[Mapping[str, Any]] = None,
-        extra_exp_fields: Optional[Mapping[str, Any]] = None,
-        **top: Any,
-    ) -> Mapping[str, Any]:
-        """Helper to build a minimal multi-env config with one env and one experiment."""
-        env_entry: Dict[str, Any] = {"name": "pendulum", "env": "Pendulum-v1"}
-        if extra_env_fields:
-            env_entry.update(extra_env_fields)
-        exp_entry: Dict[str, Any] = {}
-        if extra_exp_fields:
-            exp_entry.update(extra_exp_fields)
-        env_entry["experiments"] = [exp_entry]
-        return {**top, "environments": [env_entry]}
+
+class TestLoadConfigsPrecedence:
+    """Argument precedence: code defaults < batch file < CLI args."""
+
+    def test_cli_num_runs_overrides_file_num_runs(self, tmp_path):
+        """CLI --num-runs overrides the top-level num_runs in the batch file."""
+        config = _make_single_env_config(output_dir=str(tmp_path), num_runs=3)
+        configs = runner._load_configs(
+            _write_config(tmp_path, config),
+            exec_kwargs={"num_runs": 5},
+        )
+        assert len(configs) == 5
+
+    def test_cli_num_runs_overrides_env_level_num_runs(self, tmp_path):
+        """CLI --num-runs overrides num_runs set at the environment level."""
+        config = {
+            "output_dir": str(tmp_path),
+            "environments": [
+                {"env": "Pendulum-v1", "num_runs": 2, "experiments": [{}]},
+            ],
+        }
+        configs = runner._load_configs(
+            _write_config(tmp_path, config),
+            exec_kwargs={"num_runs": 4},
+        )
+        assert len(configs) == 4
+
+    def test_file_num_steps_not_overridden_by_absent_cli_arg(self, tmp_path):
+        """File num_steps is preserved when the user did not pass --num-steps (None)."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_steps": 99999,
+            "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            _write_config(tmp_path, config),
+            common_kwargs={"num_steps": None},
+        )
+        assert configs[0].num_steps == 99999
+
+    def test_cli_num_steps_overrides_file(self, tmp_path):
+        """CLI --num-steps overrides num_steps set in the batch file."""
+        config = {
+            "output_dir": str(tmp_path),
+            "num_steps": 99999,
+            "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            _write_config(tmp_path, config),
+            common_kwargs={"num_steps": 1000},
+        )
+        assert configs[0].num_steps == 1000
+
+    def test_cli_num_steps_overrides_env_level_field(self, tmp_path):
+        """CLI --num-steps overrides num_steps even when set at the environment level."""
+        config = {
+            "output_dir": str(tmp_path),
+            "environments": [
+                {"env": "Pendulum-v1", "num_steps": 99999, "experiments": [{}]},
+            ],
+        }
+        configs = runner._load_configs(
+            _write_config(tmp_path, config),
+            common_kwargs={"num_steps": 1000},
+        )
+        assert configs[0].num_steps == 1000
+
+    def test_cli_output_dir_overrides_file(self, tmp_path):
+        """CLI --output-dir overrides the output_dir in the batch file."""
+        cli_dir = str(tmp_path / "cli")
+        config = {
+            "output_dir": str(tmp_path / "file"),
+            "environments": [{"env": "Pendulum-v1", "experiments": [{}]}],
+        }
+        configs = runner._load_configs(
+            _write_config(tmp_path, config),
+            common_kwargs={"output_dir": cli_dir},
+        )
+        assert configs[0].output_dir.startswith(cli_dir)
 
 
 class TestRunBatch:
@@ -689,17 +1276,16 @@ class TestRunBatch:
                 clear_buffer_on_update=False,
                 reward_model_kwargs={},
                 num_steps=100,
-                sac_learning_rate=3e-4,
-                sac_buffer_size=1000,
-                sac_batch_size=32,
-                sac_gradient_steps=1,
+                sac_kwargs={"buffer_size": 1000, "batch_size": 32, "gradient_steps": 1},
                 log_episode_frequency=1,
                 output_dir=str(tmp_path),
+                exp_name="exp-000",
+                run_id=idx,
                 seed=idx,
             )
             for idx in range(3)
         ]
-        with patch("drmdp.control.runner.run") as mock_run:
+        with unittest.mock.patch("drmdp.control.runner.run") as mock_run:
             runner.run_batch(configs, mode="debug")
         assert mock_run.call_count == 3
 
@@ -715,29 +1301,28 @@ class TestRunBatch:
                 clear_buffer_on_update=False,
                 reward_model_kwargs={},
                 num_steps=100,
-                sac_learning_rate=3e-4,
-                sac_buffer_size=1000,
-                sac_batch_size=32,
-                sac_gradient_steps=1,
+                sac_kwargs={"buffer_size": 1000, "batch_size": 32, "gradient_steps": 1},
                 log_episode_frequency=1,
                 output_dir=str(tmp_path),
+                exp_name="exp-000",
+                run_id=idx,
                 seed=idx,
             )
             for idx in range(2)
         ]
-        mock_future = MagicMock()
+        mock_future = unittest.mock.MagicMock()
         mock_future.result.return_value = None
-        mock_executor = MagicMock()
-        mock_executor.__enter__ = MagicMock(return_value=mock_executor)
-        mock_executor.__exit__ = MagicMock(return_value=False)
+        mock_executor = unittest.mock.MagicMock()
+        mock_executor.__enter__ = unittest.mock.MagicMock(return_value=mock_executor)
+        mock_executor.__exit__ = unittest.mock.MagicMock(return_value=False)
         mock_executor.submit.return_value = mock_future
 
         with (
-            patch(
+            unittest.mock.patch(
                 "drmdp.control.runner.concurrent.futures.ProcessPoolExecutor",
                 return_value=mock_executor,
             ),
-            patch(
+            unittest.mock.patch(
                 "drmdp.control.runner.concurrent.futures.as_completed",
                 return_value=iter([mock_future, mock_future]),
             ),
@@ -757,14 +1342,13 @@ class TestRunBatch:
             clear_buffer_on_update=False,
             reward_model_kwargs={},
             num_steps=100,
-            sac_learning_rate=3e-4,
-            sac_buffer_size=1000,
-            sac_batch_size=32,
-            sac_gradient_steps=1,
+            sac_kwargs={"buffer_size": 1000, "batch_size": 32, "gradient_steps": 1},
             log_episode_frequency=1,
             output_dir=str(tmp_path),
+            exp_name="exp-000",
+            run_id=0,
         )
-        with patch("drmdp.control.runner.run") as mock_run:
+        with unittest.mock.patch("drmdp.control.runner.run") as mock_run:
             runner.run_batch([config], mode="unknown_mode")
         assert mock_run.call_count == 1
 
@@ -777,9 +1361,9 @@ class TestParseRewardModelKwargs:
 
     def test_int_value_parsed(self):
         """Integer strings are coerced to int."""
-        result = runner.parse_reward_model_kwargs(["max_buffer_size=200"])
-        assert result["max_buffer_size"] == 200
-        assert isinstance(result["max_buffer_size"], int)
+        result = runner.parse_reward_model_kwargs(["fifo_capacity=300000"])
+        assert result["fifo_capacity"] == 300000
+        assert isinstance(result["fifo_capacity"], int)
 
     def test_float_value_parsed(self):
         """Float strings are coerced to float."""
@@ -801,14 +1385,9 @@ class TestParseRewardModelKwargs:
     def test_multiple_pairs(self):
         """Multiple key=value pairs are all parsed into the same mapping."""
         result = runner.parse_reward_model_kwargs(
-            ["max_buffer_size=200", "k_neighbors=5"]
+            ["fifo_capacity=300000", "heap_capacity=10"]
         )
-        assert result == {"max_buffer_size": 200, "k_neighbors": 5}
-
-
-# ---------------------------------------------------------------------------
-# Stubs and helpers
-# ---------------------------------------------------------------------------
+        assert result == {"fifo_capacity": 300000, "heap_capacity": 10}
 
 
 class _TrackingRewardModel(base.RewardModel):
@@ -825,6 +1404,7 @@ class _TrackingRewardModel(base.RewardModel):
         actions: np.ndarray,
         terminals: np.ndarray,
     ) -> np.ndarray:
+        del actions, terminals
         return np.full(len(observations), self._constant, dtype=np.float32)
 
     def update(self, trajectories: Sequence[base.Trajectory]) -> Mapping[str, float]:
@@ -848,16 +1428,24 @@ class _MockLogger:
 
     def __init__(self):
         self.log_calls: List[Mapping[str, Any]] = []
+        self.params: Optional[Any] = None
 
     def log(
         self,
         episode: int,
         steps: int,
+        global_steps: int,
         returns: float,
         info: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.log_calls.append(
-            {"episode": episode, "steps": steps, "returns": returns, "info": info}
+            {
+                "episode": episode,
+                "steps": steps,
+                "global_steps": global_steps,
+                "returns": returns,
+                "info": info,
+            }
         )
 
 
@@ -865,26 +1453,26 @@ def _build_callback(
     reward_model: Optional[base.RewardModel] = None,
     update_every: int = 100,
     clear_buffer: bool = False,
-    log_freq: int = 1,
-    exp_logger: Any = None,
+    log_episode_freq: int = 1,
+    train_logger: Any = None,
 ) -> runner.RewardModelUpdateCallback:
     """Construct a callback with sensible defaults for unit testing."""
     if reward_model is None:
         reward_model = _TrackingRewardModel()
-    if exp_logger is None:
-        exp_logger = _MockLogger()
+    if train_logger is None:
+        train_logger = _MockLogger()
     return runner.RewardModelUpdateCallback(
         reward_model=reward_model,
         update_every_n_steps=update_every,
         clear_buffer_on_update=clear_buffer,
-        log_episode_frequency=log_freq,
-        exp_logger=exp_logger,
+        log_episode_frequency=log_episode_freq,
+        train_logger=train_logger,
     )
 
 
-def _make_mock_sac(obs_dim: int = 3, act_dim: int = 1) -> MagicMock:
+def _make_mock_sac(obs_dim: int = 3) -> unittest.mock.MagicMock:
     """Return a minimal SAC mock with _last_obs and replay_buffer."""
-    sac = MagicMock()
+    sac = unittest.mock.MagicMock()
     sac._last_obs = np.zeros((1, obs_dim), dtype=np.float32)
     sac.replay_buffer = _MockReplayBuffer()
     return sac
@@ -900,13 +1488,36 @@ def _step_callback(
     num_timesteps: int,
 ) -> bool:
     """Simulate one SB3 callback step by setting required attributes/locals."""
-    sac_model._last_obs = obs_before[np.newaxis]  # (1, obs_dim)
+    sac_model._last_obs = obs_before[np.newaxis]
     callback.model = sac_model
     callback.locals = {
-        "actions": action[np.newaxis],  # (1, act_dim)
+        "actions": action[np.newaxis],
         "rewards": np.array([reward]),
         "dones": np.array([done]),
         "infos": [{}],
     }
     callback.num_timesteps = num_timesteps
     return callback._on_step()
+
+
+def _write_config(tmp_path: Any, data: Mapping[str, Any]) -> str:
+    """Serialise a batch-config dict to a temporary JSON file and return its path."""
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(data))
+    return str(config_file)
+
+
+def _make_single_env_config(
+    extra_env_fields: Optional[Mapping[str, Any]] = None,
+    extra_exp_fields: Optional[Mapping[str, Any]] = None,
+    **top: Any,
+) -> Mapping[str, Any]:
+    """Build a minimal batch config with one env entry and one experiment entry."""
+    env_entry: Dict[str, Any] = {"env": "Pendulum-v1"}
+    if extra_env_fields:
+        env_entry.update(extra_env_fields)
+    exp_entry: Dict[str, Any] = {}
+    if extra_exp_fields:
+        exp_entry.update(extra_exp_fields)
+    env_entry["experiments"] = [exp_entry]
+    return {**top, "environments": [env_entry]}

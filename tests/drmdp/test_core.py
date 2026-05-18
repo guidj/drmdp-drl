@@ -152,3 +152,80 @@ class TestEnvMonitorWrapper:
         wrapped_env.reset()
         assert wrapped_env.mon.rewards == 0.0
         assert wrapped_env.mon.step == 0
+
+
+class TestArgChain:
+    def test_empty_layers_returns_default(self):
+        chain = core.ArgChain([])
+        assert chain.get("k", 7) == 7
+
+    def test_single_layer_found(self):
+        chain = core.ArgChain([{"k": 42}])
+        assert chain.get("k") == 42
+
+    def test_single_layer_not_found_returns_default(self):
+        chain = core.ArgChain([{"a": 1}])
+        assert chain.get("b", 99) == 99
+
+    def test_default_is_none_when_omitted(self):
+        chain = core.ArgChain([{"a": 1}])
+        assert chain.get("missing") is None
+
+    def test_first_layer_wins(self):
+        chain = core.ArgChain([{"k": "first"}, {"k": "second"}])
+        assert chain.get("k") == "first"
+
+    def test_falls_through_to_later_layer(self):
+        chain = core.ArgChain([{"a": 1}, {"b": 2}])
+        assert chain.get("b") == 2
+
+    def test_none_value_is_valid(self):
+        chain = core.ArgChain([{"k": None}, {"k": "fallback"}])
+        assert chain.get("k") is None
+
+    def test_prepend_gives_higher_priority(self):
+        chain = core.ArgChain([{"k": "base"}])
+        new_chain = chain.prepend([{"k": "override"}])
+        assert new_chain.get("k") == "override"
+
+    def test_prepend_does_not_mutate_original(self):
+        chain = core.ArgChain([{"k": "base"}])
+        chain.prepend([{"k": "override"}])
+        assert chain.get("k") == "base"
+
+    def test_extend_appends_lower_priority(self):
+        chain = core.ArgChain([{"k": "original"}])
+        new_chain = chain.extend([{"k": "extended"}])
+        assert new_chain.get("k") == "original"
+
+    def test_extend_does_not_mutate_original(self):
+        chain = core.ArgChain([{"k": "base"}])
+        chain.extend([{"k": "extended"}])
+        assert chain.get("k") == "base"
+
+    def test_pinned_cli_wins_over_prepended_layer(self):
+        cli = {"k": "cli"}
+        base = {"k": "base"}
+        override = {"k": "override"}
+        chain = core.ArgChain.pinned([cli], [base])
+        new_chain = chain.prepend([override])
+        assert new_chain.get("k") == "cli"
+
+    def test_prepend_with_pin_inserts_below_pinned(self):
+        cli = {"k": "cli"}
+        base = {"k": "base"}
+        new_layer = {"other": "new"}
+        chain = core.ArgChain.pinned([cli], [base])
+        new_chain = chain.prepend([new_layer])
+        assert new_chain.get("other") == "new"
+        assert new_chain.get("k") == "cli"
+
+    def test_extend_preserves_pin(self):
+        chain = core.ArgChain.pinned([{"a": 1}], [{"b": 2}])
+        extended = chain.extend([{"c": 3}])
+        assert extended._pin == chain._pin
+
+    def test_prepend_preserves_pin(self):
+        chain = core.ArgChain.pinned([{"a": 1}], [{"b": 2}])
+        prepended = chain.prepend([{"c": 3}])
+        assert prepended._pin == chain._pin

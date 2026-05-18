@@ -1,9 +1,9 @@
 """
 Tests for drmdp.control.grd: GRDRewardModel, _CausalStructure, _RewardNetwork,
-_DynamicsNetwork, _extract_transitions, _compute_compact_mask, _sparsity_reg.
+_DynamicsNetwork, _extract_transition_arrays, _compute_compact_mask, _sparsity_reg.
 """
 
-from typing import List
+from typing import Any, List, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -44,11 +44,11 @@ class TestCausalStructure:
 
     def test_gumbel_has_gradient(self):
         causal = grd._CausalStructure(obs_dim=3, action_dim=2)
-        mask_sr, _, _, _ = causal.sample_gumbel()
-        # Gumbel output must carry gradients back to phi parameters.
-        loss = mask_sr.sum()
+        mask_sr, mask_ar, mask_ss, mask_as = causal.sample_gumbel()
+        loss = mask_sr.sum() + mask_ar.sum() + mask_ss.sum() + mask_as.sum()
         loss.backward()
-        assert causal.phi_sr.grad is not None
+        for name, param in causal.named_parameters():
+            assert param.grad is not None, f"{name} has no gradient"
 
 
 class TestRewardNetwork:
@@ -105,62 +105,97 @@ class TestDynamicsNetwork:
             assert param.grad is not None
 
     def test_column_masking_isolates_target_gradient(self):
-        """Zeroing column i of mask_ss blocks gradient to that target dim."""
+        """Zeroing column i of mask_ss/mask_as blocks obs/act gradient for that dim."""
         torch.manual_seed(42)
+        masked_dim = 1
         net = grd._DynamicsNetwork(
             obs_dim=3, action_dim=2, hidden_dim=16, num_hidden_layers=1
         )
-        obs = torch.randn(4, 3)
-        act = torch.randn(4, 2)
+        obs = torch.randn(4, 3, requires_grad=True)
+        act = torch.randn(4, 2, requires_grad=True)
         next_obs = torch.randn(4, 3)
 
-        # Mask that zeros out all edges to target dim 1.
         mask_ss = torch.ones(3, 3)
-        mask_ss[:, 1] = 0.0
+        # `masked_dim` in obs has no influence on any state dim
+        mask_ss[masked_dim, :] = 0.0
         mask_as = torch.ones(2, 3)
-        mask_as[:, 1] = 0.0
+        # `masked_dim` in action has no influence on any state dim
+        mask_as[masked_dim::] = 0.0
 
-        # NLL should still be finite even with zero-masked inputs for dim 1.
         nll = net.nll(obs, act, next_obs, mask_ss, mask_as)
-        assert torch.isfinite(nll)
+        nll.backward()
+        assert obs.grad is not None
+        assert act.grad is not None
+        expected_obs_grad = torch.ones_like(obs.grad)
+        expected_obs_grad[:, masked_dim] = 0.0
+        expected_act_grad = torch.ones_like(act.grad)
+        expected_act_grad[:, masked_dim] = 0.0
 
-    def test_mdn_mixing_weights_sum_to_one(self):
-        """MDN π weights must be a valid probability distribution."""
+        # Gradients should be zero for the masked_dim
+        # and non-zero otherwise.
+        torch.testing.assert_close(
+            torch.where(obs.grad == 0.0, 0.0, 1.0), expected_obs_grad
+        )
+        torch.testing.assert_close(
+            torch.where(act.grad == 0.0, 0.0, 1.0), expected_act_grad
+        )
+
+        # If none of the dimensions are relevant
+        # the gradients are zero.
+        obs2 = torch.randn(4, 3, requires_grad=True)
+        act2 = torch.randn(4, 2, requires_grad=True)
+        mask_ss_nr = torch.zeros(3, 3)
+        mask_as_nr = torch.zeros(2, 3)
+
+        nll2 = net.nll(obs2, act2, next_obs, mask_ss_nr, mask_as_nr)
+        nll2.backward()
+        assert obs2.grad is not None
+        assert act2.grad is not None
+        torch.testing.assert_close(obs2.grad, torch.zeros_like(obs2.grad))
+        torch.testing.assert_close(act2.grad, torch.zeros_like(act2.grad))
+
+    def test_nll_decreases_with_training(self):
+        """MDN parameters converge when trained on a fixed transition."""
         torch.manual_seed(0)
         net = grd._DynamicsNetwork(
             obs_dim=3, action_dim=2, hidden_dim=16, num_hidden_layers=1
         )
-        obs = torch.randn(5, 3)
-        act = torch.randn(5, 2)
+        obs = torch.randn(16, 3)
+        act = torch.randn(16, 2)
+        next_obs = obs.clone()
         mask_ss = torch.ones(3, 3)
         mask_as = torch.ones(2, 3)
 
-        # Access raw MDN outputs by inspecting the forward path directly.
-        with torch.no_grad():
-            obs_expanded = obs.unsqueeze(1) * mask_ss.T.unsqueeze(0)
-            act_expanded = act.unsqueeze(1) * mask_as.T.unsqueeze(0)
-            inputs = torch.cat([obs_expanded, act_expanded], dim=-1)
-            flat_inputs = inputs.reshape(5 * 3, 3 + 2)
-            raw = net._final(net._layers(flat_inputs)).reshape(
-                5, 3, grd._MDN_COMPONENTS, 3
-            )
-            pi = torch.softmax(raw[..., 0], dim=-1)
-        np.testing.assert_allclose(pi.sum(dim=-1).numpy(), np.ones((5, 3)), atol=1e-5)
+        initial_nll = net.nll(obs, act, next_obs, mask_ss, mask_as).item()
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+        for _ in range(10):
+            optimizer.zero_grad()
+            loss = net.nll(obs, act, next_obs, mask_ss, mask_as)
+            loss.backward()
+            optimizer.step()
+
+        final_nll = loss.item()
+        assert final_nll < initial_nll
 
 
-class TestExtractTransitions:
+class TestExtractTransitionArrays:
     def test_terminal_step_skipped(self):
         traj = _make_trajectory(obs_dim=2, action_dim=1, num_steps=4)
-        transitions = grd._extract_transitions(traj)
-        # The terminal step (last) should be skipped.
-        assert len(transitions) == 3
+        obs, act, next_obs = grd._extract_transition_arrays(traj)
+        assert len(obs) == 3
+        assert len(act) == 3
+        assert len(next_obs) == 3
 
     def test_obs_next_obs_slices_are_consecutive(self):
         traj = _make_trajectory(obs_dim=2, action_dim=1, num_steps=4)
-        transitions = grd._extract_transitions(traj)
-        for step_idx, tr in enumerate(transitions):
-            np.testing.assert_array_equal(tr.obs, traj.observations[step_idx])
-            np.testing.assert_array_equal(tr.next_obs, traj.observations[step_idx + 1])
+        obs, act, next_obs = grd._extract_transition_arrays(traj)
+        for step_idx in range(len(obs)):
+            np.testing.assert_array_equal(obs[step_idx], traj.observations[step_idx])
+            np.testing.assert_array_equal(
+                next_obs[step_idx], traj.observations[step_idx + 1]
+            )
+            np.testing.assert_array_equal(act[step_idx], traj.actions[step_idx])
 
     def test_all_terminal_trajectory_yields_no_transitions(self):
         traj = base.Trajectory(
@@ -168,9 +203,11 @@ class TestExtractTransitions:
             actions=np.zeros((3, 1), dtype=np.float32),
             env_rewards=np.zeros(3, dtype=np.float32),
             terminals=np.array([True, True, True]),
+            infos=({}, {}, {}),
             episode_return=0.0,
         )
-        assert grd._extract_transitions(traj) == []
+        obs, _, _ = grd._extract_transition_arrays(traj)
+        assert len(obs) == 0
 
     def test_single_step_episode_yields_no_transitions(self):
         traj = base.Trajectory(
@@ -178,9 +215,11 @@ class TestExtractTransitions:
             actions=np.zeros((1, 1), dtype=np.float32),
             env_rewards=np.zeros(1, dtype=np.float32),
             terminals=np.array([True]),
+            infos=({},),
             episode_return=0.0,
         )
-        assert grd._extract_transitions(traj) == []
+        obs, _, _ = grd._extract_transition_arrays(traj)
+        assert len(obs) == 0
 
 
 class TestSparsityReg:
@@ -216,20 +255,13 @@ class TestSparsityReg:
 
 
 class TestGRDRewardModel:
-    def test_predict_output_shape(self):
+    def test_predict_output(self):
         model = _make_model(obs_dim=4, action_dim=2)
         obs = np.zeros((10, 4), dtype=np.float32)
         act = np.zeros((10, 2), dtype=np.float32)
         term = np.zeros(10, dtype=bool)
         preds = model.predict(obs, act, term)
         assert preds.shape == (10,)
-
-    def test_predict_dtype_float32(self):
-        model = _make_model(obs_dim=4, action_dim=2)
-        obs = np.zeros((5, 4), dtype=np.float32)
-        act = np.zeros((5, 2), dtype=np.float32)
-        term = np.zeros(5, dtype=bool)
-        preds = model.predict(obs, act, term)
         assert preds.dtype == np.float32
 
     def test_predict_before_update_is_finite(self):
@@ -246,14 +278,13 @@ class TestGRDRewardModel:
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
         )
         metrics = model.update(trajs)
-        required = {
-            "buffer_size",
-            "training_steps",
-            "reward_loss",
-            "dyn_loss",
-            "sparsity_reg",
-        }
-        assert required <= set(metrics.keys())
+        assert len(metrics) == 6
+        assert metrics["buffer_size"] == 2
+        assert metrics["epochs"] == 1
+        assert metrics["training_steps"] == 10
+        assert np.isfinite(metrics["reward_loss"])
+        assert np.isfinite(metrics["dyn_loss"])
+        assert np.isfinite(metrics["sparsity_reg"])
 
     def test_update_buffer_size_increments(self):
         model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
@@ -262,6 +293,8 @@ class TestGRDRewardModel:
         )
         metrics = model.update(trajs)
         assert metrics["buffer_size"] == 3.0
+        metrics = model.update(trajs)
+        assert metrics["buffer_size"] == 6.0
 
     def test_buffer_eviction(self):
         model = _make_model(obs_dim=4, action_dim=2, train_epochs=1, max_buffer_size=2)
@@ -296,7 +329,7 @@ class TestGRDRewardModel:
         )
         metrics_before = model.update(trajs)
         # Train for many more epochs.
-        model._train_epochs = 50
+        model._train_epochs = 10
         metrics_after = model.update([])
         # The reward loss over the buffered data should decrease.
         assert metrics_after["reward_loss"] <= metrics_before["reward_loss"] + 0.5
@@ -355,6 +388,242 @@ class TestComputeCompactMask:
         np.testing.assert_array_equal(result, np.zeros(4, dtype=np.float32))
 
 
+class TestGRDPredictMode:
+    def test_predict_leaves_reward_net_in_eval_mode(self):
+        """predict() always leaves _reward_net in eval mode."""
+        model = _make_model(obs_dim=4, action_dim=2)
+        model._reward_net.train()
+
+        model.predict(
+            np.zeros((3, 4), dtype=np.float32),
+            np.zeros((3, 2), dtype=np.float32),
+            np.zeros(3, dtype=bool),
+        )
+
+        assert model._reward_net.training is False
+
+    def test_predict_skips_eval_when_already_eval(self):
+        """The eval() switch is skipped when _reward_net is already in eval mode."""
+        model = _make_model(obs_dim=4, action_dim=2)
+        model._reward_net.eval()
+
+        call_counter = {"n": 0}
+        original_eval = model._reward_net.eval
+
+        def _counting_eval():
+            call_counter["n"] += 1
+            return original_eval()
+
+        model._reward_net.eval = _counting_eval  # type: ignore[method-assign]
+
+        for _ in range(3):
+            model.predict(
+                np.zeros((2, 4), dtype=np.float32),
+                np.zeros((2, 2), dtype=np.float32),
+                np.zeros(2, dtype=bool),
+            )
+
+        assert call_counter["n"] == 0
+
+
+class TestGRDVectorisedUpdate:
+    def test_buffer_invalidation_on_extend(self):
+        """_stacked_dirty resets to False after each update that adds trajectories."""
+        model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        model.update(trajs)
+        assert model._stacked_dirty is False
+        assert model._stacked_obs is not None
+
+        model.update(trajs)
+        assert model._stacked_dirty is False
+
+    def test_variable_length_trajectories_padded_correctly(self):
+        """Trajectories of different lengths are padded; mask matches real positions."""
+        traj_short = _make_trajectory(obs_dim=4, action_dim=2, num_steps=3)
+        traj_long = _make_trajectory(obs_dim=4, action_dim=2, num_steps=7)
+
+        model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
+        model.update([traj_short, traj_long])
+
+        assert model._stacked_obs.shape == (2, 7, 4)
+        assert model._stacked_mask.shape == (2, 7, 1)
+        np.testing.assert_array_equal(
+            model._stacked_mask[0, :, 0].numpy(),
+            np.array([1.0] * 3 + [0.0] * 4, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            model._stacked_mask[1, :, 0].numpy(),
+            np.ones(7, dtype=np.float32),
+        )
+
+    def test_padded_positions_excluded_from_sum_preds(self):
+        """Per-trajectory sum_preds is invariant to whatever fills padded slots."""
+        obs_dim, action_dim = 4, 2
+        traj_short = _make_trajectory(obs_dim, action_dim, num_steps=3)
+        traj_long = _make_trajectory(obs_dim, action_dim, num_steps=7)
+        model = _make_model(obs_dim=obs_dim, action_dim=action_dim, train_epochs=1)
+        model.update([traj_short, traj_long])
+
+        with torch.no_grad():
+            mask_sr, mask_ar, _, _ = model._causal.greedy_masks()
+
+        obs_a = model._stacked_obs.clone()
+        acts_a = model._stacked_acts.clone()
+        terms_a = model._stacked_terms.clone()
+        mask = model._stacked_mask
+
+        obs_b = obs_a.clone()
+        obs_b[0, 3:, :] = 1e6
+        acts_b = acts_a.clone()
+        acts_b[0, 3:, :] = 1e6
+        terms_b = terms_a.clone()
+        terms_b[0, 3:, :] = 1.0
+
+        def _sum_preds(obs_t, act_t, term_t):
+            batch_n, traj_t, _ = obs_t.shape
+            masked_o = obs_t * mask_sr.view(1, 1, -1)
+            masked_a = act_t * mask_ar.view(1, 1, -1)
+            flat = model._reward_net(
+                masked_o.reshape(batch_n * traj_t, obs_dim),
+                masked_a.reshape(batch_n * traj_t, action_dim),
+                term_t.reshape(batch_n * traj_t, 1),
+            )
+            return (flat.reshape(batch_n, traj_t, 1) * mask).sum(dim=1).squeeze(-1)
+
+        with torch.no_grad():
+            sum_a = _sum_preds(obs_a, acts_a, terms_a)
+            sum_b = _sum_preds(obs_b, acts_b, terms_b)
+
+        torch.testing.assert_close(sum_a, sum_b, atol=1e-4, rtol=0.0)
+
+    def test_update_deterministic_with_fixed_seed(self):
+        """Same buffer + same seed produces identical _reward_net params."""
+
+        def _train_once() -> List[torch.Tensor]:
+            torch.manual_seed(0)
+            np.random.seed(0)
+            model = _make_model(
+                obs_dim=4,
+                action_dim=2,
+                hidden_dim=16,
+                num_hidden_layers=1,
+                train_epochs=2,
+                batch_size=2,
+            )
+            trajs = _make_synthetic_trajectories(
+                num_trajs=4, obs_dim=4, action_dim=2, num_steps=5
+            )
+            model.update(trajs)
+            return [param.detach().clone() for param in model._reward_net.parameters()]
+
+        params_a = _train_once()
+        params_b = _train_once()
+        assert len(params_a) == len(params_b)
+        for tensor_a, tensor_b in zip(params_a, params_b):
+            torch.testing.assert_close(tensor_a, tensor_b, atol=1e-6, rtol=0.0)
+
+
+class TestGRDTrainEpochsDecay:
+    def test_default_decay_is_no_op(self):
+        train_epochs = 4
+        model = _make_model(
+            obs_dim=4, action_dim=2, train_epochs=train_epochs, train_epochs_decay=1
+        )
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 10 * train_epochs
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 20 * train_epochs
+
+    def test_decay_reduces_epochs_geometrically(self):
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=10,
+            train_epochs_decay=0.5,
+        )
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 10
+        assert metrics["training_steps"] == 10 * 10
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == 5
+        # buffer increases
+        assert metrics["training_steps"] == 20 * 5
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 3
+        assert metrics["epochs"] == 2
+        # buffer increases
+        assert metrics["training_steps"] == 30 * 2
+
+    def test_decay_floors_at_one(self):
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=2,
+            train_epochs_decay=0.1,
+        )
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 2
+        assert metrics["training_steps"] == 10 * 2
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == 1
+        assert metrics["training_steps"] == 20 * 1
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 3
+        assert metrics["epochs"] == 1
+        assert metrics["training_steps"] == 30 * 1
+
+    def test_update_idx_does_not_increment_on_empty_buffer(self):
+        model = _make_model(
+            obs_dim=4,
+            action_dim=2,
+            train_epochs=4,
+            train_epochs_decay=0.5,
+        )
+
+        # Fully empty path: no trajectories and no buffer state.
+        metrics = model.update([])
+        assert model._update_idx == 0
+        assert metrics["epochs"] == 0
+        assert metrics["training_steps"] == 0
+
+        trajs = _make_synthetic_trajectories(
+            num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
+        )
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 4
+        assert metrics["training_steps"] == 10 * 4
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -366,6 +635,7 @@ def _make_model(
     hidden_dim: int = 16,
     num_hidden_layers: int = 1,
     train_epochs: int = 2,
+    train_epochs_decay: float = 1.0,
     batch_size: int = 4,
     trans_batch_size: int = 8,
     dyn_weight: float = 1.0,
@@ -378,6 +648,7 @@ def _make_model(
         hidden_dim=hidden_dim,
         num_hidden_layers=num_hidden_layers,
         train_epochs=train_epochs,
+        train_epochs_decay=train_epochs_decay,
         batch_size=batch_size,
         trans_batch_size=trans_batch_size,
         dyn_weight=dyn_weight,
@@ -395,11 +666,13 @@ def _make_trajectory(
     rng = np.random.default_rng(0)
     terminals = np.zeros(num_steps, dtype=bool)
     terminals[-1] = True
+    infos: Sequence[Mapping[str, Any]] = tuple({} for _ in range(num_steps))
     return base.Trajectory(
         observations=rng.standard_normal((num_steps, obs_dim)).astype(np.float32),
         actions=rng.standard_normal((num_steps, action_dim)).astype(np.float32),
         env_rewards=np.zeros(num_steps, dtype=np.float32),
         terminals=terminals,
+        infos=infos,
         episode_return=episode_return,
     )
 

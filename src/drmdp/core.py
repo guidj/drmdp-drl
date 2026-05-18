@@ -189,3 +189,43 @@ class ProxiedEnv:
 
     env: gym.Env
     proxy: gym.Env
+
+
+class ArgChain:
+    """Priority-ordered lookup over a sequence of argument dicts.
+
+    Earlier layers take precedence; later layers are fallbacks.
+    Layers 0.._pin-1 are "pinned" (e.g. CLI overrides); prepend() inserts
+    new layers at position _pin, keeping the pinned prefix at the top.
+    """
+
+    def __init__(self, layers: Sequence[Mapping[str, Any]], _pin: int = 0) -> None:
+        self._layers: Tuple[Mapping[str, Any], ...] = tuple(layers)
+        self._pin: int = _pin
+
+    def get(self, key: str, default: Optional[Any] = None) -> Any:
+        for layer in self._layers:
+            if key in layer:
+                return layer[key]
+        return default
+
+    def prepend(self, layers: Sequence[Mapping[str, Any]]) -> "ArgChain":
+        """Insert layers just below the pinned prefix."""
+        idx = self._pin
+        return ArgChain(
+            [*self._layers[:idx], *layers, *self._layers[idx:]],
+            _pin=idx,
+        )
+
+    def extend(self, layers: Sequence[Mapping[str, Any]]) -> "ArgChain":
+        """Append layers at the lowest priority."""
+        return ArgChain([*self._layers, *layers], _pin=self._pin)
+
+    @classmethod
+    def pinned(
+        cls,
+        pinned: Sequence[Mapping[str, Any]],
+        rest: Sequence[Mapping[str, Any]] = (),
+    ) -> "ArgChain":
+        """Create a chain with the given layers permanently anchored at the top."""
+        return cls([*pinned, *rest], _pin=len(pinned))

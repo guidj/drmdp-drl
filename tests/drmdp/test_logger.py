@@ -36,7 +36,7 @@ class TestDataclassFromDict:
 
     def test_raises_on_dataclass_instance(self):
         instance = SampleConfig(name="x", value=1)
-        # Passing an instance instead of the class should raise
+        # The function requires a class, not an instance, to construct a new object
         with pytest.raises(ValueError):
             logger.dataclass_from_dict(instance, {"name": "x", "value": 1})
 
@@ -46,24 +46,20 @@ class TestJsonFromDict:
         original = {"a": {"b": 1}, "c": 2}
         result = logger.json_from_dict(original, dict_encode_level=None)
         assert result == original
-        # Verify it's a copy, not the same object
+        # Mutating the result must not affect the original; deep copy is required
         result["a"]["b"] = 999
         assert original["a"]["b"] == 1
 
     def test_level_0_encodes_top_level_nested_dicts_as_strings(self):
         original = {"a": {"b": 1}, "c": 2}
         result = logger.json_from_dict(original, dict_encode_level=0)
-        # Value at level 0 that is a dict gets JSON-encoded
         assert isinstance(result["a"], str)
         assert json.loads(result["a"]) == {"b": 1}
-        # Non-dict value unchanged
         assert result["c"] == 2
 
     def test_level_1_encodes_depth_2_dicts(self):
         original = {"outer": {"inner": {"deep": 1}}}
         result = logger.json_from_dict(original, dict_encode_level=1)
-        # Level 0: outer → dict, recurse
-        # Level 1: inner → dict at level 1 >= 1, encode as string
         assert isinstance(result["outer"]["inner"], str)
         assert json.loads(result["outer"]["inner"]) == {"deep": 1}
 
@@ -123,14 +119,20 @@ class TestExperimentLogger:
     def test_context_manager_creates_log_file(self, tmp_path):
         params = {"x": 1}
         with logger.ExperimentLogger(str(tmp_path), params) as exp_logger:
-            exp_logger.log(episode=0, steps=10, returns=5.0)
+            exp_logger.log(episode=0, steps=10, global_steps=100, returns=5.0)
         log_file = tmp_path / logger.ExperimentLogger.LOG_FILE_NAME
         assert log_file.exists()
 
     def test_log_appends_jsonl_entry(self, tmp_path):
         params = {}
         with logger.ExperimentLogger(str(tmp_path), params) as exp_logger:
-            exp_logger.log(episode=1, steps=50, returns=3.14, info={"extra": "data"})
+            exp_logger.log(
+                episode=1,
+                steps=50,
+                global_steps=500,
+                returns=3.14,
+                info={"extra": "data"},
+            )
 
         log_file = tmp_path / logger.ExperimentLogger.LOG_FILE_NAME
         with open(str(log_file), "r", encoding="UTF-8") as readable:
@@ -140,6 +142,7 @@ class TestExperimentLogger:
         entry = json.loads(lines[0])
         assert entry["episode"] == 1
         assert entry["steps"] == 50
+        assert entry["global_steps"] == 500
         assert entry["returns"] == 3.14
         assert entry["info"] == {"extra": "data"}
 
@@ -153,4 +156,4 @@ class TestExperimentLogger:
         params = {}
         exp_logger = logger.ExperimentLogger(str(tmp_path), params)
         with pytest.raises(RuntimeError):
-            exp_logger.log(episode=0, steps=1, returns=0.0)
+            exp_logger.log(episode=0, steps=1, global_steps=1, returns=0.0)

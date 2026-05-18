@@ -16,9 +16,9 @@ python $PARENT_DIR/src/$BASE/control/runner.py \
     --agent-type hc \
     --agent-kwarg history_hidden_size=128 \
     --agent-kwarg reg_lambda=5.0 \
-    --sac-buffer-size 100000 \
-    --sac-batch-size 256 \
-    --sac-gradient-steps -1 \
-    --log-episode-frequency 10 \
+    --sac-kwarg buffer_size=100000 \
+    --sac-kwarg batch_size=256 \
+    --sac-kwarg gradient_steps=-1 \
+    --sac-kwarg ent_coef=0.1 \
     --output-dir $OUTPUT_DIR \
     --seed 0

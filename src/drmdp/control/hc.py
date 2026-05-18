@@ -79,11 +79,11 @@ class IntervalPositionWrapper(gym.Wrapper):
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._position = min(self._position + 1, self._max_delay)
+        augmented = self._augment(obs)
         if info.get("interval_end", False) or terminated or truncated:
             self._position = 0
-        else:
-            self._position = min(self._position + 1, self._max_delay)
-        return self._augment(obs), reward, terminated, truncated, info
+        return augmented, reward, terminated, truncated, info
 
     def _augment(self, obs: np.ndarray) -> np.ndarray:
         pos = np.array([self._position / self._max_delay], dtype=np.float32)
@@ -144,13 +144,16 @@ class HCSAC(SAC):
         self,
         env: Any,
         max_delay: int = 3,
-        history_hidden_size: int = 128,
+        history_hidden_size: int = 48,
+        projection_dim: int = 48,
         reg_lambda: float = 5.0,
+        grad_clip_norm: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         policy_kwargs = kwargs.pop("policy_kwargs", {})
         policy_kwargs["max_delay"] = max_delay
         policy_kwargs["history_hidden_size"] = history_hidden_size
+        policy_kwargs["projection_dim"] = projection_dim
 
         rb_kwargs = kwargs.pop("replay_buffer_kwargs", {})
         rb_kwargs["max_delay"] = max_delay
@@ -164,16 +167,16 @@ class HCSAC(SAC):
             **kwargs,
         )
         self._max_delay = max_delay
-        # λ for H_φ regularisation loss (Eq. 9). Default 5.0 per paper for RNN variant.
         self._reg_lambda = reg_lambda
+        self._grad_clip_norm = grad_clip_norm
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:  # noqa: PLR0915
-        """HC training loop.
+        """HC training loop (Eq. 8).
 
         Differences from standard SAC.train():
         - TD target includes Q^H_target(h_{t+1}) + Q^C_target(s', a').
-        - Head network trained to predict the full target.
-        - Critic trained to predict target minus the head component.
+        - Joint loss MSE(H + C, target) couples H and C gradients.
+        - Regularisation MSE(H, R_t) at interval-end steps (Eq. 9).
         - Actor gradient flows through Q^C only (not Q^H).
         - Separate soft-updates for head/encoder target networks.
         """
@@ -259,42 +262,42 @@ class HCSAC(SAC):
                     qh_next + next_qc_min
                 )
 
+            # Joint Bellman error (Eq. 8): MSE(H(h) + C(s,a), target).
             _, h_t_enc = self.history_encoder(history)
             h_t = h_t_enc.squeeze(0)  # (B, hidden)
             qh_pred = self.head_net(h_t)  # (B, 1)
-            head_loss: torch.Tensor = F.mse_loss(qh_pred, target_q.detach())
+
+            current_qc = self.critic(replay_data.observations, replay_data.actions)
+            target_q_detached = target_q.detach()
+            critic_loss: torch.Tensor = 0.5 * sum(
+                F.mse_loss(qh_pred + qc_val, target_q_detached) for qc_val in current_qc
+            )
 
             # Regularisation (Eq. 9): at interval-end steps force H_φ ≈ R_t.
-            # Prevents H_φ from absorbing credit that C_φ needs for the actor.
             if self._reg_lambda > 0.0 and interval_end.any():
                 reg_mask = interval_end.squeeze(-1)  # (B,)
                 reg_loss: torch.Tensor = F.mse_loss(
                     qh_pred[reg_mask],
                     replay_data.rewards[reg_mask].detach(),
                 )
-                head_loss = head_loss + self._reg_lambda * reg_loss
-
-            # Critic update: Q^C(s, a) vs. target minus head component so the
-            # critic learns only the action-specific value Q^C.
-            current_qc = self.critic(replay_data.observations, replay_data.actions)
-            critic_target_val = (target_q - qh_next).detach()
-            critic_loss: torch.Tensor = 0.5 * sum(
-                F.mse_loss(qc_val, critic_target_val) for qc_val in current_qc
-            )
+                critic_loss = critic_loss + self._reg_lambda * reg_loss
 
             self.policy.head_optimizer.zero_grad()
             self.critic.optimizer.zero_grad()
-            (head_loss + critic_loss).backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.history_encoder.parameters())
-                + list(self.head_net.parameters()),
-                max_norm=1.0,
-            )
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+            critic_loss.backward()
+            if self._grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.history_encoder.parameters())
+                    + list(self.head_net.parameters()),
+                    max_norm=self._grad_clip_norm,
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    self.critic.parameters(), max_norm=self._grad_clip_norm
+                )
             self.policy.head_optimizer.step()
             self.critic.optimizer.step()
 
-            head_losses.append(head_loss.item())
+            head_losses.append(qh_pred.mean().item())
             critic_losses.append(critic_loss.item())
 
             # Actor update: gradient through Q^C only (not Q^H).
@@ -328,7 +331,7 @@ class HCSAC(SAC):
         self._n_updates += gradient_steps
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
-        self.logger.record("train/head_loss", np.mean(head_losses))
+        self.logger.record("train/qh_mean", np.mean(head_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         if ent_coef_losses:
@@ -360,12 +363,14 @@ class HCSACPolicy(SACPolicy):
         self,
         *args: Any,
         max_delay: int = 3,
-        history_hidden_size: int = 128,
+        history_hidden_size: int = 48,
+        projection_dim: int = 48,
         **kwargs: Any,
     ) -> None:
         # Store before super().__init__() because _build() is called inside it.
         self._max_delay = max_delay
         self._history_hidden_size = history_hidden_size
+        self._projection_dim = projection_dim
         super().__init__(*args, **kwargs)
 
     def set_training_mode(self, mode: bool) -> None:
@@ -386,9 +391,9 @@ class HCSACPolicy(SACPolicy):
         act_dim = int(np.prod(self.action_space.shape))
         sa_dim = obs_dim + act_dim
 
-        self.history_encoder = _HistoryEncoder(sa_dim, self._history_hidden_size).to(
-            self.device
-        )
+        self.history_encoder = _HistoryEncoder(
+            sa_dim, self._history_hidden_size, self._projection_dim
+        ).to(self.device)
         self.history_encoder_target = copy.deepcopy(self.history_encoder)
         self.history_encoder_target.eval()
 
@@ -422,7 +427,7 @@ class HCReplayBuffer(buffers.ReplayBuffer):
 
     Args:
         *args: Forwarded to ``ReplayBuffer``.
-        max_delay: Maximum signal interval lengtorch.  Determines history window
+        max_delay: Maximum signal interval length.  Determines history window
             size.  Should match the delay in ``DelayedRewardWrapper``.
         **kwargs: Forwarded to ``ReplayBuffer``.
     """
@@ -542,15 +547,21 @@ class HCReplayBuffer(buffers.ReplayBuffer):
 
 
 class _HistoryEncoder(nn.Module):
-    """GRU that encodes a padded (s, a) sequence into a history embedding.
+    """FC projection followed by GRU over a padded (s, a) sequence.
 
-    Processes the full padded window (left-zero-padded); the final hidden
-    state summarises the actual signal-interval history.
+    Paper D.1: "Each step's input is first passed through a fully connected
+    network with 48 hidden units and then fed into the GRU with a 48-unit
+    hidden state."
     """
 
-    def __init__(self, sa_dim: int, hidden_size: int) -> None:
+    def __init__(
+        self, sa_dim: int, hidden_size: int = 48, projection_dim: int = 48
+    ) -> None:
         super().__init__()
-        self._gru = nn.GRU(input_size=sa_dim, hidden_size=hidden_size, batch_first=True)
+        self._proj = nn.Linear(sa_dim, projection_dim)
+        self._gru = nn.GRU(
+            input_size=projection_dim, hidden_size=hidden_size, batch_first=True
+        )
 
     def forward(self, history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -561,19 +572,20 @@ class _HistoryEncoder(nn.Module):
             output: (batch, max_delay, hidden_size)
             h_n: (1, batch, hidden_size) — final hidden state.
         """
-        return self._gru(history)  # type: ignore[no-any-return]
+        projected = F.relu(self._proj(history))
+        return self._gru(projected)  # type: ignore[no-any-return]
 
 
 class _HeadNetwork(nn.Module):
-    """Shallow MLP that maps a GRU hidden state to a scalar Q^H value."""
+    """Linear projection from GRU hidden state to scalar Q^H value.
+
+    Paper D.1: "H_φ(τ_{t_i:t}) is the output of the GRU at the
+    corresponding step" — single linear layer, no hidden layers.
+    """
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
-        self._net = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        self._linear = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """
@@ -583,4 +595,4 @@ class _HeadNetwork(nn.Module):
         Returns:
             q_h: (batch, 1)
         """
-        return self._net(hidden)
+        return self._linear(hidden)

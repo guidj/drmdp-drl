@@ -12,19 +12,16 @@ progression of cumulative episode returns, encouraging predictions that are
 globally consistent with the return trajectory rather than just locally
 consistent with each delayed window.
 
-Windows are extracted from completed episode trajectories by scanning the
-imputed reward signal: a non-zero env_reward marks the end of a delay
-interval and provides the aggregate reward label for that window. Partial
-windows at episode termination (where no aggregate reward was received) are
-discarded.
-
-Note: delay intervals whose true aggregate reward is exactly 0 are not
-detectable from the imputed reward signal alone and will be skipped. This
-is a known limitation of the Trajectory schema.
+Windows are extracted from completed episode trajectories using the
+per-step ``infos[t]["interval_end"]`` flag injected by
+``ImputeMissingRewardWrapper``.  A ``True`` flag marks the end of a delay
+interval; the corresponding ``env_rewards[t]`` provides the aggregate
+reward label.  Partial windows at episode termination (where no aggregate
+reward was received) are discarded.
 """
 
 import dataclasses
-from typing import List, Mapping, Sequence
+from typing import List, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -128,17 +125,34 @@ class DGRARewardModel(base.RewardModel):
         num_hidden_layers: int = 4,
         learning_rate: float = 1e-3,
         train_epochs: int = 10,
+        train_epochs_decay: float = 1.0,
         batch_size: int = 64,
         regu_lam: float = 1.0,
         max_buffer_size: int = 500,
     ) -> None:
+        self._obs_dim = obs_dim
+        self._action_dim = action_dim
         self._net = _RNetwork(obs_dim, action_dim, hidden_dim, num_hidden_layers)
         self._optimizer = torch.optim.Adam(self._net.parameters(), lr=learning_rate)
         self._train_epochs = train_epochs
+        self._train_epochs_decay = train_epochs_decay
+        self._update_idx = 0
         self._batch_size = batch_size
         self._regu_lam = regu_lam
         self._max_buffer_size = max_buffer_size
         self._buffer: List[_Window] = []
+        # Stacked tensor view of self._buffer, rebuilt lazily inside
+        # update() when _stacked_dirty is True. Storing them lets the
+        # training loop run one batched forward+backward per mini-batch
+        # instead of one per window.
+        self._stacked_obs: Optional[torch.Tensor] = None
+        self._stacked_acts: Optional[torch.Tensor] = None
+        self._stacked_terms: Optional[torch.Tensor] = None
+        self._stacked_mask: Optional[torch.Tensor] = None
+        self._stacked_agg: Optional[torch.Tensor] = None
+        self._stacked_start: Optional[torch.Tensor] = None
+        self._stacked_end: Optional[torch.Tensor] = None
+        self._stacked_dirty = True
 
     def predict(
         self,
@@ -159,7 +173,8 @@ class DGRARewardModel(base.RewardModel):
         Returns:
             Per-step reward estimates, shape (T,), dtype float32.
         """
-        self._net.eval()
+        if self._net.training:
+            self._net.eval()
         with torch.no_grad():
             obs_t = torch.as_tensor(observations, dtype=torch.float32)
             act_t = torch.as_tensor(actions, dtype=torch.float32)
@@ -187,9 +202,13 @@ class DGRARewardModel(base.RewardModel):
             (losses are averages over the final training epoch).
         """
         for trajectory in trajectories:
-            self._buffer.extend(_extract_windows(trajectory))
+            extracted = _extract_windows(trajectory)
+            if extracted:
+                self._buffer.extend(extracted)
+                self._stacked_dirty = True
         if len(self._buffer) > self._max_buffer_size:
             self._buffer = self._buffer[-self._max_buffer_size :]
+            self._stacked_dirty = True
 
         if not self._buffer:
             return {
@@ -199,47 +218,56 @@ class DGRARewardModel(base.RewardModel):
                 "regu_loss": 0.0,
             }
 
-        total_training_steps = 0
+        if self._stacked_dirty:
+            self._rebuild_stacked()
+
+        assert self._stacked_obs is not None
+        assert self._stacked_acts is not None
+        assert self._stacked_terms is not None
+        assert self._stacked_mask is not None
+        assert self._stacked_agg is not None
+        assert self._stacked_start is not None
+        assert self._stacked_end is not None
+
         last_epoch_reward_losses: List[float] = []
         last_epoch_regu_losses: List[float] = []
 
+        effective_epochs = max(
+            int(self._train_epochs * self._train_epochs_decay**self._update_idx),
+            1,
+        )
+
         self._net.train()
-        for epoch_idx in range(self._train_epochs):
+        for epoch_idx in range(effective_epochs):
             indices = np.random.permutation(len(self._buffer))
             epoch_reward_losses: List[float] = []
             epoch_regu_losses: List[float] = []
 
             for batch_start in range(0, len(self._buffer), self._batch_size):
                 batch_indices = indices[batch_start : batch_start + self._batch_size]
-                mini_batch = [self._buffer[idx] for idx in batch_indices]
+                idx_t = torch.as_tensor(batch_indices, dtype=torch.long)
 
-                sum_preds: List[torch.Tensor] = []
-                agg_rewards: List[float] = []
-                start_returns: List[float] = []
-                end_returns: List[float] = []
+                obs_b = self._stacked_obs.index_select(0, idx_t)
+                act_b = self._stacked_acts.index_select(0, idx_t)
+                term_b = self._stacked_terms.index_select(0, idx_t)
+                mask_b = self._stacked_mask.index_select(0, idx_t)
+                agg_b = self._stacked_agg.index_select(0, idx_t)
+                start_b = self._stacked_start.index_select(0, idx_t)
+                end_b = self._stacked_end.index_select(0, idx_t)
 
-                for window in mini_batch:
-                    obs_t = torch.as_tensor(window.observations, dtype=torch.float32)
-                    act_t = torch.as_tensor(window.actions, dtype=torch.float32)
-                    term_t = torch.as_tensor(
-                        window.terminals[:, np.newaxis].astype(np.float32),
-                        dtype=torch.float32,
-                    )
-                    preds = self._net(obs_t, act_t, term_t)  # (W, 1)
-                    sum_preds.append(preds.sum())
-                    agg_rewards.append(window.aggregate_reward)
-                    start_returns.append(window.start_return)
-                    end_returns.append(window.end_return)
-                    if epoch_idx == self._train_epochs - 1:
-                        total_training_steps += len(window.observations)
+                # Flatten (B, W) into (B*W) for a single batched forward,
+                # then reshape back and zero-out padded positions before
+                # the per-window sum.
+                batch_n, window_w, _ = obs_b.shape
+                flat_obs = obs_b.reshape(batch_n * window_w, self._obs_dim)
+                flat_act = act_b.reshape(batch_n * window_w, self._action_dim)
+                flat_term = term_b.reshape(batch_n * window_w, 1)
+                flat_preds = self._net(flat_obs, flat_act, flat_term)
+                preds = flat_preds.reshape(batch_n, window_w, 1)
+                sum_preds = (preds * mask_b).sum(dim=1).squeeze(-1)
 
-                sum_preds_t = torch.stack(sum_preds)
-                agg_t = torch.tensor(agg_rewards, dtype=torch.float32)
-                start_t = torch.tensor(start_returns, dtype=torch.float32)
-                end_t = torch.tensor(end_returns, dtype=torch.float32)
-
-                reward_loss = F.mse_loss(sum_preds_t, agg_t)
-                regu_loss = F.mse_loss(start_t + sum_preds_t, end_t)
+                reward_loss = F.mse_loss(sum_preds, agg_b)
+                regu_loss = F.mse_loss(start_b + sum_preds, end_b)
                 total_loss = reward_loss + self._regu_lam * regu_loss
 
                 self._optimizer.zero_grad()
@@ -249,9 +277,15 @@ class DGRARewardModel(base.RewardModel):
                 epoch_reward_losses.append(reward_loss.item())
                 epoch_regu_losses.append(regu_loss.item())
 
-            if epoch_idx == self._train_epochs - 1:
+            if epoch_idx == effective_epochs - 1:
                 last_epoch_reward_losses = epoch_reward_losses
                 last_epoch_regu_losses = epoch_regu_losses
+
+        # Total training step count = number of real (non-padded) timesteps
+        # touched in the final epoch — equals one full pass over the buffer.
+        total_training_steps = int(self._stacked_mask.sum().item())
+
+        self._update_idx += 1
 
         return {
             "buffer_size": float(len(self._buffer)),
@@ -260,14 +294,53 @@ class DGRARewardModel(base.RewardModel):
             "regu_loss": float(np.mean(last_epoch_regu_losses)),
         }
 
+    def _rebuild_stacked(self) -> None:
+        """Materialise self._buffer as (N, W_max, ...) padded torch tensors.
+
+        Window length varies under ClippedPoissonDelay/UniformDelay; pad each
+        window to W_max with zeros and track real-vs-padded positions in a
+        binary mask. The stacked tensors are reused across epochs.
+        """
+        windows = self._buffer
+        num_windows = len(windows)
+        window_max = max(len(w.observations) for w in windows)
+
+        obs = np.zeros((num_windows, window_max, self._obs_dim), dtype=np.float32)
+        acts = np.zeros((num_windows, window_max, self._action_dim), dtype=np.float32)
+        terms = np.zeros((num_windows, window_max, 1), dtype=np.float32)
+        mask = np.zeros((num_windows, window_max, 1), dtype=np.float32)
+        agg = np.empty(num_windows, dtype=np.float32)
+        start = np.empty(num_windows, dtype=np.float32)
+        end = np.empty(num_windows, dtype=np.float32)
+
+        for idx, window in enumerate(windows):
+            length = len(window.observations)
+            obs[idx, :length] = window.observations
+            acts[idx, :length] = window.actions
+            terms[idx, :length, 0] = window.terminals
+            mask[idx, :length, 0] = 1.0
+            agg[idx] = window.aggregate_reward
+            start[idx] = window.start_return
+            end[idx] = window.end_return
+
+        self._stacked_obs = torch.from_numpy(obs)
+        self._stacked_acts = torch.from_numpy(acts)
+        self._stacked_terms = torch.from_numpy(terms)
+        self._stacked_mask = torch.from_numpy(mask)
+        self._stacked_agg = torch.from_numpy(agg)
+        self._stacked_start = torch.from_numpy(start)
+        self._stacked_end = torch.from_numpy(end)
+        self._stacked_dirty = False
+
 
 def _extract_windows(trajectory: base.Trajectory) -> List[_Window]:
     """Extract delay-interval windows from a completed episode trajectory.
 
-    A window spans the steps between consecutive non-zero env_rewards. The
-    non-zero env_reward marks the interval end and provides the aggregate
-    reward label. A partial tail at episode termination (env_reward == 0 at
-    the terminal step) is discarded because no aggregate signal was received.
+    A window spans the steps between consecutive ``interval_end`` flags
+    (from ``trajectory.infos``).  The flag marks the interval end; the
+    corresponding ``env_rewards`` entry provides the aggregate reward
+    label.  A partial tail without an ``interval_end`` flag is discarded
+    because no aggregate signal was received.
 
     Args:
         trajectory: A completed episode trajectory from the control loop.
@@ -280,10 +353,10 @@ def _extract_windows(trajectory: base.Trajectory) -> List[_Window]:
     window_start = 0
     cumulative_return = 0.0
 
-    for step_idx, reward in enumerate(trajectory.env_rewards):
-        if reward == 0.0:
+    for step_idx in range(len(trajectory.env_rewards)):
+        if not trajectory.infos[step_idx].get("interval_end", False):
             continue
-        aggregate_reward = float(reward)
+        aggregate_reward = float(trajectory.env_rewards[step_idx])
         start_return = cumulative_return
         end_return = cumulative_return + aggregate_reward
         windows.append(
