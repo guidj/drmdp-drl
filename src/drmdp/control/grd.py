@@ -52,7 +52,8 @@ class GRDRewardModel(base.RewardModel):
     via obs_mask so the policy sees only causally relevant state features.
 
     Attributes:
-        max_buffer_size: Maximum full trajectories and transitions retained.
+        max_buffer_size: Maximum full trajectories retained.
+        max_trans_buffer_size: Maximum individual transitions retained.
         train_epochs: Training epochs run on the buffer each update call.
         batch_size: Number of full trajectories per reward-loss mini-batch.
         trans_batch_size: Number of transitions per dynamics mini-batch.
@@ -66,16 +67,17 @@ class GRDRewardModel(base.RewardModel):
         obs_dim: int,
         action_dim: int,
         hidden_dim: int = 256,
-        num_hidden_layers: int = 4,
+        num_hidden_layers: int = 2,
         learning_rate: float = 3e-4,
         train_epochs: int = 10,
         train_epochs_decay: float = 1.0,
         batch_size: int = 4,
         trans_batch_size: int = 256,
         dyn_weight: float = 1.0,
-        sparsity_lam_diag: float = 1e-4,
+        sparsity_lam_diag: float = 1e-6,
         sparsity_lam_offdiag: float = 1e-5,
         max_buffer_size: int = 300,
+        max_trans_buffer_size: int = 1_000_000,
     ) -> None:
         self._obs_dim = obs_dim
         self._action_dim = action_dim
@@ -88,6 +90,7 @@ class GRDRewardModel(base.RewardModel):
         self._sparsity_lam_diag = sparsity_lam_diag
         self._sparsity_lam_offdiag = sparsity_lam_offdiag
         self._max_buffer_size = max_buffer_size
+        self._max_trans_buffer_size = max_trans_buffer_size
 
         self._causal = _CausalStructure(obs_dim, action_dim)
         self._reward_net = _RewardNetwork(
@@ -194,10 +197,10 @@ class GRDRewardModel(base.RewardModel):
         if len(self._traj_buffer) > self._max_buffer_size:
             self._traj_buffer = self._traj_buffer[-self._max_buffer_size :]
             self._stacked_dirty = True
-        if self._trans_count > self._max_buffer_size:
-            self._trans_obs = self._trans_obs[-self._max_buffer_size :]
-            self._trans_act = self._trans_act[-self._max_buffer_size :]
-            self._trans_next = self._trans_next[-self._max_buffer_size :]
+        if self._trans_count > self._max_trans_buffer_size:
+            self._trans_obs = self._trans_obs[-self._max_trans_buffer_size :]
+            self._trans_act = self._trans_act[-self._max_trans_buffer_size :]
+            self._trans_next = self._trans_next[-self._max_trans_buffer_size :]
             self._trans_count = len(self._trans_obs)
 
         if not self._traj_buffer:
@@ -657,20 +660,22 @@ def _sparsity_reg(
     Returns:
         Scalar regularisation loss.
     """
-    sr_prob = F.softmax(causal.phi_sr, dim=-1)[..., 1].mean()
-    ar_prob = F.softmax(causal.phi_ar, dim=-1)[..., 1].mean()
-    as_prob = F.softmax(causal.phi_as, dim=-1)[..., 1].mean()
+    eps = 1e-8
+    sr_ce = (-torch.log(1 - F.softmax(causal.phi_sr, dim=-1)[..., 1] + eps)).mean()
+    ar_ce = (-torch.log(1 - F.softmax(causal.phi_ar, dim=-1)[..., 1] + eps)).mean()
+    as_ce = (-torch.log(1 - F.softmax(causal.phi_as, dim=-1)[..., 1] + eps)).mean()
 
     ss_probs = F.softmax(causal.phi_ss, dim=-1)[..., 1]  # (obs_dim, obs_dim)
+    ss_ce = -torch.log(1 - ss_probs + eps)
     obs_dim = ss_probs.shape[0]
     diag_mask = torch.eye(obs_dim, device=ss_probs.device, dtype=torch.bool)
 
-    ss_diag_prob = ss_probs[diag_mask].mean()
+    ss_diag_ce = ss_ce[diag_mask].mean()
     if obs_dim > 1:
-        ss_offdiag_prob = ss_probs[~diag_mask].mean()
+        ss_offdiag_ce = ss_ce[~diag_mask].mean()
     else:
-        ss_offdiag_prob = torch.zeros(1, device=ss_probs.device)[0]
+        ss_offdiag_ce = torch.zeros(1, device=ss_probs.device)[0]
 
-    offdiag_term = lam_offdiag * (sr_prob + ar_prob + as_prob + ss_offdiag_prob)
-    diag_term = lam_diag * ss_diag_prob
+    offdiag_term = lam_offdiag * (sr_ce + ar_ce + as_ce + ss_offdiag_ce)
+    diag_term = lam_diag * ss_diag_ce
     return offdiag_term + diag_term

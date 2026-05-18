@@ -253,6 +253,23 @@ class TestSparsityReg:
         reg_zero = grd._sparsity_reg(causal, lam_diag=0.0, lam_offdiag=0.0)
         assert reg_high.item() > reg_zero.item()
 
+    def test_uses_cross_entropy_not_mean_probability(self):
+        """Sparsity penalty uses -log(1-p), not mean(p)."""
+        causal = grd._CausalStructure(obs_dim=2, action_dim=1)
+        with torch.no_grad():
+            causal.phi_sr.data[:, 0] = -10.0
+            causal.phi_sr.data[:, 1] = 10.0
+            causal.phi_ar.data[:, 0] = -10.0
+            causal.phi_ar.data[:, 1] = 10.0
+            causal.phi_ss.data[..., 0] = -10.0
+            causal.phi_ss.data[..., 1] = 10.0
+            causal.phi_as.data[..., 0] = -10.0
+            causal.phi_as.data[..., 1] = 10.0
+
+        reg = grd._sparsity_reg(causal, lam_diag=1.0, lam_offdiag=1.0)
+        # With p≈1.0, CE = -log(1-p) >> 1.0, while mean(p) ≈ 1.0.
+        assert reg.item() > 5.0
+
 
 class TestGRDRewardModel:
     def test_predict_output(self):
