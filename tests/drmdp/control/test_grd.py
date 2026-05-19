@@ -126,6 +126,7 @@ class TestDynamicsNetwork:
         nll.backward()
         assert obs.grad is not None
         assert act.grad is not None
+
         expected_obs_grad = torch.ones_like(obs.grad)
         expected_obs_grad[:, masked_dim] = 0.0
         expected_act_grad = torch.ones_like(act.grad)
@@ -289,7 +290,7 @@ class TestGRDRewardModel:
         preds = model.predict(obs, act, term)
         assert np.all(np.isfinite(preds))
 
-    def test_update_returns_required_metric_keys(self):
+    def test_update_returns_required_metrics(self):
         model = _make_model(obs_dim=4, action_dim=2, train_epochs=1)
         trajs = _make_synthetic_trajectories(
             num_trajs=2, obs_dim=4, action_dim=2, num_steps=5
@@ -310,6 +311,7 @@ class TestGRDRewardModel:
         )
         metrics = model.update(trajs)
         assert metrics["buffer_size"] == 3.0
+
         metrics = model.update(trajs)
         assert metrics["buffer_size"] == 6.0
 
@@ -583,13 +585,11 @@ class TestGRDTrainEpochsDecay:
         metrics = model.update(trajs)
         assert model._update_idx == 2
         assert metrics["epochs"] == 5
-        # buffer increases
         assert metrics["training_steps"] == 20 * 5
 
         metrics = model.update(trajs)
         assert model._update_idx == 3
         assert metrics["epochs"] == 2
-        # buffer increases
         assert metrics["training_steps"] == 30 * 2
 
     def test_decay_floors_at_one(self):
@@ -608,15 +608,11 @@ class TestGRDTrainEpochsDecay:
         assert metrics["epochs"] == 2
         assert metrics["training_steps"] == 10 * 2
 
-        metrics = model.update(trajs)
-        assert model._update_idx == 2
-        assert metrics["epochs"] == 1
-        assert metrics["training_steps"] == 20 * 1
-
-        metrics = model.update(trajs)
-        assert model._update_idx == 3
-        assert metrics["epochs"] == 1
-        assert metrics["training_steps"] == 30 * 1
+        for idx in range(2, 2 + 3):
+            metrics = model.update(trajs)
+            assert model._update_idx == idx
+            assert metrics["epochs"] == 1
+            assert metrics["training_steps"] == (10 * idx)
 
     def test_update_idx_does_not_increment_on_empty_buffer(self):
         model = _make_model(

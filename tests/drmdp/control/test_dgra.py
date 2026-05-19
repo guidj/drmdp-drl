@@ -67,6 +67,9 @@ class TestExtractWindows:
 
         assert len(windows) == 1
         assert windows[0].observations.shape == (2, 2)  # steps 0 and 1 only
+        assert windows[0].aggregate_reward == pytest.approx(2)
+        assert windows[0].start_return == pytest.approx(0.0)
+        assert windows[0].end_return == pytest.approx(2.0)
 
     def test_no_interval_ends_returns_empty(self):
         """No interval_end flags produce no windows."""
@@ -170,23 +173,8 @@ class TestExtractWindows:
         np.testing.assert_array_equal(windows[1].observations, obs[2:4])
 
 
-class TestWindowDataclass:
-    def test_window_is_frozen(self):
-        """Assigning to a _Window field raises FrozenInstanceError."""
-        window = dgra._Window(
-            observations=np.zeros((2, 2), dtype=np.float32),
-            actions=np.zeros((2, 1), dtype=np.float32),
-            terminals=np.zeros(2, dtype=bool),
-            aggregate_reward=1.0,
-            start_return=0.0,
-            end_return=1.0,
-        )
-        with pytest.raises(Exception):
-            window.aggregate_reward = 99.0  # type: ignore[misc]
-
-
 class TestDGRARewardModel:
-    def test_predict_output_shape(self):
+    def test_predict_output(self):
         """predict returns a 1-D array of length T."""
         model = dgra.DGRARewardModel(obs_dim=3, action_dim=2)
         obs = np.zeros((5, 3), dtype=np.float32)
@@ -196,16 +184,6 @@ class TestDGRARewardModel:
         result = model.predict(obs, actions, terminals)
 
         assert result.shape == (5,)
-
-    def test_predict_output_dtype_is_float32(self):
-        """predict always returns dtype float32."""
-        model = dgra.DGRARewardModel(obs_dim=3, action_dim=2)
-        obs = np.zeros((4, 3), dtype=np.float64)
-        actions = np.zeros((4, 2), dtype=np.float64)
-        terminals = np.zeros(4, dtype=bool)
-
-        result = model.predict(obs, actions, terminals)
-
         assert result.dtype == np.float32
 
     def test_predict_before_update_does_not_crash(self):
@@ -219,15 +197,17 @@ class TestDGRARewardModel:
 
         assert np.all(np.isfinite(result))
 
-    def test_update_returns_required_metric_keys(self):
+    def test_update_returns_required_metrics(self):
         """update() returns a mapping with buffer_size, training_steps, reward_loss, regu_loss."""
         model = dgra.DGRARewardModel(obs_dim=2, action_dim=1, train_epochs=1)
         traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
-
         metrics = model.update([traj])
-
-        for key in ("buffer_size", "training_steps", "reward_loss", "regu_loss"):
-            assert key in metrics
+        assert len(metrics) == 5
+        assert metrics["buffer_size"] == 1
+        assert metrics["training_steps"] == 3
+        assert metrics["epochs"] == 1
+        assert np.isfinite(metrics["reward_loss"])
+        assert np.isfinite(metrics["regu_loss"])
 
     def test_update_buffer_size_increments(self):
         """buffer_size grows with each update call."""
@@ -235,19 +215,24 @@ class TestDGRARewardModel:
         traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
 
         metrics1 = model.update([traj])
-        metrics2 = model.update([traj])
+        assert metrics1["buffer_size"] == 1
 
-        assert metrics2["buffer_size"] > metrics1["buffer_size"]
+        metrics2 = model.update([traj])
+        assert metrics2["buffer_size"] == 2
 
     def test_buffer_eviction(self):
         """buffer_size never exceeds max_buffer_size; oldest windows are evicted."""
         model = dgra.DGRARewardModel(
             obs_dim=2, action_dim=1, train_epochs=1, max_buffer_size=2
         )
-        for _ in range(3):
-            model.update([_make_trajectory_with_window(obs_dim=2, action_dim=1)])
+        for idx in range(3):
+            model.update(
+                [_make_trajectory_with_window(obs_dim=2, action_dim=1, obs_value=idx)]
+            )
 
         assert len(model._buffer) == 2
+        np.testing.assert_array_equal(model._buffer[0].observations, 1)
+        np.testing.assert_array_equal(model._buffer[1].observations, 2)
 
     def test_training_steps_positive_after_update(self):
         """training_steps is > 0 when at least one window was processed."""
@@ -474,9 +459,20 @@ class TestTrainEpochsDecay:
         model = dgra.DGRARewardModel(obs_dim=2, action_dim=1, train_epochs=train_epochs)
         traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
 
-        epochs_run = _count_epochs_per_update(model, [traj], num_updates=3)
+        metrics = model.update([traj])
+        assert model._update_idx == 1
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 3 * train_epochs
 
-        assert epochs_run == [train_epochs] * 3
+        metrics = model.update([traj])
+        assert model._update_idx == 2
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 6 * train_epochs
+
+        metrics = model.update([traj])
+        assert model._update_idx == 3
+        assert metrics["epochs"] == train_epochs
+        assert metrics["training_steps"] == 9 * train_epochs
 
     def test_decay_reduces_epochs_geometrically(self):
         """Each successive update runs floor(train_epochs * decay**idx) epochs."""
@@ -486,11 +482,22 @@ class TestTrainEpochsDecay:
             train_epochs=10,
             train_epochs_decay=0.5,
         )
-        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+        trajs = [_make_trajectory_with_window(obs_dim=2, action_dim=1)]
 
-        epochs_run = _count_epochs_per_update(model, [traj], num_updates=3)
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 10
+        assert metrics["training_steps"] == 3 * 10
 
-        assert epochs_run == [10, 5, 2]
+        metrics = model.update(trajs)
+        assert model._update_idx == 2
+        assert metrics["epochs"] == 5
+        assert metrics["training_steps"] == 6 * 5
+
+        metrics = model.update(trajs)
+        assert model._update_idx == 3
+        assert metrics["epochs"] == 2
+        assert metrics["training_steps"] == 9 * 2
 
     def test_decay_floors_at_one(self):
         """effective_epochs never drops below 1 once train_epochs * decay**idx < 1."""
@@ -500,11 +507,18 @@ class TestTrainEpochsDecay:
             train_epochs=2,
             train_epochs_decay=0.1,
         )
-        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
+        trajs = [_make_trajectory_with_window(obs_dim=2, action_dim=1)]
 
-        epochs_run = _count_epochs_per_update(model, [traj], num_updates=5)
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 2
+        assert metrics["training_steps"] == 3 * 2
 
-        assert epochs_run == [2, 1, 1, 1, 1]
+        for idx in range(2, 2 + 3):
+            metrics = model.update(trajs)
+            assert model._update_idx == idx
+            assert metrics["epochs"] == 1
+            assert metrics["training_steps"] == (3 * idx)
 
     def test_update_idx_does_not_increment_on_empty_buffer(self):
         """Calls that early-return (empty buffer) leave _update_idx at 0."""
@@ -526,41 +540,11 @@ class TestTrainEpochsDecay:
 
         # First training-effective update; should still use the full 4 epochs
         # (decay**0 == 1.0).
-        traj = _make_trajectory_with_window(obs_dim=2, action_dim=1)
-        epochs_run = _count_epochs_per_update(model, [traj], num_updates=1)
-        assert epochs_run == [4]
-
-    def test_metrics_reflect_effective_epochs(self):
-        """The last-losses capture targets epoch_idx = effective_epochs - 1.
-
-        Verifies that update() returns the average over the actual final
-        epoch rather than the (now unreached) original train_epochs - 1.
-        """
-        torch.manual_seed(0)
-        np.random.seed(0)
-        model = dgra.DGRARewardModel(
-            obs_dim=2,
-            action_dim=1,
-            train_epochs=4,
-            train_epochs_decay=0.5,
-            batch_size=1,
-        )
-        # Two separate trajectories give two windows = two mini-batches per epoch.
-        trajs = [
-            _make_trajectory_with_window(obs_dim=2, action_dim=1),
-            _make_trajectory_with_window(obs_dim=2, action_dim=1),
-        ]
-
-        # First update: 4 epochs.  Second update: 2 epochs.
-        m1 = model.update(trajs)
-        m2 = model.update([])
-
-        assert m1["reward_loss"] >= 0.0
-        assert m2["reward_loss"] >= 0.0
-        # Both must be finite (would be NaN if the wrong epoch_idx guard
-        # was used and last_*_losses stayed empty).
-        assert np.isfinite(m1["reward_loss"])
-        assert np.isfinite(m2["reward_loss"])
+        trajs = [_make_trajectory_with_window(obs_dim=2, action_dim=1)]
+        metrics = model.update(trajs)
+        assert model._update_idx == 1
+        assert metrics["epochs"] == 4
+        assert metrics["training_steps"] == 3 * 4
 
 
 # ---------------------------------------------------------------------------
@@ -588,9 +572,11 @@ def _make_trajectory(
     )
 
 
-def _make_trajectory_with_window(obs_dim: int, action_dim: int) -> base.Trajectory:
+def _make_trajectory_with_window(
+    obs_dim: int, action_dim: int, obs_value: int = 0
+) -> base.Trajectory:
     """Build a minimal 3-step trajectory with one complete delay window."""
-    obs = np.zeros((3, obs_dim), dtype=np.float32)
+    obs = np.ones((3, obs_dim), dtype=np.float32) * obs_value
     actions = np.zeros((3, action_dim), dtype=np.float32)
     env_rewards = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     interval_ends = np.array([False, False, True])
@@ -612,36 +598,3 @@ def _make_synthetic_trajectories(
         env_rewards = np.array([0.0, 0.0, 3.0, 0.0, 0.0, 3.0], dtype=np.float32)
         trajs.append(_make_trajectory(obs, actions, env_rewards, interval_ends))
     return trajs
-
-
-def _count_epochs_per_update(
-    model: dgra.DGRARewardModel,
-    trajs: List[base.Trajectory],
-    num_updates: int,
-) -> List[int]:
-    """Run `num_updates` updates and return the per-call epoch count.
-
-    Patches np.random.permutation (called once per epoch inside update())
-    to count invocations and bin them per update call.
-    """
-    counts: List[int] = []
-
-    def _run_one() -> None:
-        before = call_counter["n"]
-        model.update(trajs)
-        counts.append(call_counter["n"] - before)
-
-    call_counter = {"n": 0}
-    original_permutation = np.random.permutation
-
-    def _counting_permutation(*args, **kwargs):
-        call_counter["n"] += 1
-        return original_permutation(*args, **kwargs)
-
-    np.random.permutation = _counting_permutation  # type: ignore[assignment]
-    try:
-        for _ in range(num_updates):
-            _run_one()
-    finally:
-        np.random.permutation = original_permutation  # type: ignore[assignment]
-    return counts

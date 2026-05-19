@@ -214,6 +214,7 @@ class DGRARewardModel(base.RewardModel):
             return {
                 "buffer_size": 0.0,
                 "training_steps": 0.0,
+                "epochs": 0,
                 "reward_loss": 0.0,
                 "regu_loss": 0.0,
             }
@@ -283,13 +284,14 @@ class DGRARewardModel(base.RewardModel):
 
         # Total training step count = number of real (non-padded) timesteps
         # touched in the final epoch — equals one full pass over the buffer.
-        total_training_steps = int(self._stacked_mask.sum().item())
+        total_training_steps = int(self._stacked_mask.sum().item()) * effective_epochs
 
         self._update_idx += 1
 
         return {
             "buffer_size": float(len(self._buffer)),
             "training_steps": float(total_training_steps),
+            "epochs": effective_epochs,
             "reward_loss": float(np.mean(last_epoch_reward_losses)),
             "regu_loss": float(np.mean(last_epoch_regu_losses)),
         }
