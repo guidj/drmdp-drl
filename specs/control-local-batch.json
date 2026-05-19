@@ -1,15 +1,14 @@
 {
   "environments": [
     {
-      "env": "Hopper-v5",
-      "env_kwargs": {"max_episode_steps": 1000},
+      "env": "Pendulum-v1",
+      "env_kwargs": {"max_episode_steps": 200},
       "delay": 3,
-      "num_steps": 1e6,
+      "num_steps": 60000,
       "eval_step_freq": 400,
       "sac_kwargs": {
-        "learning_rate": 3e-4,
-        "buffer_size": 1000000,
-        "batch_size": 128,
+        "learning_rate": 1e-3,
+        "buffer_size": 100000,
         "gradient_steps": -1,
         "verbose": 1
       },
@@ -24,8 +23,7 @@
         {
           "reward_model_type": "dgra",
           "reward_model_kwargs": {
-            "max_buffer_size": 20000,
-            "train_epochs": 50,
+            "max_buffer_size": 50000,
             "batch_size": 64,
             "regu_lam": 1.0,
             "learning_rate": 1e-3,
@@ -36,16 +34,68 @@
           "reward_model_type": "grd",
           "reward_model_kwargs": {
             "max_buffer_size": 300,
-            "train_epochs": 50,
+            "train_epochs": 25,
             "batch_size": 4,
             "trans_batch_size": 256,
             "dyn_weight": 1.0,
-            "sparsity_lam_diag": 1e-4,
+            "sparsity_lam_diag": 1e-6,
             "sparsity_lam_offdiag": 1e-5,
             "learning_rate": 3e-4,
             "train_epochs_decay": 1.0
           }
-        },        
+        },
+        {
+          "agent_type": "hc",
+          "agent_kwargs": {"history_hidden_size": 48, "projection_dim": 48, "reg_lambda": 5.0}
+        }
+      ]
+    },
+    {
+      "env": "InvertedPendulum-v5",
+      "env_kwargs": {"max_episode_steps": 1000},
+      "delay": 3,
+      "num_steps": 100000,
+      "eval_step_freq": 1000,
+      "sac_kwargs": {
+        "learning_rate": 3e-4,
+        "buffer_size": 1000000,
+        "batch_size": 256,
+        "learning_starts": 10000,
+        "gradient_steps": -1,
+        "verbose": 1
+      },
+      "experiments": [
+        {
+          "reward_model_type": "none"
+        },
+        {
+          "reward_model_type": "ircr",
+          "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10}
+        },
+        {
+          "reward_model_type": "dgra",
+          "reward_model_kwargs": {
+            "max_buffer_size": 50000,
+            "batch_size": 64,
+            "regu_lam": 1.0,
+            "learning_rate": 1e-3,
+            "train_epochs_decay": 1.0
+          }
+        },
+        {
+          "reward_model_type": "grd",
+          "reward_model_kwargs": {
+            "max_buffer_size": 300,
+            "train_epochs": 25,
+            "batch_size": 4,
+            "trans_batch_size": 256,
+            "dyn_weight": 1.0,
+            "sparsity_lam_diag": 1e-6,
+            "sparsity_lam_offdiag": 1e-5,
+            "learning_rate": 3e-4,
+            "train_epochs_decay": 1.0
+          }
+        },
         {
           "agent_type": "hc",
           "agent_kwargs": {"history_hidden_size": 48, "projection_dim": 48, "reg_lambda": 5.0}
