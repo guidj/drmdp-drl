@@ -80,9 +80,9 @@ class IntervalPositionWrapper(gym.Wrapper):
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         obs, reward, terminated, truncated, info = self.env.step(action)
         self._position = min(self._position + 1, self._max_delay)
-        augmented = self._augment(obs)
         if info.get("interval_end", False) or terminated or truncated:
             self._position = 0
+        augmented = self._augment(obs)
         return augmented, reward, terminated, truncated, info
 
     def _augment(self, obs: np.ndarray) -> np.ndarray:
@@ -273,11 +273,16 @@ class HCSAC(SAC):
                 F.mse_loss(qh_pred + qc_val, target_q_detached) for qc_val in current_qc
             )
 
-            # Regularisation (Eq. 9): at interval-end steps force H_φ ≈ R_t.
+            # Regularisation (Eq. 9): H_φ(τ_i) ≈ r(τ_i) at interval-end steps.
+            # Use `shifted` (the full interval including current step) rather
+            # than `history` (which excludes it) so that H_φ sees all n steps.
             if self._reg_lambda > 0.0 and interval_end.any():
                 reg_mask = interval_end.squeeze(-1)  # (B,)
+                _, h_reg_enc = self.history_encoder(shifted[reg_mask])
+                h_reg = h_reg_enc.squeeze(0)
+                qh_reg = self.head_net(h_reg)
                 reg_loss: torch.Tensor = F.mse_loss(
-                    qh_pred[reg_mask],
+                    qh_reg,
                     replay_data.rewards[reg_mask].detach(),
                 )
                 critic_loss = critic_loss + self._reg_lambda * reg_loss
@@ -423,6 +428,17 @@ class HCReplayBuffer(buffers.ReplayBuffer):
     - ``_interval_ends``: whether this step was an interval boundary, read
       from ``info["interval_end"]`` (set by ``ImputeMissingRewardWrapper``)
 
+    History is **left-zero-padded**: real (s, a) pairs are packed to the right
+    of the ``max_delay``-length window, with leading zeros filling unused
+    slots.  For example, at the third step of an interval with max_delay=5::
+
+        [0, 0, 0, (s₀,a₀), (s₁,a₁)]
+
+    This layout lets the GRU process zeros first (carrying no useful signal)
+    then the real pairs in chronological order, so the final hidden state
+    ``h_n`` reflects the last real step — matching the paper's "output of the
+    GRU at the corresponding step" — without needing ``pack_padded_sequence``.
+
     History resets at interval boundaries and at episode termination.
 
     Args:
@@ -467,8 +483,9 @@ class HCReplayBuffer(buffers.ReplayBuffer):
         done: np.ndarray,
         infos: List[Dict[str, Any]],
     ) -> None:
-        # Snapshot history and interval_end flag BEFORE calling super() so
-        # the stored entry does not include the current (obs_t, action_t).
+        # Snapshot history BEFORE super().add() so the stored window is
+        # τ_{t_i:t} (excludes the current step).  Right-align into the
+        # fixed-width array so the GRU sees zeros then real pairs in order.
         pos = self.pos
         done_arr = np.asarray(done).reshape(self.n_envs)
         obs_arr = np.asarray(obs).reshape(self.n_envs, -1)
