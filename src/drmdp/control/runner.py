@@ -914,12 +914,6 @@ def parse_single_cli() -> Mapping[str, Any]:
         "Values are parsed via ast.literal_eval; unrecognised literals "
         "are kept as strings. E.g. --agent-kwarg key=value",
     )
-    parser.add_argument(
-        "--non-stationary",
-        action="store_true",
-        default=False,
-        help="Wrap environment with non-stationary dynamics (episodic mass/friction/gravity perturbation)",
-    )
 
     args, argv = parser.parse_known_args()
     common_args = parse_common_args(argv)
@@ -991,6 +985,12 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         type=str,
         default=None,
         help="Directory for logs and saved model",
+    )
+    parser.add_argument(
+        "--non-stationary",
+        action="store_true",
+        default=None,
+        help="Wrap environment with non-stationary dynamics (episodic mass/friction/gravity perturbation)",
     )
     args, _ = parser.parse_known_args(argv)
     return args
