@@ -21,6 +21,10 @@ class Trajectory:
         actions: Actions taken at each step, shape (T, action_dim).
         env_rewards: Raw environment rewards (delayed aggregate or 0-imputed), shape (T,).
         terminals: Episode-end flags per step, shape (T,).
+        infos: Per-step info dicts from the environment wrappers.  Contains
+            at minimum ``interval_end`` (from ``ImputeMissingRewardWrapper``),
+            ``delay``, ``segment``, ``segment_step`` (from
+            ``DelayedRewardWrapper``).
         episode_return: Sum of env_rewards over the episode.
     """
 
@@ -28,6 +32,7 @@ class Trajectory:
     actions: np.ndarray
     env_rewards: np.ndarray
     terminals: np.ndarray
+    infos: Sequence[Mapping[str, Any]]
     episode_return: float
 
 
@@ -95,6 +100,11 @@ class RelabelingReplayBuffer(buffers.ReplayBuffer):
     ):
         super().__init__(*args, **kwargs)
         self.reward_model = reward_model
+        # Identity-keyed cache for the obs_mask torch tensor. The reward
+        # model's obs_mask returns the same numpy array until invalidated;
+        # converting it to a torch tensor on every sample() is wasted work.
+        self._cached_mask_np: Optional[np.ndarray] = None
+        self._cached_mask_t: Optional[torch.Tensor] = None
 
     def sample(
         self,
@@ -126,9 +136,14 @@ class RelabelingReplayBuffer(buffers.ReplayBuffer):
         batch = batch._replace(rewards=relabeled)
         mask = self.reward_model.obs_mask
         if mask is not None:
-            mask_t = torch.as_tensor(
-                mask, dtype=batch.observations.dtype, device=batch.observations.device
-            )
+            if mask is not self._cached_mask_np:
+                self._cached_mask_t = torch.as_tensor(
+                    mask,
+                    dtype=batch.observations.dtype,
+                    device=batch.observations.device,
+                )
+                self._cached_mask_np = mask
+            mask_t = self._cached_mask_t
             batch = batch._replace(
                 observations=batch.observations * mask_t,
                 next_observations=batch.next_observations * mask_t,

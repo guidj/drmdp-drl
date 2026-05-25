@@ -31,20 +31,24 @@ class ExperimentLogger(contextlib.AbstractContextManager):
     def __init__(
         self,
         log_dir: str,
-        params: Any,
+        params: Optional[Any] = None,
+        filename: Optional[str] = None,
     ):
-        self.log_file = os.path.join(log_dir, self.LOG_FILE_NAME)
+        filename = filename if filename is not None else self.LOG_FILE_NAME
+        self.log_file = os.path.join(log_dir, filename)
         self.param_file = os.path.join(log_dir, self.PARAM_FILE_NAME)
         if not tf.io.gfile.exists(log_dir):
             tf.io.gfile.makedirs(log_dir)
 
-        serialisable = (
-            dataclasses.asdict(params)
-            if dataclasses.is_dataclass(params) and not isinstance(params, type)
-            else params
-        )
-        with tf.io.gfile.GFile(self.param_file, "w") as writer:
-            writer.write(json.dumps(serialisable))
+        self.params = params
+        if params is not None:
+            serialisable = (
+                dataclasses.asdict(params)
+                if dataclasses.is_dataclass(params) and not isinstance(params, type)
+                else params
+            )
+            with tf.io.gfile.GFile(self.param_file, "w") as writer:
+                writer.write(json.dumps(serialisable))
 
         self._writer: Optional[tf.io.gfile.GFile] = None
 
@@ -79,15 +83,17 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         self,
         episode: int,
         steps: int,
+        global_steps: int,
         returns: float,
         info: Optional[Mapping[str, Any]] = None,
-    ):
+    ) -> None:
         """
         Logs an experiment entry for an episode.
         """
         entry = {
             "episode": episode,
             "steps": steps,
+            "global_steps": global_steps,
             "returns": returns,
             "info": info,
         }
@@ -97,7 +103,7 @@ class ExperimentLogger(contextlib.AbstractContextManager):
         self._writer.write(f"{json.dumps(entry)}\n")
 
 
-def dataclass_from_dict(clazz: Callable, data: Mapping[str, Any]):  # type: ignore [arg-type]
+def dataclass_from_dict(clazz: Callable, data: Mapping[str, Any]) -> Any:  # type: ignore [arg-type]
     """
     Creates an instance of a dataclass from a dictionary.
     """
@@ -119,7 +125,7 @@ def json_from_dict(
     if dict_encode_level is None:
         return mapping
 
-    def go(data: Any, level: int):
+    def go(data: Any, level: int) -> Any:
         """Recursively encode nested dicts to JSON strings at the threshold depth."""
         if isinstance(data, Mapping):
             if level >= dict_encode_level:

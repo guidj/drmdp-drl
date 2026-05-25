@@ -14,10 +14,12 @@ ray job submit \
     -- \
     python $PARENT_DIR/src/$BASE/dfdrl/est_o2.py \
         --delay=3 \
-        --buffer-num-steps=100 \
-        --train-epochs=10 \
+        --buffer-num-steps=20000 \
+        --train-epochs=1000 \
+        --env "Hopper-v5" \
+        --max-episode-steps 1000 \
         --output-dir=$HOME/fs/$BASE/dfdrl-rest/o2/$TIMESTAMP \
         --task-prefix $TIMESTAMP \
-        --num-runs=3 \
+        --num-runs=1 \
         --log-episode-frequency=5 \
         --use-seed

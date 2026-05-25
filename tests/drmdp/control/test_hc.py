@@ -54,17 +54,25 @@ class TestIntervalPositionWrapper:
                 break
             np.testing.assert_allclose(position, expected_pos / max_delay, atol=1e-6)
 
-    def test_position_resets_after_interval_end(self):
-        """Position of the returned obs is 0 immediately after an interval ends."""
+    def test_position_zero_at_interval_end(self):
+        """Interval-end obs is the first state of the new interval: position 0."""
         max_delay = 3
         env = self._make_wrapped_env(max_delay)
         env.reset()
-        # Drive exactly to interval end (steps 1 .. max_delay).
-        for step_idx in range(1, max_delay):
+        for _ in range(1, max_delay):
             env.step(env.action_space.sample())
-        # Final step of the interval: returned obs belongs to next interval.
         obs, _, _, _, _ = env.step(env.action_space.sample())
         np.testing.assert_allclose(obs[-1], 0.0, atol=1e-6)
+
+    def test_position_at_first_step_of_new_interval(self):
+        """First step after an interval boundary has position 1/max_delay."""
+        max_delay = 3
+        env = self._make_wrapped_env(max_delay)
+        env.reset()
+        for _ in range(max_delay):
+            env.step(env.action_space.sample())
+        obs, _, _, _, _ = env.step(env.action_space.sample())
+        np.testing.assert_allclose(obs[-1], 1.0 / max_delay, atol=1e-6)
 
     def test_position_resets_after_done(self):
         """Position of the first obs in a new episode is 0."""
@@ -72,6 +80,18 @@ class TestIntervalPositionWrapper:
         env.reset()
         obs, _ = env.reset()
         assert obs[-1] == 0.0
+
+    def test_position_sequence_across_two_intervals(self):
+        """Positions: [0, 1/d, 2/d, 0, 1/d, 2/d, 0] across two intervals."""
+        max_delay = 3
+        env = self._make_wrapped_env(max_delay)
+        obs, _ = env.reset()
+        positions = [obs[-1]]
+        for _ in range(max_delay * 2):
+            obs, _, _, _, _ = env.step(env.action_space.sample())
+            positions.append(obs[-1])
+        expected = [0.0, 1 / 3, 2 / 3, 0.0, 1 / 3, 2 / 3, 0.0]
+        np.testing.assert_allclose(positions, expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +196,123 @@ class TestHCReplayBuffer:
         samples = buf.sample(4)
         assert isinstance(samples, hc.HCReplayBufferSamples)
 
+    def test_reward_zero_at_intermediate_steps(self):
+        """R_t = 0 at non-interval-end steps, aggregate at interval-end."""
+        obs_dim, act_dim, max_delay = 3, 2, 3
+        buf = _make_hc_buffer(obs_dim, act_dim, max_delay)
+        _add_transition(buf, obs_dim, act_dim, interval_end=False, reward=0.0)
+        _add_transition(buf, obs_dim, act_dim, interval_end=False, reward=0.0)
+        _add_transition(buf, obs_dim, act_dim, interval_end=True, reward=5.0)
+        np.testing.assert_allclose(buf.rewards[0, 0], 0.0)
+        np.testing.assert_allclose(buf.rewards[1, 0], 0.0)
+        np.testing.assert_allclose(buf.rewards[2, 0], 5.0)
+
+    def test_history_has_n_minus_one_rows_at_interval_end(self):
+        """Buffer stores τ_{t_i:t} (n-1 steps) for HC decomposition (Eq. 6)."""
+        obs_dim, act_dim, max_delay = 2, 1, 3
+        buf = _make_hc_buffer(obs_dim, act_dim, max_delay)
+        rng = np.random.default_rng(42)
+        for step_idx in range(max_delay):
+            obs = rng.uniform(1, 2, (1, obs_dim)).astype(np.float32)
+            act = rng.uniform(1, 2, (1, act_dim)).astype(np.float32)
+            is_last = step_idx == max_delay - 1
+            buf.add(
+                obs,
+                obs,
+                act,
+                np.array([3.0 if is_last else 0.0]),
+                np.array([False]),
+                [{"interval_end": is_last}],
+            )
+        history_at_end = buf._history_sa[max_delay - 1, 0]
+        n_nonzero = int(np.any(history_at_end != 0.0, axis=-1).sum())
+        assert n_nonzero == max_delay - 1
+
+    def test_shifted_has_n_rows_at_interval_end(self):
+        """Eq. 9: shifted = history + current step = full interval τ_i (n steps)."""
+        obs_dim, act_dim, max_delay = 2, 1, 3
+        buf = _make_hc_buffer(obs_dim, act_dim, max_delay)
+        rng = np.random.default_rng(42)
+        for step_idx in range(max_delay):
+            obs = rng.uniform(1, 2, (1, obs_dim)).astype(np.float32)
+            act = rng.uniform(1, 2, (1, act_dim)).astype(np.float32)
+            is_last = step_idx == max_delay - 1
+            buf.add(
+                obs,
+                obs,
+                act,
+                np.array([3.0 if is_last else 0.0]),
+                np.array([False]),
+                [{"interval_end": is_last}],
+            )
+        history = torch.from_numpy(buf._history_sa[max_delay - 1, 0]).unsqueeze(0)
+        sa = (
+            torch.from_numpy(
+                np.concatenate(
+                    [
+                        buf.observations[max_delay - 1, 0].flatten(),
+                        buf.actions[max_delay - 1, 0].flatten(),
+                    ]
+                )
+            )
+            .unsqueeze(0)
+            .unsqueeze(1)
+        )
+        shifted = torch.cat([history[:, 1:, :], sa], dim=1)
+        n_nonzero = int(torch.any(shifted[0] != 0.0, dim=-1).sum().item())
+        assert n_nonzero == max_delay
+
 
 # ---------------------------------------------------------------------------
 # TestHCSACPolicy
 # ---------------------------------------------------------------------------
+
+
+class TestHistoryEncoderArchitecture:
+    """Tests for _HistoryEncoder FC projection and GRU."""
+
+    def test_fc_projection_output_shape(self):
+        """FC layer projects (batch, max_delay, sa_dim) → (batch, max_delay, projection_dim)."""
+        sa_dim, hidden, proj = 10, 48, 48
+        encoder = hc._HistoryEncoder(sa_dim, hidden, proj)
+        history = torch.randn(4, 5, sa_dim)
+        output, _ = encoder(history)
+        assert output.shape == (4, 5, hidden)
+
+    def test_gru_hidden_shape_default(self):
+        """Final hidden state has shape (1, batch, hidden_size) with default 48."""
+        sa_dim = 10
+        encoder = hc._HistoryEncoder(sa_dim)
+        history = torch.randn(4, 5, sa_dim)
+        _, h_n = encoder(history)
+        assert h_n.shape == (1, 4, 48)
+
+    def test_custom_projection_dim(self):
+        """Non-default projection_dim changes the FC layer width."""
+        sa_dim, hidden, proj = 10, 32, 24
+        encoder = hc._HistoryEncoder(sa_dim, hidden, proj)
+        assert encoder._proj.in_features == sa_dim
+        assert encoder._proj.out_features == proj
+        assert encoder._gru.input_size == proj
+        assert encoder._gru.hidden_size == hidden
+
+
+class TestHeadNetworkArchitecture:
+    """Tests for _HeadNetwork single linear layer."""
+
+    def test_single_linear_layer(self):
+        """Head network is a single nn.Linear, not an MLP."""
+        head = hc._HeadNetwork(48)
+        assert isinstance(head._linear, torch.nn.Linear)
+        assert head._linear.in_features == 48
+        assert head._linear.out_features == 1
+
+    def test_output_shape(self):
+        """Output shape is (batch, 1)."""
+        head = hc._HeadNetwork(48)
+        hidden = torch.randn(8, 48)
+        output = head(hidden)
+        assert output.shape == (8, 1)
 
 
 class TestHCSACPolicy:
@@ -203,6 +336,14 @@ class TestHCSACPolicy:
         agent = self._make_agent()
         assert hasattr(agent.policy, "head_optimizer")
         assert isinstance(agent.policy.head_optimizer, torch.optim.Optimizer)
+
+    def test_encoder_has_fc_projection(self):
+        """Encoder has FC projection layer before GRU."""
+        agent = self._make_agent()
+        encoder = agent.policy.history_encoder
+        assert hasattr(encoder, "_proj")
+        assert hasattr(encoder, "_gru")
+        assert encoder._gru.input_size == 48
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +411,120 @@ class TestHCSAC:
             learning_starts=50,
         )
         agent.learn(total_timesteps=200)
+
+    def test_grad_clip_disabled_by_default(self):
+        """Default grad_clip_norm=None trains without error."""
+        env = self._make_hc_env(delay=3)
+        agent = hc.HCSAC(
+            env,
+            max_delay=3,
+            verbose=0,
+            buffer_size=500,
+            batch_size=32,
+            learning_starts=50,
+        )
+        assert agent._grad_clip_norm is None
+        agent.learn(total_timesteps=200)
+
+    def test_grad_clip_enabled(self):
+        """Training with explicit grad_clip_norm completes."""
+        env = self._make_hc_env(delay=3)
+        agent = hc.HCSAC(
+            env,
+            max_delay=3,
+            grad_clip_norm=1.0,
+            verbose=0,
+            buffer_size=500,
+            batch_size=32,
+            learning_starts=50,
+        )
+        agent.learn(total_timesteps=200)
+
+
+# ---------------------------------------------------------------------------
+# TestNextHistoryConstruction
+# ---------------------------------------------------------------------------
+
+
+class TestNextHistoryConstruction:
+    """Tests for the next-step history logic in HCSAC.train() (Eq. 4)."""
+
+    def test_next_history_zeros_at_interval_end(self):
+        """Eq. 4: when interval ends, next step's history is empty (new interval)."""
+        batch, max_delay, sa_dim = 2, 4, 5
+        history = torch.randn(batch, max_delay, sa_dim)
+        current_sa = torch.randn(batch, 1, sa_dim)
+        interval_end = torch.tensor([[True], [False]])
+
+        shifted = torch.cat([history[:, 1:, :], current_sa], dim=1)
+        next_history = torch.where(
+            interval_end.unsqueeze(-1).expand_as(shifted),
+            torch.zeros_like(shifted),
+            shifted,
+        )
+        torch.testing.assert_close(next_history[0], torch.zeros(max_delay, sa_dim))
+
+    def test_next_history_extends_mid_interval(self):
+        """Eq. 4: mid-interval, history shifts left and appends current (s,a)."""
+        history = torch.tensor(
+            [[[0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3]]], dtype=torch.float32
+        )
+        current_sa = torch.tensor([[[4, 4, 4]]], dtype=torch.float32)
+        interval_end = torch.tensor([[False]])
+
+        shifted = torch.cat([history[:, 1:, :], current_sa], dim=1)
+        next_history = torch.where(
+            interval_end.unsqueeze(-1).expand_as(shifted),
+            torch.zeros_like(shifted),
+            shifted,
+        )
+        expected = torch.tensor(
+            [[[1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4]]], dtype=torch.float32
+        )
+        torch.testing.assert_close(next_history, expected)
+
+
+# ---------------------------------------------------------------------------
+# TestActorGradientIsolation
+# ---------------------------------------------------------------------------
+
+
+class TestActorGradientIsolation:
+    """Eq. 7: actor gradient flows through C only, not H."""
+
+    def test_head_net_receives_no_actor_gradient(self):
+        """After actor backward, head_net and encoder grads are None or zero."""
+        env = gym.make("Pendulum-v1")
+        env = rewdelay.DelayedRewardWrapper(env, rewdelay.FixedDelay(3))
+        env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
+        env = hc.IntervalPositionWrapper(env, max_delay=3)
+        agent = hc.HCSAC(
+            env,
+            max_delay=3,
+            verbose=0,
+            buffer_size=500,
+            batch_size=32,
+            learning_starts=50,
+        )
+        agent.learn(total_timesteps=100)
+
+        replay_data = agent.replay_buffer.sample(32)
+        actions_pi, log_prob = agent.actor.action_log_prob(replay_data.observations)
+        qc_pi = torch.cat(agent.critic(replay_data.observations, actions_pi), dim=1)
+        min_qc_pi, _ = torch.min(qc_pi, dim=1, keepdim=True)
+        actor_loss = (
+            torch.exp(agent.log_ent_coef.detach()) * log_prob.reshape(-1, 1) - min_qc_pi
+        ).mean()
+
+        agent.actor.optimizer.zero_grad()
+        agent.policy.head_optimizer.zero_grad()
+        agent.critic.optimizer.zero_grad()
+        actor_loss.backward()
+
+        for param in agent.head_net.parameters():
+            assert param.grad is None or torch.all(param.grad == 0)
+        for param in agent.history_encoder.parameters():
+            assert param.grad is None or torch.all(param.grad == 0)
 
 
 # ---------------------------------------------------------------------------

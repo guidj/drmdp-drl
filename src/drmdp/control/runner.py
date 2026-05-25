@@ -3,8 +3,10 @@ Off-policy SAC control with interleaved reward model learning or HC decompositio
 
 Two agent types are supported:
 
-* ``sac`` (default): standard SAC with a pluggable reward model
+* ``sac`` (default): standard SAC with an optional pluggable reward model
   (e.g. IRCRRewardModel) that relabels replay buffer rewards at sample time.
+  Pass ``--reward-model-type none`` to train SAC directly on delayed rewards
+  without any reward model (delayed-rewards baseline).
 * ``hc``: HC-decomposition SAC (Han et al., ICML 2022) that learns a
   decomposed Q-function Q^H(h_t) + Q^C(s_t, a_t) directly from the delayed
   environment rewards.  No separate reward model is used.
@@ -13,6 +15,11 @@ Usage (SAC + IRCR):
     python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
         --delay 3 --num-steps 50000 --reward-model-type ircr \\
         --update-every-n-steps 1000 --output-dir /tmp/control-ircr
+
+Usage (SAC delayed-rewards baseline, no reward model):
+    python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
+        --delay 3 --num-steps 50000 --reward-model-type none \\
+        --output-dir /tmp/control-delayed
 
 Usage (HC):
     python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \\
@@ -23,18 +30,20 @@ Usage (HC):
 import argparse
 import ast
 import concurrent.futures
+import contextlib
 import dataclasses
 import json
 import logging
 import os
 import tempfile
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
 import ray
-import stable_baselines3
 from stable_baselines3.common import callbacks
+from stable_baselines3.common import evaluation as sb3_evaluation
 
 from drmdp import core, logger, ray_utils, rewdelay
 from drmdp.control import base, dgra, grd, hc, ircr
@@ -49,7 +58,8 @@ class TrainingArgs:
         delay: Reward delay (number of steps).
         env_kwargs: Keyword arguments forwarded to ``gym.make()`` (e.g.
             ``{"max_episode_steps": 2500}``).
-        reward_model_type: Reward model identifier. Supports "ircr", "dgra", and "grd".
+        reward_model_type: Reward model identifier. Supports "ircr", "dgra", "grd",
+            and "none" (train directly on delayed rewards; no model instantiated).
             Only used when ``agent_type="sac"``.
         update_every_n_steps: Call reward_model.update() every N env steps.
             Only used when ``agent_type="sac"``.
@@ -58,11 +68,15 @@ class TrainingArgs:
         reward_model_kwargs: Keyword arguments forwarded to the reward model
             constructor. Only used when ``agent_type="sac"``.
         num_steps: Total environment steps to train for.
-        sac_learning_rate: Learning rate for SAC actor and critic networks.
-        sac_buffer_size: Capacity of SAC's replay buffer.
-        sac_batch_size: Mini-batch size for SAC gradient updates.
-        sac_gradient_steps: Gradient steps per env step (-1 = match collected).
-        log_episode_frequency: Log to ExperimentLogger every N episodes.
+        sac_kwargs: Keyword arguments forwarded to the SAC or HCSAC constructor
+            (e.g. ``{"buffer_size": 100_000, "ent_coef": "auto_0.1"}``).
+            ``replay_buffer_class``, ``replay_buffer_kwargs``, ``seed``, and
+            ``max_delay`` (HC) are set by the runner and cannot be overridden here.
+        log_episode_frequency: Log to ExperimentLogger every N completed episodes.
+            1 logs every episode (default); N>1 logs every Nth episode.
+        eval_step_freq: Evaluate the greedy policy every N env steps on a clean
+            (undelayed) environment. 0 disables step-based evaluation.
+        n_eval_episodes: Number of episodes per evaluation when eval_step_freq > 0.
         output_dir: Directory for logs and the saved SAC model.
         seed: Random seed for reproducibility.
         agent_type: Agent algorithm. "sac" uses standard SAC with a reward
@@ -80,14 +94,15 @@ class TrainingArgs:
     clear_buffer_on_update: bool
     reward_model_kwargs: Mapping[str, Any]
     num_steps: int
-    sac_learning_rate: float
-    sac_buffer_size: int
-    sac_batch_size: int
-    sac_gradient_steps: int
     log_episode_frequency: int
     output_dir: str
+    exp_name: str
+    run_id: int
+    eval_step_freq: int = 0
+    n_eval_episodes: int = 10
     seed: Optional[int] = None
     agent_type: str = "sac"
+    sac_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     env_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -107,7 +122,7 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         update_every_n_steps: int,
         clear_buffer_on_update: bool,
         log_episode_frequency: int,
-        exp_logger: logger.ExperimentLogger,
+        train_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -115,45 +130,66 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
         self._update_every_n_steps = update_every_n_steps
         self._clear_buffer_on_update = clear_buffer_on_update
         self._log_episode_frequency = log_episode_frequency
-        self._exp_logger = exp_logger
+        self._train_logger = train_logger
 
         self._episode_obs: List[np.ndarray] = []
         self._episode_actions: List[np.ndarray] = []
         self._episode_rewards: List[float] = []
         self._episode_terminals: List[bool] = []
+        self._episode_infos: List[Mapping[str, Any]] = []
         self._episode_steps: int = 0
         self._episode_count: int = 0
+        self._last_logged_episode: int = 0
 
         self._pending_trajectories: List[base.Trajectory] = []
         self._last_model_metrics: Mapping[str, float] = {}
         self._reward_model_total_steps: int = 0
+        self._last_update_step: int = 0
+        self._start_time: float = 0.0
+
+        self._last_episode_trajectory: Optional[base.Trajectory] = None
+        self._last_episode_return: float = 0.0
+        self._last_episode_delayed_return: float = 0.0
+        self._last_episode_step_count: int = 0
+        self._last_episode_global_steps: int = 0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
 
     def _on_step(self) -> bool:
         obs_before = self.model._last_obs[0]
         action = self.locals["actions"][0]
         reward = float(self.locals["rewards"][0])
         done = bool(self.locals["dones"][0])
+        info = dict(self.locals["infos"][0])
 
         self._episode_obs.append(obs_before.copy())
         self._episode_actions.append(action.copy())
         self._episode_rewards.append(reward)
         self._episode_terminals.append(done)
+        self._episode_infos.append(info)
         self._episode_steps += 1
 
         if done:
             self._on_episode_end()
 
         if (
-            self.num_timesteps % self._update_every_n_steps == 0
+            self.num_timesteps >= self._last_update_step + self._update_every_n_steps
             and len(self._pending_trajectories) > 0
         ):
             self._flush_pending_trajectories()
+            self._last_update_step = self.num_timesteps
 
         return True
 
     def _on_training_end(self) -> None:
         if len(self._pending_trajectories) > 0:
             self._flush_pending_trajectories()
+        if (
+            self._episode_count > self._last_logged_episode
+            and self._last_episode_trajectory is not None
+        ):
+            self._log_episode(training_complete=True)
 
     def _on_episode_end(self) -> None:
         """Finalise the current episode and log if on schedule."""
@@ -162,38 +198,55 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             actions=np.stack(self._episode_actions),
             env_rewards=np.array(self._episode_rewards, dtype=np.float32),
             terminals=np.array(self._episode_terminals),
+            infos=tuple(self._episode_infos),
             episode_return=float(sum(self._episode_rewards)),
         )
         self._pending_trajectories.append(trajectory)
         self._episode_count += 1
 
+        true_episode_return = float(
+            self.locals["infos"][0].get("true_episode_return", 0.0)
+        )
+        self._last_episode_trajectory = trajectory
+        self._last_episode_return = true_episode_return
+        self._last_episode_delayed_return = trajectory.episode_return
+        self._last_episode_step_count = self._episode_steps
+        self._last_episode_global_steps = self.num_timesteps
+
         if self._episode_count % self._log_episode_frequency == 0:
-            true_episode_return = float(
-                self.locals["infos"][0].get("true_episode_return", 0.0)
-            )
-            est_rewards = self._reward_model.predict(
-                trajectory.observations,
-                trajectory.actions,
-                trajectory.terminals,
-            )
-            self._exp_logger.log(
-                episode=self._episode_count,
-                steps=self._episode_steps,
-                returns=true_episode_return,
-                info={
-                    "sac_total_steps": self.num_timesteps,
-                    "reward_model_total_steps": self._reward_model_total_steps,
-                    "delayed_returns": trajectory.episode_return,
-                    "estimated_return": float(est_rewards.sum()),
-                    "reward_model": dict(self._last_model_metrics),
-                },
-            )
+            self._log_episode()
 
         self._episode_obs = []
         self._episode_actions = []
         self._episode_rewards = []
         self._episode_terminals = []
+        self._episode_infos = []
         self._episode_steps = 0
+
+    def _log_episode(self, training_complete: bool = False) -> None:
+        assert self._last_episode_trajectory is not None
+        est_rewards = self._reward_model.predict(
+            self._last_episode_trajectory.observations,
+            self._last_episode_trajectory.actions,
+            self._last_episode_trajectory.terminals,
+        )
+        info: Dict[str, Any] = {
+            "sac_total_steps": self._last_episode_global_steps,
+            "reward_model_total_steps": self._reward_model_total_steps,
+            "delayed_returns": self._last_episode_delayed_return,
+            "estimated_return": float(est_rewards.sum()),
+            "reward_model": dict(self._last_model_metrics),
+            "elapsed_seconds": time.time() - self._start_time,
+            "training_complete": training_complete,
+        }
+        self._train_logger.log(
+            episode=self._episode_count,
+            steps=self._last_episode_step_count,
+            global_steps=self._last_episode_global_steps,
+            returns=self._last_episode_return,
+            info=info,
+        )
+        self._last_logged_episode = self._episode_count
 
     def _flush_pending_trajectories(self) -> None:
         """Pass pending trajectories to the reward model and optionally clear the buffer."""
@@ -206,8 +259,8 @@ class RewardModelUpdateCallback(callbacks.BaseCallback):
             self.model.replay_buffer.reset()
 
 
-class _HCLoggingCallback(callbacks.BaseCallback):
-    """Lightweight episode logger for the HC agent.
+class _RewardObsLoggingCallback(callbacks.BaseCallback):
+    """Lightweight episode logger for the Vanilla SAC and HC agents.
 
     Logs per-episode returns and step counts to ExperimentLogger at a
     configurable frequency.  Unlike RewardModelUpdateCallback, this callback
@@ -217,15 +270,25 @@ class _HCLoggingCallback(callbacks.BaseCallback):
     def __init__(
         self,
         log_episode_frequency: int,
-        exp_logger: logger.ExperimentLogger,
+        train_logger: logger.ExperimentLogger,
         verbose: int = 0,
     ):
         super().__init__(verbose)
         self._log_episode_frequency = log_episode_frequency
-        self._exp_logger = exp_logger
+        self._train_logger = train_logger
         self._episode_steps: int = 0
         self._episode_count: int = 0
         self._episode_rewards: List[float] = []
+        self._last_logged_episode: int = 0
+        self._start_time: float = 0.0
+
+        self._last_episode_return: float = 0.0
+        self._last_episode_delayed_return: float = 0.0
+        self._last_episode_step_count: int = 0
+        self._last_episode_global_steps: int = 0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
 
     def _on_step(self) -> bool:
         self._episode_steps += 1
@@ -234,24 +297,113 @@ class _HCLoggingCallback(callbacks.BaseCallback):
             self._on_episode_end()
         return True
 
+    def _on_training_end(self) -> None:
+        if self._episode_count > self._last_logged_episode:
+            self._log_episode(training_complete=True)
+
     def _on_episode_end(self) -> None:
         self._episode_count += 1
+        true_episode_return = float(
+            self.locals["infos"][0].get("true_episode_return", 0.0)
+        )
+        self._last_episode_return = true_episode_return
+        self._last_episode_delayed_return = float(sum(self._episode_rewards))
+        self._last_episode_step_count = self._episode_steps
+        self._last_episode_global_steps = self.num_timesteps
+
         if self._episode_count % self._log_episode_frequency == 0:
-            true_episode_return = float(
-                self.locals["infos"][0].get("true_episode_return", 0.0)
-            )
-            delayed_returns = float(sum(self._episode_rewards))
-            self._exp_logger.log(
-                episode=self._episode_count,
-                steps=self._episode_steps,
-                returns=true_episode_return,
-                info={
-                    "hc_total_steps": self.num_timesteps,
-                    "delayed_returns": delayed_returns,
-                },
-            )
+            self._log_episode()
+
         self._episode_steps = 0
         self._episode_rewards = []
+
+    def _log_episode(self, training_complete: bool = False) -> None:
+        info: Dict[str, Any] = {
+            "total_steps": self._last_episode_global_steps,
+            "delayed_returns": self._last_episode_delayed_return,
+            "elapsed_seconds": time.time() - self._start_time,
+            "training_complete": training_complete,
+        }
+        self._train_logger.log(
+            episode=self._episode_count,
+            steps=self._last_episode_step_count,
+            global_steps=self._last_episode_global_steps,
+            returns=self._last_episode_return,
+            info=info,
+        )
+        self._last_logged_episode = self._episode_count
+
+
+class StepEvalCallback(callbacks.BaseCallback):
+    """SB3 callback that evaluates the greedy policy at fixed step intervals.
+
+    Runs K deterministic episodes on a separate clean (undelayed) environment
+    every eval_step_freq env steps and logs mean/std returns to eval_logger.
+    """
+
+    def __init__(
+        self,
+        eval_env: Any,
+        eval_step_freq: int,
+        n_eval_episodes: int,
+        eval_logger: logger.ExperimentLogger,
+        algo_name: str,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._eval_env = eval_env
+        self._eval_step_freq = eval_step_freq
+        self._n_eval_episodes = n_eval_episodes
+        self._eval_logger = eval_logger
+        self._algo_name = algo_name
+        self._eval_count: int = 0
+        self._last_eval_steps: int = 0
+        self._start_time: float = 0.0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
+
+    def _on_step(self) -> bool:
+        if self._eval_step_freq > 0 and self.num_timesteps % self._eval_step_freq == 0:
+            self._run_eval()
+        return True
+
+    def _on_training_end(self) -> None:
+        if self.num_timesteps > self._last_eval_steps:
+            self._run_eval()
+
+    def _run_eval(self) -> None:
+        episode_rewards, _ = sb3_evaluation.evaluate_policy(
+            self.model,
+            self._eval_env,
+            n_eval_episodes=self._n_eval_episodes,
+            deterministic=True,
+            return_episode_rewards=True,
+        )
+        self._eval_count += 1
+        params = self._eval_logger.params
+        if params is not None:
+            logging.info(
+                "Eval env=%s algo=%s seed=%s step=%d :: mean_return=%.3f std=%.3f",
+                getattr(params, "env", "?"),
+                self._algo_name,
+                getattr(params, "seed", "?"),
+                self.num_timesteps,
+                float(np.mean(episode_rewards)),
+                float(np.std(episode_rewards)),
+            )
+        self._eval_logger.log(
+            episode=self._eval_count,
+            steps=0,
+            global_steps=self.num_timesteps,
+            returns=float(np.mean(episode_rewards)),
+            info={
+                "std_return": float(np.std(episode_rewards)),
+                "n_eval_episodes": self._n_eval_episodes,
+                "elapsed_seconds": time.time() - self._start_time,
+            },
+        )
+        self._last_eval_steps = self.num_timesteps
 
 
 def run(args: TrainingArgs) -> None:
@@ -261,7 +413,11 @@ def run(args: TrainingArgs) -> None:
     over windows) and ImputeMissingRewardWrapper (to replace None rewards with
     0.0 so SAC always receives a numeric value).
     """
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     logging.info("Training args: %s", args)
 
     delay = rewdelay.ClippedPoissonDelay(args.delay)
@@ -270,42 +426,81 @@ def run(args: TrainingArgs) -> None:
     env = rewdelay.DelayedRewardWrapper(env, delay)
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
 
-    with logger.ExperimentLogger(args.output_dir, params=args) as exp_logger:
+    with contextlib.ExitStack() as stack:
+        train_logger = stack.enter_context(
+            logger.ExperimentLogger(args.output_dir, params=args)
+        )
+        eval_env: Optional[Any] = None
+        eval_logger: Optional[logger.ExperimentLogger] = None
+        if args.eval_step_freq > 0:
+            eval_env = core.EnvMonitorWrapper(gym.make(args.env, **args.env_kwargs))
+            eval_logger = stack.enter_context(
+                logger.ExperimentLogger(
+                    args.output_dir,
+                    params=args,
+                    filename="eval-logs.jsonl",
+                )
+            )
         if args.agent_type == "hc":
-            _run_hc(args, env, exp_logger, delay=delay)
+            _run_hc(args, env, train_logger, delay, eval_env, eval_logger)
         else:
-            _run_sac(args, env, exp_logger)
+            _run_sac(args, env, train_logger, eval_env, eval_logger)
 
 
 def _run_sac(
     args: TrainingArgs,
     env: Any,
-    exp_logger: logger.ExperimentLogger,
+    train_logger: logger.ExperimentLogger,
+    eval_env: Optional[Any] = None,
+    eval_logger: Optional[logger.ExperimentLogger] = None,
 ) -> None:
-    """Train standard SAC with a pluggable reward model."""
+    """Train standard SAC with a reward model or directly on delayed rewards."""
+    import sbx
+
     reward_model = _make_reward_model(args, env)
-    sac = stable_baselines3.SAC(
+    if isinstance(reward_model, ircr.IRCRRewardModel):
+        replay_buffer_class = ircr.IRCRReplayBuffer
+    else:
+        replay_buffer_class = base.RelabelingReplayBuffer
+    sac = sbx.SAC(
         "MlpPolicy",
         env,
-        learning_rate=args.sac_learning_rate,
-        buffer_size=args.sac_buffer_size,
-        batch_size=args.sac_batch_size,
-        gradient_steps=args.sac_gradient_steps,
-        replay_buffer_class=base.RelabelingReplayBuffer,
+        replay_buffer_class=replay_buffer_class,
         replay_buffer_kwargs={"reward_model": reward_model},
         seed=args.seed,
-        verbose=1,
+        **args.sac_kwargs,
     )
-    callback = RewardModelUpdateCallback(
-        reward_model=reward_model,
-        update_every_n_steps=args.update_every_n_steps,
-        clear_buffer_on_update=args.clear_buffer_on_update,
-        log_episode_frequency=args.log_episode_frequency,
-        exp_logger=exp_logger,
+    training_callback = (
+        RewardModelUpdateCallback(
+            reward_model=reward_model,
+            update_every_n_steps=args.update_every_n_steps,
+            clear_buffer_on_update=args.clear_buffer_on_update,
+            log_episode_frequency=args.log_episode_frequency,
+            train_logger=train_logger,
+        )
+        if reward_model
+        else _RewardObsLoggingCallback(
+            log_episode_frequency=args.log_episode_frequency,
+            train_logger=train_logger,
+        )
+    )
+    eval_callback = (
+        StepEvalCallback(
+            eval_env,
+            args.eval_step_freq,
+            args.n_eval_episodes,
+            eval_logger,
+            algo_name=f"sac/{args.reward_model_type}",
+        )
+        if eval_env is not None and eval_logger is not None
+        else None
+    )
+    callback = callbacks.CallbackList(
+        [cb for cb in (training_callback, eval_callback) if cb is not None]
     )
     sac.learn(
         total_timesteps=args.num_steps,
-        log_interval=args.log_episode_frequency,
+        log_interval=4,
         callback=callback,
         progress_bar=True,
     )
@@ -316,14 +511,18 @@ def _run_sac(
 def _run_hc(
     args: TrainingArgs,
     env: Any,
-    exp_logger: logger.ExperimentLogger,
+    train_logger: logger.ExperimentLogger,
     delay: rewdelay.RewardDelay,
+    eval_env: Optional[Any] = None,
+    eval_logger: Optional[logger.ExperimentLogger] = None,
 ) -> None:
     """Train HC-decomposition SAC."""
     # IntervalPositionWrapper depends on info["interval_end"] from ImputeMissingRewardWrapper,
     # so it must be applied after that wrapper.
     _, max_delay = delay.range()
     env = hc.IntervalPositionWrapper(env, max_delay=max_delay)
+    if eval_env is not None:
+        eval_env = hc.IntervalPositionWrapper(eval_env, max_delay=max_delay)
     # Runner owns max_delay; strip from agent_kwargs so both IntervalPositionWrapper
     # and HCSAC (and its replay buffer) use the same value from the delay distribution.
     remaining_kwargs = {
@@ -332,21 +531,30 @@ def _run_hc(
     agent = hc.HCSAC(
         env,
         max_delay=max_delay,
-        learning_rate=args.sac_learning_rate,
-        buffer_size=args.sac_buffer_size,
-        batch_size=args.sac_batch_size,
-        gradient_steps=args.sac_gradient_steps,
         seed=args.seed,
-        verbose=1,
-        **remaining_kwargs,
+        **{**args.sac_kwargs, **remaining_kwargs},
     )
-    callback = _HCLoggingCallback(
+    training_callback = _RewardObsLoggingCallback(
         log_episode_frequency=args.log_episode_frequency,
-        exp_logger=exp_logger,
+        train_logger=train_logger,
+    )
+    eval_callback = (
+        StepEvalCallback(
+            eval_env,
+            args.eval_step_freq,
+            args.n_eval_episodes,
+            eval_logger,
+            algo_name="hc",
+        )
+        if eval_env is not None and eval_logger is not None
+        else None
+    )
+    callback = callbacks.CallbackList(
+        [cb for cb in (training_callback, eval_callback) if cb is not None]
     )
     agent.learn(
         total_timesteps=args.num_steps,
-        log_interval=args.log_episode_frequency,
+        log_interval=4,
         callback=callback,
         progress_bar=True,
     )
@@ -354,7 +562,7 @@ def _run_hc(
     logging.info("Model saved to %s/hc_model", args.output_dir)
 
 
-def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
+def _make_reward_model(args: TrainingArgs, env: Any) -> Optional[base.RewardModel]:
     """Instantiate the reward model specified in args.
 
     Args:
@@ -363,7 +571,13 @@ def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
             action_dim for parametric models such as DGRA.
     """
     if args.reward_model_type == "ircr":
-        return ircr.IRCRRewardModel(**args.reward_model_kwargs)
+        obs_dim = int(np.prod(env.observation_space.shape))
+        action_dim = int(np.prod(env.action_space.shape))
+        return ircr.IRCRRewardModel(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            **args.reward_model_kwargs,
+        )
     if args.reward_model_type == "dgra":
         obs_dim = int(np.prod(env.observation_space.shape))
         action_dim = int(np.prod(env.action_space.shape))
@@ -380,6 +594,8 @@ def _make_reward_model(args: TrainingArgs, env: Any) -> base.RewardModel:
             action_dim=action_dim,
             **args.reward_model_kwargs,
         )
+    if args.reward_model_type == "none":
+        return None
     raise ValueError(f"Unknown reward_model_type: {args.reward_model_type!r}")
 
 
@@ -420,7 +636,11 @@ def _run_remote(args: TrainingArgs) -> None:
     run(args)
 
 
-def _load_configs(config_path: str) -> List[TrainingArgs]:
+def _load_configs(
+    config_path: str,
+    exec_kwargs: Mapping[str, Any] = {},
+    common_kwargs: Mapping[str, Any] = {},
+) -> List[TrainingArgs]:
     """Load and expand experiment configs from a JSON file.
 
     The config must have a top-level "environments" list. Top-level fields
@@ -432,49 +652,44 @@ def _load_configs(config_path: str) -> List[TrainingArgs]:
     with open(config_path, encoding="utf-8") as config_file:
         raw = json.load(config_file)
 
-    top_level_output_dir: Optional[str] = raw.get("output_dir")
-    top_level_num_runs: int = raw.get("num_runs", 1)
-    shared_fields = {
-        key: value
-        for key, value in raw.items()
-        if key not in ("environments", "output_dir", "num_runs")
+    shared_fields = {key: value for key, value in raw.items() if key != "environments"}
+    filtered_exec = {
+        key: value for key, value in exec_kwargs.items() if value is not None
     }
-    global_defaults = {**_default_training_args(), **shared_fields}
+    filtered_common = {
+        key: value for key, value in common_kwargs.items() if value is not None
+    }
 
+    # Priority: CLI >> experiment >> env >> shared >> code defaults
+    global_chain = core.ArgChain.pinned(
+        [filtered_exec, filtered_common],
+        [shared_fields],
+    )
     return _expand_environments(
-        raw["environments"], global_defaults, top_level_num_runs, top_level_output_dir
+        raw["environments"],
+        global_chain,
     )
 
 
 def _expand_environments(
     environments: Sequence[Mapping[str, Any]],
-    global_defaults: Mapping[str, Any],
-    top_level_num_runs: int,
-    top_level_output_dir: Optional[str],
+    global_chain: core.ArgChain,
 ) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     global_exp_offset: int = 0
     for env_entry in environments:
-        env_label: str = env_entry.get("name", env_entry.get("env", ""))
-        env_num_runs: int = env_entry.get("num_runs", top_level_num_runs)
-        env_output_dir: Optional[str] = (
-            env_entry.get("output_dir") or top_level_output_dir
-        )
         env_fields = {
             key: value
             for key, value in env_entry.items()
-            if key not in ("name", "experiments", "output_dir", "num_runs")
+            if key not in ("experiments",)
         }
-        env_defaults = {**global_defaults, **env_fields}
+        env_chain = global_chain.prepend([env_fields])
         experiments = env_entry.get("experiments", [])
 
         configs.extend(
             _expand_experiments(
                 experiments,
-                env_defaults,
-                env_num_runs,
-                env_output_dir,
-                env_label=env_label,
+                env_chain,
                 global_exp_offset=global_exp_offset,
             )
         )
@@ -484,29 +699,30 @@ def _expand_environments(
 
 def _expand_experiments(
     experiments: Sequence[Mapping[str, Any]],
-    defaults: Mapping[str, Any],
-    top_level_num_runs: int,
-    top_level_output_dir: Optional[str],
-    env_label: Optional[str] = None,
+    base_chain: core.ArgChain,
     global_exp_offset: int = 0,
 ) -> List[TrainingArgs]:
     configs: List[TrainingArgs] = []
     for exp_idx, entry in enumerate(experiments):
-        num_runs: int = entry.get("num_runs", top_level_num_runs)
-        base_seed: Optional[int] = entry.get("seed")
-        experiment_fields = {
-            key: value
-            for key, value in entry.items()
-            if key not in ("num_runs", "output_dir", "seed")
-        }
-        merged_base = {**defaults, **experiment_fields}
+        defaults = _default_training_args()
+        chain = base_chain.prepend([entry])
         global_idx = global_exp_offset + exp_idx
-
+        num_runs: int = chain.get("num_runs", 1)
         for run_idx in range(num_runs):
-            merged = {**merged_base}
-            merged["seed"] = _resolve_seed(num_runs, base_seed, global_idx, run_idx)
+            merged = {key: chain.get(key, val) for key, val in defaults.items()}
+            merged["exp_name"] = f"exp-{global_idx:03d}"
+            merged["run_id"] = run_idx
+            merged["seed"] = _resolve_seed(
+                num_runs,
+                base_seed=chain.get("seed"),
+                exp_idx=global_idx,
+                run_idx=run_idx,
+            )
             merged["output_dir"] = _resolve_output_dir(
-                entry, exp_idx, run_idx, top_level_output_dir, env_label
+                exp_idx,
+                run_idx,
+                base_path=chain.get("output_dir"),
+                env_label=chain.get("env"),
             )
             configs.append(TrainingArgs(**merged))
     return configs
@@ -525,15 +741,12 @@ def _resolve_seed(
 
 
 def _resolve_output_dir(
-    entry: Mapping[str, Any],
     exp_idx: int,
     run_idx: int,
-    top_level_output_dir: Optional[str],
+    base_path: Optional[str] = None,
     env_label: Optional[str] = None,
 ) -> str:
-    if "output_dir" in entry:
-        return str(entry["output_dir"])
-    base = top_level_output_dir or os.path.join(tempfile.gettempdir(), "drmdp-batch")
+    base = base_path or os.path.join(tempfile.gettempdir(), "drmdp-batch")
     parts: List[str] = []
     if env_label:
         parts.append(env_label)
@@ -551,35 +764,87 @@ def _default_training_args() -> Mapping[str, Any]:
         "clear_buffer_on_update": False,
         "reward_model_kwargs": {},
         "num_steps": 50000,
-        "sac_learning_rate": 3e-4,
-        "sac_buffer_size": 100_000,
-        "sac_batch_size": 256,
-        "sac_gradient_steps": -1,
-        "log_episode_frequency": 10,
+        "sac_kwargs": {},
+        "log_episode_frequency": 1,
         "output_dir": tempfile.gettempdir(),
+        "exp_name": "exp-000",
+        "run_id": 0,
+        "eval_step_freq": 500,
+        "n_eval_episodes": 5,
         "seed": None,
         "agent_type": "sac",
         "agent_kwargs": {},
     }
 
 
+def _generate_configs(
+    single_cli: Mapping[str, Any],
+    exec_kwargs: Mapping[str, Any] = {},
+    common_kwargs: Mapping[str, Any] = {},
+) -> List[TrainingArgs]:
+    configs: List[TrainingArgs] = []
+    env_label: str = single_cli.get("env", "")
+    base_seed: Optional[int] = single_cli.get("seed")
+    output_dir: Optional[str] = single_cli.get("output_dir")
+    num_runs: int = exec_kwargs.get("num_runs") or 1
+    experiment_fields = {
+        key: value
+        for key, value in single_cli.items()
+        if key not in ("output_dir", "seed") and value is not None
+    }
+    cli_overrides = {k: v for k, v in common_kwargs.items() if v is not None}
+    chain = core.ArgChain([cli_overrides, experiment_fields, _default_training_args()])
+    defaults = _default_training_args()
+    for run_idx in range(num_runs):
+        merged = {key: chain.get(key, val) for key, val in defaults.items()}
+        merged["exp_name"] = "exp-000"
+        merged["run_id"] = run_idx
+        merged["seed"] = _resolve_seed(num_runs, base_seed, exp_idx=0, run_idx=run_idx)
+        merged["output_dir"] = _resolve_output_dir(
+            exp_idx=0,
+            run_idx=run_idx,
+            base_path=output_dir,
+            env_label=env_label,
+        )
+        configs.append(TrainingArgs(**merged))
+    return configs
+
+
 def main() -> None:
     """Parse command-line arguments and launch single or batch control loop."""
-    batch_cli = _parse_batch_cli()
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    common_args = parse_common_args()
+    common_dict = vars(common_args)
+    if common_dict.get("sac_kwargs") is not None:
+        common_dict["sac_kwargs"] = parse_reward_model_kwargs(common_dict["sac_kwargs"])
+    exec_args = parse_exec_args()
+    batch_cli = parse_batch_cli()
     if batch_cli.config_file is not None:
-        configs = _load_configs(batch_cli.config_file)
-        run_batch(
-            configs,
-            mode=batch_cli.mode,
-            max_workers=batch_cli.max_workers,
-            ray_address=batch_cli.ray_address,
+        logging.info("Parsed args: %s", batch_cli)
+        configs = _load_configs(
+            batch_cli.config_file,
+            exec_kwargs=vars(exec_args),
+            common_kwargs=common_dict,
         )
     else:
-        args = parse_args()
-        run(args)
+        single_cli = parse_single_cli()
+        logging.info("Parsed args: %s", single_cli)
+        configs = _generate_configs(
+            single_cli, exec_kwargs=vars(exec_args), common_kwargs=common_dict
+        )
+    run_batch(
+        configs,
+        mode=exec_args.mode,
+        max_workers=exec_args.max_workers,
+        ray_address=exec_args.ray_address,
+    )
 
 
-def parse_args() -> TrainingArgs:
+def parse_single_cli() -> Mapping[str, Any]:
     """Parse command-line arguments into a TrainingArgs instance."""
     parser = argparse.ArgumentParser(
         description="Off-policy SAC control with interleaved reward model learning"
@@ -606,20 +871,8 @@ def parse_args() -> TrainingArgs:
         "--reward-model-type",
         type=str,
         default="dgra",
-        choices=["ircr", "dgra", "grd"],
-        help="Reward model to use",
-    )
-    parser.add_argument(
-        "--update-every-n-steps",
-        type=int,
-        default=1000,
-        help="Update the reward model every N environment steps",
-    )
-    parser.add_argument(
-        "--clear-buffer-on-update",
-        action="store_true",
-        default=False,
-        help="Reset SAC replay buffer after each reward model update",
+        choices=["ircr", "dgra", "grd", "none"],
+        help="Reward model to use ('none' trains directly on delayed rewards)",
     )
     parser.add_argument(
         "--reward-model-kwarg",
@@ -630,48 +883,6 @@ def parse_args() -> TrainingArgs:
         help="Reward-model-specific keyword argument (repeatable). "
         "Values are parsed via ast.literal_eval; unrecognised literals "
         "are kept as strings. E.g. --reward-model-kwarg max_buffer_size=200",
-    )
-    parser.add_argument(
-        "--num-steps",
-        type=int,
-        default=50000,
-        help="Total environment steps to train for",
-    )
-    parser.add_argument(
-        "--sac-learning-rate",
-        type=float,
-        default=3e-4,
-        help="Learning rate for SAC actor and critic",
-    )
-    parser.add_argument(
-        "--sac-buffer-size",
-        type=int,
-        default=100000,
-        help="Capacity of SAC's replay buffer",
-    )
-    parser.add_argument(
-        "--sac-batch-size",
-        type=int,
-        default=256,
-        help="Mini-batch size for SAC gradient updates",
-    )
-    parser.add_argument(
-        "--sac-gradient-steps",
-        type=int,
-        default=-1,
-        help="Gradient steps per env step (-1 = match collected steps)",
-    )
-    parser.add_argument(
-        "--log-episode-frequency",
-        type=int,
-        default=10,
-        help="Log to ExperimentLogger every N episodes",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=tempfile.gettempdir(),
-        help="Directory for logs and saved model",
     )
     parser.add_argument(
         "--seed",
@@ -697,14 +908,98 @@ def parse_args() -> TrainingArgs:
         "are kept as strings. E.g. --agent-kwarg key=value",
     )
 
-    args, _ = parser.parse_known_args()
-    args_dict = vars(args)
+    args, argv = parser.parse_known_args()
+    common_args = parse_common_args(argv)
+    args_dict = {**vars(args), **vars(common_args)}
     args_dict["reward_model_kwargs"] = parse_reward_model_kwargs(
         args_dict["reward_model_kwargs"]
     )
     args_dict["agent_kwargs"] = parse_reward_model_kwargs(args_dict["agent_kwargs"])
+    args_dict["sac_kwargs"] = parse_reward_model_kwargs(
+        args_dict.get("sac_kwargs") or []
+    )
     args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
-    return TrainingArgs(**args_dict)
+    return args_dict
+
+
+def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse command-line arguments into a TrainingArgs instance."""
+    parser = argparse.ArgumentParser(
+        description="Off-policy SAC control with interleaved reward model learning"
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Total environment steps to train for",
+    )
+    parser.add_argument(
+        "--update-every-n-steps",
+        type=int,
+        default=1000,
+        help="Update the reward model every N environment steps",
+    )
+    parser.add_argument(
+        "--clear-buffer-on-update",
+        action="store_true",
+        default=False,
+        help="Reset SAC replay buffer after each reward model update",
+    )
+    parser.add_argument(
+        "--sac-kwarg",
+        action="append",
+        dest="sac_kwargs",
+        default=None,
+        metavar="KEY=VALUE",
+        help="SAC constructor keyword argument (repeatable). "
+        "Values are parsed via ast.literal_eval; unrecognised literals "
+        "are kept as strings. E.g. --sac-kwarg buffer_size=100000 --sac-kwarg ent_coef=auto_0.1",
+    )
+    parser.add_argument(
+        "--log-episode-frequency",
+        type=int,
+        default=None,
+        help="Log to ExperimentLogger every N completed episodes (default: 1, every episode)",
+    )
+    parser.add_argument(
+        "--eval-step-freq",
+        type=int,
+        default=None,
+        help="Evaluate the greedy policy every N env steps (0 = disabled)",
+    )
+    parser.add_argument(
+        "--n-eval-episodes",
+        type=int,
+        default=None,
+        help="Number of evaluation episodes per step-based evaluation",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for logs and saved model",
+    )
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
+def parse_exec_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Off-policy SAC control with interleaved reward model learning"
+    )
+    parser.add_argument(
+        "--mode", type=str, default="debug", choices=["debug", "local", "ray"]
+    )
+    parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=None,
+        help="Number of runs",
+    )
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--ray-address", type=str, default=None)
+    args, _ = parser.parse_known_args(argv)
+    return args
 
 
 def parse_reward_model_kwargs(
@@ -727,15 +1022,10 @@ def parse_reward_model_kwargs(
     return kwargs
 
 
-def _parse_batch_cli() -> argparse.Namespace:
+def parse_batch_cli() -> argparse.Namespace:
     """Parse only batch-mode flags; single-run flags are ignored here."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config-file", type=str, default=None)
-    parser.add_argument(
-        "--mode", type=str, default="debug", choices=["debug", "local", "ray"]
-    )
-    parser.add_argument("--max-workers", type=int, default=None)
-    parser.add_argument("--ray-address", type=str, default=None)
     args, _ = parser.parse_known_args()
     return args
 

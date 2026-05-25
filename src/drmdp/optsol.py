@@ -26,7 +26,7 @@ class MultivariateNormal:
         perturbed_eig_values = np.maximum(
             eig_values, np.array([noise] * len(eig_values))
         )
-        return eig_matrix * np.diag(perturbed_eig_values) * np.linalg.inv(eig_matrix)
+        return eig_matrix @ np.diag(perturbed_eig_values) @ np.linalg.inv(eig_matrix)
 
     @classmethod
     def least_squares(

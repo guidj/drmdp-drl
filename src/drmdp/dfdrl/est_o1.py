@@ -655,7 +655,11 @@ def train(
 
 def experiment(args: TrainingArgs):
     """Run a single training experiment for the given configuration."""
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     # Create environment
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
     logging.info("Spec: %s", args)
@@ -729,7 +733,11 @@ def _parse_kwargs(pairs: Optional[List[str]]) -> Dict[str, Any]:
 def main():
     """Parse args and launch Ray training runs."""
     args = parse_args()
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     ray_env: Dict[str, Any] = {}
     with ray.init(runtime_env=ray_env):

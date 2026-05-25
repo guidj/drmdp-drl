@@ -38,6 +38,17 @@ class TestMultivariateNormalPerturbCovarianceMatrix:
         eigenvalues = np.linalg.eigvalsh(perturbed)
         assert np.all(eigenvalues >= noise - 1e-9)
 
+    def test_non_diagonal_covariance_preserved(self):
+        cov = np.array([[2.0, 0.5], [0.5, 1.0]])
+        perturbed = optsol.MultivariateNormal.perturb_covariance_matrix(cov, noise=1e-6)
+        np.testing.assert_allclose(perturbed, cov, atol=1e-6)
+
+    def test_non_diagonal_off_diagonal_nonzero(self):
+        cov = np.array([[2.0, 0.5], [0.5, 1.0]])
+        perturbed = optsol.MultivariateNormal.perturb_covariance_matrix(cov, noise=1e-6)
+        assert abs(perturbed[0, 1]) > 0.1
+        assert abs(perturbed[1, 0]) > 0.1
+
 
 class TestMultivariateNormalLeastSquares:
     def test_basic_solution_pseudo_inverse(self):

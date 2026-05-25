@@ -16,5 +16,5 @@ ray job submit \
         --num-episodes=100 \
         --output-dir=$HOME/fs/$BASE/workflows/controljob/logs/$TIMESTAMP \
         --task-prefix $TIMESTAMP \
-        --log-episode-frequency=5 \
+        --log-step-frequency=5 \
         --use-seed
