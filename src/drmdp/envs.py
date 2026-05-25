@@ -100,126 +100,6 @@ class UniversalNonStationaryMuJoCoWrapper(gym.Wrapper):
         return self.env.step(action)
 
 
-def make_non_stationary_mujoco_env(env_id, render_mode=None, **kwargs):
-    """
-    Creates a Gymnasium MuJoCo v5 environment and wraps it with environment-specific
-    non-stationary parameters. Fully supports v5 custom kwargs (e.g., xml_file).
-
-    Args:
-        env_id (str): The Gymnasium environment ID (e.g., 'HalfCheetah-v5').
-        render_mode (str): Render mode for the environment.
-        **kwargs: Additional arguments for gym.make() (perfect for v5's xml_file or reset_noise_scale).
-
-    Returns:
-        gym.Env: The wrapped, non-stationary environment.
-    """
-
-    # Strip the version number to match the base environment name
-    base_env_name = re.sub(r"-v\d+", "", env_id)
-
-    # Define heuristic configurations based on physical stability limits for v5
-    configs = {
-        # Highly stable crawlers/quadrupeds
-        "Ant": {
-            "mass_variance": 0.2,
-            "friction_variance": 0.2,
-            "change_gravity": True,
-            "max_gravity_shift": 1.0,
-        },
-        "HalfCheetah": {
-            "mass_variance": 0.2,
-            "friction_variance": 0.2,
-            "change_gravity": True,
-            "max_gravity_shift": 1.0,
-        },
-        "Swimmer": {
-            "mass_variance": 0.2,
-            "friction_variance": 0.2,
-            "change_gravity": True,
-            "max_gravity_shift": 0.5,
-        },
-        # Bipedal/Monopedal hoppers
-        "Hopper": {
-            "mass_variance": 0.1,
-            "friction_variance": 0.1,
-            "change_gravity": True,
-            "max_gravity_shift": 0.3,
-        },
-        "Walker2d": {
-            "mass_variance": 0.1,
-            "friction_variance": 0.1,
-            "change_gravity": True,
-            "max_gravity_shift": 0.3,
-        },
-        # Highly complex/unstable balance
-        "Humanoid": {
-            "mass_variance": 0.05,
-            "friction_variance": 0.05,
-            "change_gravity": False,
-        },
-        "HumanoidStandup": {
-            "mass_variance": 0.05,
-            "friction_variance": 0.05,
-            "change_gravity": False,
-        },
-        # Strict balancing tasks
-        "InvertedPendulum": {
-            "mass_variance": 0.1,
-            "friction_variance": 0.1,
-            "change_gravity": False,
-        },
-        "InvertedDoublePendulum": {
-            "mass_variance": 0.05,
-            "friction_variance": 0.05,
-            "change_gravity": False,
-        },
-        # Pinned manipulation tasks (Pusher-v5 has corrected mass values, making it much more stable)
-        "Pusher": {
-            "mass_variance": 0.15,
-            "friction_variance": 0.15,
-            "change_gravity": True,
-            "max_gravity_shift": 0.3,
-        },
-        "Reacher": {
-            "mass_variance": 0.15,
-            "friction_variance": 0.15,
-            "change_gravity": True,
-            "max_gravity_shift": 0.3,
-        },
-    }
-
-    # Default fallback for unrecognized or custom MuJoCo environments
-    default_config = {
-        "mass_variance": 0.1,
-        "friction_variance": 0.1,
-        "change_gravity": False,
-    }
-
-    env_config = configs.get(base_env_name, default_config)
-
-    # Create the v5 base environment, passing through any specific kwargs
-    base_env = gym.make(env_id, render_mode=render_mode, **kwargs)
-
-    # Wrap it
-    wrapped_env = UniversalNonStationaryMuJoCoWrapper(
-        base_env,
-        change_mass=True,
-        mass_variance=env_config.get("mass_variance"),
-        change_friction=True,
-        friction_variance=env_config.get("friction_variance"),
-        change_gravity=env_config.get("change_gravity"),
-        gravity_drift_rate=0.01,
-        max_gravity_shift=env_config.get("max_gravity_shift", 0.0),
-    )
-
-    return wrapped_env
-
-
-# ---------------------------------------------------------------------------
-# Classic control non-stationarity
-# ---------------------------------------------------------------------------
-
-
 class ClassicControlNonStationaryWrapper(gym.Wrapper):
     """Gym wrapper that injects episodic non-stationarity into classic control envs.
 
@@ -260,6 +140,112 @@ class ClassicControlNonStationaryWrapper(gym.Wrapper):
         if self._recompute is not None:
             self._recompute(unwrapped)
         return self.env.reset(seed=seed, options=options)
+
+
+# ---------------------------------------------------------------------------
+# Module-level functions and constants
+# ---------------------------------------------------------------------------
+
+_MUJOCO_CONFIGS: Mapping[str, Mapping[str, Any]] = {
+    "Ant": {
+        "mass_variance": 0.2,
+        "friction_variance": 0.2,
+        "change_gravity": True,
+        "max_gravity_shift": 1.0,
+    },
+    "HalfCheetah": {
+        "mass_variance": 0.2,
+        "friction_variance": 0.2,
+        "change_gravity": True,
+        "max_gravity_shift": 1.0,
+    },
+    "Swimmer": {
+        "mass_variance": 0.2,
+        "friction_variance": 0.2,
+        "change_gravity": True,
+        "max_gravity_shift": 0.5,
+    },
+    "Hopper": {
+        "mass_variance": 0.1,
+        "friction_variance": 0.1,
+        "change_gravity": True,
+        "max_gravity_shift": 0.3,
+    },
+    "Walker2d": {
+        "mass_variance": 0.1,
+        "friction_variance": 0.1,
+        "change_gravity": True,
+        "max_gravity_shift": 0.3,
+    },
+    "Humanoid": {
+        "mass_variance": 0.05,
+        "friction_variance": 0.05,
+        "change_gravity": False,
+    },
+    "HumanoidStandup": {
+        "mass_variance": 0.05,
+        "friction_variance": 0.05,
+        "change_gravity": False,
+    },
+    "InvertedPendulum": {
+        "mass_variance": 0.1,
+        "friction_variance": 0.1,
+        "change_gravity": False,
+    },
+    "InvertedDoublePendulum": {
+        "mass_variance": 0.05,
+        "friction_variance": 0.05,
+        "change_gravity": False,
+    },
+    "Pusher": {
+        "mass_variance": 0.15,
+        "friction_variance": 0.15,
+        "change_gravity": True,
+        "max_gravity_shift": 0.3,
+    },
+    "Reacher": {
+        "mass_variance": 0.15,
+        "friction_variance": 0.15,
+        "change_gravity": True,
+        "max_gravity_shift": 0.3,
+    },
+}
+
+_MUJOCO_DEFAULT_CONFIG: Mapping[str, Any] = {
+    "mass_variance": 0.1,
+    "friction_variance": 0.1,
+    "change_gravity": False,
+}
+
+
+def make_non_stationary_mujoco_env(
+    env_id: str,
+    render_mode: Optional[str] = None,
+    **kwargs: Any,
+) -> UniversalNonStationaryMuJoCoWrapper:
+    """Create a MuJoCo environment with non-stationary dynamics.
+
+    Args:
+        env_id: Gymnasium environment ID (e.g. ``'HalfCheetah-v5'``).
+        render_mode: Render mode forwarded to ``gym.make``.
+        **kwargs: Additional keyword arguments forwarded to ``gym.make``.
+
+    Returns:
+        The wrapped environment.
+    """
+    base_env_name = re.sub(r"-v\d+", "", env_id)
+    env_config = _MUJOCO_CONFIGS.get(base_env_name, _MUJOCO_DEFAULT_CONFIG)
+    base_env = gym.make(env_id, render_mode=render_mode, **kwargs)
+    return UniversalNonStationaryMuJoCoWrapper(
+        base_env,
+        change_mass=True,
+        mass_variance=env_config.get("mass_variance"),
+        change_friction=True,
+        friction_variance=env_config.get("friction_variance"),
+        change_gravity=env_config.get("change_gravity"),
+        gravity_drift_rate=0.01,
+        max_gravity_shift=env_config.get("max_gravity_shift", 0.0),
+    )
 
 
 def _recompute_cartpole(unwrapped: Any) -> None:
@@ -340,3 +326,28 @@ def make_non_stationary_classic_env(
         param_variances=config["param_variances"],
         recompute=config.get("recompute"),
     )
+
+
+def make_env(env_id: str, non_stationary: bool = False, **kwargs: Any) -> gym.Env:
+    """Create a Gymnasium environment, optionally with non-stationary dynamics.
+
+    When ``non_stationary`` is False the environment is created via
+    ``gym.make`` with no additional wrappers.  When True, the appropriate
+    non-stationary wrapper is applied based on the environment type (MuJoCo
+    or classic control).
+
+    Args:
+        env_id: Gymnasium environment ID.
+        non_stationary: Wrap with a non-stationary dynamics wrapper.
+        **kwargs: Forwarded to ``gym.make`` (e.g. ``max_episode_steps``).
+
+    Returns:
+        The (optionally wrapped) environment.
+    """
+    if not non_stationary:
+        return gym.make(env_id, **kwargs)
+
+    base_env_name = re.sub(r"-v\d+", "", env_id)
+    if base_env_name in _CLASSIC_CONTROL_CONFIGS:
+        return make_non_stationary_classic_env(env_id, **kwargs)
+    return make_non_stationary_mujoco_env(env_id, **kwargs)

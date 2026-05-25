@@ -39,13 +39,12 @@ import tempfile
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-import gymnasium as gym
 import numpy as np
 import ray
 from stable_baselines3.common import callbacks
 from stable_baselines3.common import evaluation as sb3_evaluation
 
-from drmdp import core, logger, ray_utils, rewdelay
+from drmdp import core, envs, logger, ray_utils, rewdelay
 from drmdp.control import base, dgra, grd, hc, ircr
 
 
@@ -85,6 +84,8 @@ class TrainingArgs:
             Used when ``agent_type="hc"`` (e.g. ``history_hidden_size``,
             ``reg_lambda``). ``max_delay`` is derived from the delay
             distribution and cannot be overridden here.
+        non_stationary: Wrap the environment with non-stationary dynamics
+            (episodic mass/friction randomisation, per-step gravity drift).
     """
 
     env: str
@@ -105,6 +106,7 @@ class TrainingArgs:
     sac_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     env_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    non_stationary: bool = False
 
 
 class RewardModelUpdateCallback(callbacks.BaseCallback):
@@ -421,7 +423,7 @@ def run(args: TrainingArgs) -> None:
     logging.info("Training args: %s", args)
 
     delay = rewdelay.ClippedPoissonDelay(args.delay)
-    env = gym.make(args.env, **args.env_kwargs)
+    env = envs.make_env(args.env, non_stationary=args.non_stationary, **args.env_kwargs)
     env = core.EnvMonitorWrapper(env)
     env = rewdelay.DelayedRewardWrapper(env, delay)
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
@@ -433,7 +435,11 @@ def run(args: TrainingArgs) -> None:
         eval_env: Optional[Any] = None
         eval_logger: Optional[logger.ExperimentLogger] = None
         if args.eval_step_freq > 0:
-            eval_env = core.EnvMonitorWrapper(gym.make(args.env, **args.env_kwargs))
+            eval_env = core.EnvMonitorWrapper(
+                envs.make_env(
+                    args.env, non_stationary=args.non_stationary, **args.env_kwargs
+                )
+            )
             eval_logger = stack.enter_context(
                 logger.ExperimentLogger(
                     args.output_dir,
@@ -774,6 +780,7 @@ def _default_training_args() -> Mapping[str, Any]:
         "seed": None,
         "agent_type": "sac",
         "agent_kwargs": {},
+        "non_stationary": False,
     }
 
 
@@ -906,6 +913,12 @@ def parse_single_cli() -> Mapping[str, Any]:
         help="Agent-specific keyword argument (repeatable). "
         "Values are parsed via ast.literal_eval; unrecognised literals "
         "are kept as strings. E.g. --agent-kwarg key=value",
+    )
+    parser.add_argument(
+        "--non-stationary",
+        action="store_true",
+        default=False,
+        help="Wrap environment with non-stationary dynamics (episodic mass/friction/gravity perturbation)",
     )
 
     args, argv = parser.parse_known_args()
