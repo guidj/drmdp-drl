@@ -61,7 +61,8 @@ class TrainingArgs:
         model_type: Model architecture identifier ("mlp").
         env: Gymnasium environment name.
         max_episode_steps: Maximum steps per episode before truncation.
-        delay: Mean reward delay (Poisson parameter).
+        min_delay: Minimum reward delay (Uniform distribution parameter).
+        max_delay: Maximum reward delay (Uniform distribution parameter).
         train_epochs: Number of training epochs.
         buffer_num_steps: Number of environment steps to collect per run.
         batch_size: Mini-batch size for training and evaluation.
@@ -80,7 +81,8 @@ class TrainingArgs:
     model_type: str
     env: str
     max_episode_steps: int
-    delay: int
+    min_delay: int
+    max_delay: int
     train_epochs: int
     buffer_num_steps: int
     batch_size: int
@@ -937,17 +939,16 @@ def experiment(args: TrainingArgs):
     env = gym.make(args.env, max_episode_steps=args.max_episode_steps)
     logging.info("Spec: %s", args)
 
-    delay = rewdelay.ClippedPoissonDelay(args.delay, min_delay=2)
-    _, max_delay = delay.range()
+    delay = rewdelay.UniformDelay(min_delay=args.min_delay, max_delay=args.max_delay)
     logging.info(
         "Collecting %d steps with delay=%d...",
-        args.buffer_num_steps * max_delay,
-        args.delay,
+        args.buffer_num_steps * delay.max_delay,
+        delay,
     )
     training_buffer = create_training_buffer(
         env,
         delay=delay,
-        buffer_num_steps=args.buffer_num_steps * max_delay,
+        buffer_num_steps=args.buffer_num_steps * delay.max_delay,
         seed=args.seed,
     )
     logging.info("Created %d training examples", len(training_buffer))
@@ -970,7 +971,7 @@ def experiment(args: TrainingArgs):
             log_episode_frequency=args.log_episode_frequency,
             output_dir=args.output_dir,
             seed=args.seed,
-            max_seq_len=max_delay,
+            max_seq_len=delay.max_delay,
             noise_ema_alpha=args.noise_ema_alpha,
         )
 
@@ -1055,10 +1056,16 @@ def parse_args() -> TrainingArgs:
         help="Maximum steps per episode",
     )
     parser.add_argument(
-        "--delay",
+        "--min-delay",
         type=int,
         default=3,
-        help="Fixed delay for reward feedback",
+        help="Minimum delay for reward feedback",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=int,
+        default=5,
+        help="Maximum delay for reward feedback",
     )
     parser.add_argument(
         "--train-epochs",

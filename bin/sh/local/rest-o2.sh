@@ -13,7 +13,8 @@ ray job submit \
     --runtime-env-json='{"py_modules":["src/drmdp"], "excludes": [".git"]}' \
     -- \
     python $PARENT_DIR/src/$BASE/dfdrl/est_o2.py \
-        --delay=3 \
+        --min-delay 3 \
+        --max-delay 5 \
         --buffer-num-steps=20000 \
         --train-epochs=1000 \
         --env "Hopper-v5" \

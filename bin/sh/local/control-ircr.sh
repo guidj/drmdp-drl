@@ -11,7 +11,8 @@ mkdir -p $OUTPUT_DIR
 
 python $PARENT_DIR/src/$BASE/control/runner.py \
     --env MountainCarContinuous-v0 \
-    --delay 3 \
+    --min-delay 3 \
+    --max-delay 5 \
     --num-steps 50000 \
     --reward-model-type ircr \
     --update-every-n-steps 1000 \

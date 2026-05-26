@@ -336,7 +336,8 @@ class TestRun:
     def _base_args(self, output_dir: str) -> runner.TrainingArgs:
         return runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=1,
+            max_delay=1,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="ircr",
             update_every_n_steps=50,
@@ -750,7 +751,8 @@ class TestMakeRewardModel:
     def test_ircr_type_returns_ircr_instance(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=2,
+            max_delay=3,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="ircr",
             reward_model_kwargs={"fifo_capacity": 500, "heap_capacity": 3},
@@ -770,7 +772,8 @@ class TestMakeRewardModel:
     def test_none_type_returns_none(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=2,
+            max_delay=3,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="none",
             reward_model_kwargs={},
@@ -789,7 +792,8 @@ class TestMakeRewardModel:
     def test_unknown_type_raises_value_error(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=2,
+            max_delay=3,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="unknown_model",
             reward_model_kwargs={},
@@ -809,7 +813,8 @@ class TestMakeRewardModel:
     def test_dgra_type_returns_dgra_instance(self, tmp_path, pendulum_env):
         args = runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=2,
+            max_delay=3,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="dgra",
             reward_model_kwargs={},
@@ -830,7 +835,8 @@ class TestMakeRewardModel:
         """DGRARewardModel constructed from Pendulum env accepts its obs/action dims."""
         args = runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=2,
+            max_delay=3,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="dgra",
             reward_model_kwargs={},
@@ -978,12 +984,12 @@ class TestGenerateConfigs:
         single_cli = {
             **self._make_single_cli(tmp_path),
             "env": "Pendulum-v1",
-            "delay": 7,
+            "max_delay": 7,
             "reward_model_type": "none",
         }
         configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
         assert configs[0].env == "Pendulum-v1"
-        assert configs[0].delay == 7
+        assert configs[0].max_delay == 7
         assert configs[0].reward_model_type == "none"
 
     def test_exp_name_and_run_id_set_in_single_cli_mode(self, tmp_path):
@@ -1001,7 +1007,8 @@ class TestGenerateConfigs:
         """
         return {
             "env": "MountainCarContinuous-v0",
-            "delay": 3,
+            "min_delay": 3,
+            "min_delay": 5,
             "env_kwargs": {"max_episode_steps": 2500},
             "reward_model_type": "ircr",
             "update_every_n_steps": 1000,
@@ -1021,14 +1028,14 @@ class TestLoadConfigs:
     def test_single_experiment_single_run(self, tmp_path):
         """One experiment with num_runs=1 produces exactly one TrainingArgs."""
         config = _make_single_env_config(
-            extra_env_fields={"delay": 2},
+            extra_env_fields={"min_delay": 2},
             output_dir=str(tmp_path),
             num_runs=1,
         )
         configs = runner._load_configs(_write_config(tmp_path, config))
         assert len(configs) == 1
         assert configs[0].env == "Pendulum-v1"
-        assert configs[0].delay == 2
+        assert configs[0].min_delay == 2
 
     def test_num_runs_expands_entries(self, tmp_path):
         """num_runs=3 expands one experiment into three TrainingArgs."""
@@ -1134,25 +1141,25 @@ class TestLoadConfigs:
         """Top-level fields serve as defaults for all environments and experiments."""
         config = {
             "output_dir": str(tmp_path),
-            "delay": 10,
+            "max_delay": 10,
             "environments": [
                 {"env": "Pendulum-v1", "experiments": [{}, {}]},
             ],
         }
         configs = runner._load_configs(_write_config(tmp_path, config))
-        assert all(cfg.delay == 10 for cfg in configs)
+        assert all(cfg.max_delay == 10 for cfg in configs)
 
     def test_env_field_overrides_top_level_default(self, tmp_path):
         """An environment entry can override a top-level shared field."""
         config = {
             "output_dir": str(tmp_path),
-            "delay": 5,
+            "min_delay": 5,
             "environments": [
-                {"env": "Pendulum-v1", "delay": 2, "experiments": [{}]},
+                {"env": "Pendulum-v1", "min_delay": 2, "experiments": [{}]},
             ],
         }
         configs = runner._load_configs(_write_config(tmp_path, config))
-        assert configs[0].delay == 2
+        assert configs[0].min_delay == 2
 
     def test_experiment_field_overrides_env_default(self, tmp_path):
         """An experiment entry can override an environment-level field."""
@@ -1161,13 +1168,13 @@ class TestLoadConfigs:
             "environments": [
                 {
                     "env": "Pendulum-v1",
-                    "delay": 5,
-                    "experiments": [{"delay": 1}],
+                    "min_delay": 5,
+                    "experiments": [{"min_delay": 2}],
                 }
             ],
         }
         configs = runner._load_configs(_write_config(tmp_path, config))
-        assert configs[0].delay == 1
+        assert configs[0].min_delay == 2
 
     def test_returns_training_args_instances(self, tmp_path):
         """All returned objects are TrainingArgs dataclass instances."""
@@ -1269,7 +1276,8 @@ class TestRunBatch:
         configs = [
             runner.TrainingArgs(
                 env="Pendulum-v1",
-                delay=1,
+                min_delay=2,
+                max_delay=3,
                 env_kwargs={"max_episode_steps": 50},
                 reward_model_type="ircr",
                 update_every_n_steps=50,
@@ -1294,7 +1302,8 @@ class TestRunBatch:
         configs = [
             runner.TrainingArgs(
                 env="Pendulum-v1",
-                delay=1,
+                min_delay=2,
+                max_delay=3,
                 env_kwargs={"max_episode_steps": 50},
                 reward_model_type="ircr",
                 update_every_n_steps=50,
@@ -1335,7 +1344,8 @@ class TestRunBatch:
         """An unrecognised mode string falls through to the sequential else branch."""
         config = runner.TrainingArgs(
             env="Pendulum-v1",
-            delay=1,
+            min_delay=2,
+            max_delay=3,
             env_kwargs={"max_episode_steps": 50},
             reward_model_type="ircr",
             update_every_n_steps=50,
