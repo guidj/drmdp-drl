@@ -483,7 +483,7 @@ class HCReplayBuffer(buffers.ReplayBuffer):
         done: np.ndarray,
         infos: List[Dict[str, Any]],
     ) -> None:
-        # Snapshot history BEFORE super().add() so the stored window is
+        # Snapshot history before super().add() so the stored window is
         # τ_{t_i:t} (excludes the current step).  Right-align into the
         # fixed-width array so the GRU sees zeros then real pairs in order.
         pos = self.pos
@@ -504,8 +504,6 @@ class HCReplayBuffer(buffers.ReplayBuffer):
 
         super().add(obs, next_obs, action, reward, done, infos)
 
-        # Use info["interval_end"] rather than reward != 0 so that
-        # zero-sum signal intervals reset the deques correctly.
         for env_idx in range(self.n_envs):
             if infos[env_idx].get("interval_end", False) or bool(done_arr[env_idx]):
                 self._recent_sa[env_idx].clear()
