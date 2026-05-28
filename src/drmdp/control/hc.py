@@ -150,6 +150,9 @@ class HCSAC(SAC):
         grad_clip_norm: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
+        # SB3's load() passes policy= from the saved checkpoint; drop it so
+        # the hardcoded HCSACPolicy below doesn't conflict.
+        kwargs.pop("policy", None)
         policy_kwargs = kwargs.pop("policy_kwargs", {})
         policy_kwargs["max_delay"] = max_delay
         policy_kwargs["history_hidden_size"] = history_hidden_size

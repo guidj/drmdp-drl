@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import ray
-from stable_baselines3.common import callbacks
+from stable_baselines3.common import base_class, callbacks
 from stable_baselines3.common import evaluation as sb3_evaluation
 
 from drmdp import core, envs, logger, ray_utils, rewdelay
@@ -512,7 +512,7 @@ def _run_sac(
         callback=callback,
         progress_bar=True,
     )
-    sac.save(os.path.join(args.output_dir, "sac_model"))
+    save_model(sac, path=os.path.join(args.output_dir, "sac_model.zip"))
     logging.info("Model saved to %s/sac_model", args.output_dir)
 
 
@@ -564,7 +564,7 @@ def _run_hc(
         callback=callback,
         progress_bar=True,
     )
-    agent.save(os.path.join(args.output_dir, "hc_model"))
+    save_model(agent, path=os.path.join(args.output_dir, "hc_model.zip"))
     logging.info("Model saved to %s/hc_model", args.output_dir)
 
 
@@ -816,6 +816,18 @@ def _generate_configs(
         )
         configs.append(TrainingArgs(**merged))
     return configs
+
+
+def save_model(model: base_class.BaseAlgorithm, path: str) -> None:
+    import io
+
+    import tensorflow as tf
+
+    model_bytes = io.BytesIO()
+    model.save(model_bytes)
+
+    with tf.io.gfile.GFile(path, "wb") as writable:
+        writable.write(model_bytes.getvalue())
 
 
 def main() -> None:
