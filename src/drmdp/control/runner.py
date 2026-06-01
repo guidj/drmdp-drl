@@ -45,7 +45,7 @@ from stable_baselines3.common import base_class, callbacks
 from stable_baselines3.common import evaluation as sb3_evaluation
 
 from drmdp import core, envs, logger, ray_utils, rewdelay
-from drmdp.control import base, dgra, grd, hc, ircr
+from drmdp.control import base, dgra, dsa, grd, hc, ircr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -449,7 +449,9 @@ def run(args: TrainingArgs) -> None:
                     filename="eval-logs.jsonl",
                 )
             )
-        if args.agent_type == "hc":
+        if args.agent_type == "dsa":
+            _run_dsa(args, env, train_logger, eval_env, eval_logger)
+        elif args.agent_type == "hc":
             _run_hc(args, env, train_logger, eval_env, eval_logger)
         else:
             _run_sac(args, env, train_logger, eval_env, eval_logger)
@@ -566,6 +568,130 @@ def _run_hc(
     )
     save_model(agent, path=os.path.join(args.output_dir, "hc_model.zip"))
     logging.info("Model saved to %s/hc_model", args.output_dir)
+
+
+def _run_dsa(
+    args: TrainingArgs,
+    env: Any,
+    train_logger: logger.ExperimentLogger,
+    eval_env: Optional[Any] = None,
+    eval_logger: Optional[logger.ExperimentLogger] = None,
+) -> None:
+    """Train DSA: transformer history encoder + DGRA + SAC."""
+    import sbx
+
+    agent_kw = dict(args.agent_kwargs)
+    latent_dim = int(agent_kw.pop("latent_dim", 32))
+    history_mode = str(agent_kw.pop("history_mode", "per_interval"))
+    d_model = int(agent_kw.pop("d_model", 64))
+    nhead = int(agent_kw.pop("nhead", 4))
+    num_encoder_layers = int(agent_kw.pop("num_encoder_layers", 2))
+    predictor_hidden_dim = int(agent_kw.pop("predictor_hidden_dim", 256))
+    encoder_update_every_n_steps = int(
+        agent_kw.pop("encoder_update_every_n_steps", 2000)
+    )
+    encoder_train_epochs = int(agent_kw.pop("encoder_train_epochs", 5))
+    encoder_batch_size = int(agent_kw.pop("encoder_batch_size", 64))
+    encoder_learning_rate = float(agent_kw.pop("encoder_learning_rate", 1e-3))
+    max_history_buffer_size = int(agent_kw.pop("max_history_buffer_size", 10000))
+
+    action_dim = int(np.prod(env.action_space.shape))
+
+    env = hc.IntervalPositionWrapper(env, max_delay=args.max_delay)
+    if eval_env is not None:
+        eval_env = hc.IntervalPositionWrapper(eval_env, max_delay=args.max_delay)
+
+    obs_dim_with_pos = int(np.prod(env.observation_space.shape))
+    sa_dim = obs_dim_with_pos + action_dim
+
+    env = dsa.LatentAugmentedObsWrapper(env, latent_dim=latent_dim)
+
+    history_encoder = dsa.HistoryEncoder(
+        sa_dim=sa_dim,
+        obs_dim=obs_dim_with_pos,
+        action_dim=action_dim,
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=num_encoder_layers,
+        latent_dim=latent_dim,
+        max_len=args.max_delay,
+        predictor_hidden_dim=predictor_hidden_dim,
+    )
+
+    reward_model: Optional[base.RewardModel] = None
+    if args.reward_model_type != "none":
+        reward_model = dgra.DGRARewardModel(
+            obs_dim=obs_dim_with_pos,
+            action_dim=action_dim,
+            **args.reward_model_kwargs,
+        )
+
+    sac = sbx.SAC(
+        "MlpPolicy",
+        env,
+        replay_buffer_class=dsa.DSAReplayBuffer,
+        replay_buffer_kwargs={
+            "max_delay": args.max_delay,
+            "history_encoder": history_encoder,
+            "reward_model": reward_model,
+            "raw_obs_dim": obs_dim_with_pos,
+            "history_mode": history_mode,
+        },
+        seed=args.seed,
+        **args.sac_kwargs,
+    )
+
+    training_callback = dsa.DSACallback(
+        history_encoder=history_encoder,
+        reward_model=reward_model,
+        max_delay=args.max_delay,
+        raw_obs_dim=obs_dim_with_pos,
+        history_mode=history_mode,
+        encoder_update_every_n_steps=encoder_update_every_n_steps,
+        encoder_train_epochs=encoder_train_epochs,
+        encoder_batch_size=encoder_batch_size,
+        encoder_learning_rate=encoder_learning_rate,
+        reward_model_update_every_n_steps=args.update_every_n_steps,
+        clear_buffer_on_update=args.clear_buffer_on_update,
+        log_episode_frequency=args.log_episode_frequency,
+        train_logger=train_logger,
+        max_history_buffer_size=max_history_buffer_size,
+    )
+
+    if eval_env is not None:
+        eval_env = dsa.LatentAugmentedObsWrapper(eval_env, latent_dim=latent_dim)
+        eval_env = dsa.DSAEvalWrapper(
+            eval_env,
+            history_encoder=history_encoder,
+            max_delay=args.max_delay,
+            latent_dim=latent_dim,
+            obs_dim_before_augmentation=obs_dim_with_pos,
+            action_dim=action_dim,
+            history_mode=history_mode,
+        )
+
+    eval_callback = (
+        StepEvalCallback(
+            eval_env,
+            args.eval_step_freq,
+            args.n_eval_episodes,
+            eval_logger,
+            algo_name=f"dsa/{args.reward_model_type}",
+        )
+        if eval_env is not None and eval_logger is not None
+        else None
+    )
+    callback = callbacks.CallbackList(
+        [cb for cb in (training_callback, eval_callback) if cb is not None]
+    )
+    sac.learn(
+        total_timesteps=args.num_steps,
+        log_interval=4,
+        callback=callback,
+        progress_bar=True,
+    )
+    save_model(sac, path=os.path.join(args.output_dir, "dsa_model.zip"))
+    logging.info("Model saved to %s/dsa_model", args.output_dir)
 
 
 def _make_reward_model(args: TrainingArgs, env: Any) -> Optional[base.RewardModel]:
@@ -914,8 +1040,9 @@ def parse_single_cli() -> Mapping[str, Any]:
         "--agent-type",
         type=str,
         default="sac",
-        choices=["sac", "hc"],
-        help="Agent algorithm: 'sac' (default) or 'hc' (HC-decomposition SAC)",
+        choices=["sac", "hc", "dsa"],
+        help="Agent algorithm: 'sac' (default), 'hc' (HC-decomposition SAC), "
+        "or 'dsa' (transformer history encoder + DGRA)",
     )
     parser.add_argument(
         "--agent-kwarg",
