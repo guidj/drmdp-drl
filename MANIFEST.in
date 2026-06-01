@@ -10,7 +10,8 @@ recursive-include assets *.png
 recursive-include docs *.png
 recursive-include docs *.ico
 recursive-include docs *.md
-recursive-include sbin *.sh
+recursive-include bin/sh *.sh
+recursive-include bin/py *.py
 recursive-include assets *.h5
 
 # config

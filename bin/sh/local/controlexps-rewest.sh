@@ -2,7 +2,7 @@
 set -xe
 
 DIR=$(dirname $0)
-PARENT_DIR=$DIR/../..
+PARENT_DIR=$DIR/../../..
 BASE=drmdp
 
 TIMESTAMP=`date +%s`

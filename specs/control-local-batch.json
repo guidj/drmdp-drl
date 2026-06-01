@@ -1,10 +1,12 @@
 {
+  "min_delay": 15,
+  "max_delay": 20,
   "environments": [
     {
       "env": "Pendulum-v1",
-      "env_kwargs": {"max_episode_steps": 200},
-      "delay": 15,
-      "num_steps": 60000,
+      "env_kwargs": {
+        "max_episode_steps": 200
+      },
       "eval_step_freq": 400,
       "sac_kwargs": {
         "learning_rate": 1e-3,
@@ -18,7 +20,10 @@
         },
         {
           "reward_model_type": "ircr",
-          "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10}
+          "reward_model_kwargs": {
+            "fifo_capacity": 300000,
+            "heap_capacity": 10
+          }
         },
         {
           "reward_model_type": "dgra",
@@ -54,15 +59,19 @@
             "gradient_steps": -1,
             "verbose": 1
           },
-          "agent_kwargs": {"history_hidden_size": 48, "projection_dim": 48, "reg_lambda": 5.0}
+          "agent_kwargs": {
+            "history_hidden_size": 48,
+            "projection_dim": 48,
+            "reg_lambda": 5.0
+          }
         }
       ]
     },
     {
       "env": "InvertedPendulum-v5",
-      "env_kwargs": {"max_episode_steps": 1000},
-      "delay": 15,
-      "num_steps": 100000,
+      "env_kwargs": {
+        "max_episode_steps": 1000
+      },
       "eval_step_freq": 1000,
       "sac_kwargs": {
         "learning_rate": 3e-4,
@@ -78,7 +87,10 @@
         },
         {
           "reward_model_type": "ircr",
-          "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10}
+          "reward_model_kwargs": {
+            "fifo_capacity": 300000,
+            "heap_capacity": 10
+          }
         },
         {
           "reward_model_type": "dgra",
@@ -115,15 +127,19 @@
             "gradient_steps": -1,
             "verbose": 1
           },
-          "agent_kwargs": {"history_hidden_size": 48, "projection_dim": 48, "reg_lambda": 5.0}
+          "agent_kwargs": {
+            "history_hidden_size": 48,
+            "projection_dim": 48,
+            "reg_lambda": 5.0
+          }
         }
       ]
     },
     {
       "env": "Reacher-v5",
-      "env_kwargs": {"max_episode_steps": 50},
-      "delay": 15,
-      "num_steps": 300000,
+      "env_kwargs": {
+        "max_episode_steps": 50
+      },
       "eval_step_freq": 5000,
       "sac_kwargs": {
         "learning_rate": 3e-4,
@@ -139,7 +155,10 @@
         },
         {
           "reward_model_type": "ircr",
-          "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10}
+          "reward_model_kwargs": {
+            "fifo_capacity": 300000,
+            "heap_capacity": 10
+          }
         },
         {
           "reward_model_type": "dgra",
@@ -176,15 +195,19 @@
             "gradient_steps": -1,
             "verbose": 1
           },
-          "agent_kwargs": {"history_hidden_size": 48, "projection_dim": 48, "reg_lambda": 5.0}
+          "agent_kwargs": {
+            "history_hidden_size": 48,
+            "projection_dim": 48,
+            "reg_lambda": 5.0
+          }
         }
       ]
     },
     {
       "env": "HalfCheetah-v5",
-      "env_kwargs": {"max_episode_steps": 1000},
-      "delay": 15,
-      "num_steps": 300000,
+      "env_kwargs": {
+        "max_episode_steps": 1000
+      },
       "eval_step_freq": 5000,
       "sac_kwargs": {
         "learning_rate": 3e-4,
@@ -200,7 +223,10 @@
         },
         {
           "reward_model_type": "ircr",
-          "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10}
+          "reward_model_kwargs": {
+            "fifo_capacity": 300000,
+            "heap_capacity": 10
+          }
         },
         {
           "reward_model_type": "dgra",
@@ -237,7 +263,11 @@
             "gradient_steps": -1,
             "verbose": 1
           },
-          "agent_kwargs": {"history_hidden_size": 48, "projection_dim": 48, "reg_lambda": 5.0}
+          "agent_kwargs": {
+            "history_hidden_size": 48,
+            "projection_dim": 48,
+            "reg_lambda": 5.0
+          }
         }
       ]
     }
