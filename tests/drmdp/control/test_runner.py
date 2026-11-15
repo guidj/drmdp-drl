@@ -1386,6 +1386,94 @@ class TestLoadConfigsPrecedence:
         assert configs[0].output_dir.startswith(cli_dir)
 
 
+class TestBatchDelayOverrides:
+    @pytest.mark.parametrize(
+        ("delay_flags", "expected_bounds"),
+        [
+            (["--delay", "12"], (12, 12)),
+            (["--min-delay", "6"], (6, 9)),
+            (["--max-delay", "10"], (5, 10)),
+            (["--min-delay", "6", "--max-delay", "15"], (6, 15)),
+            (["--delay", "12", "--max-delay", "15"], (12, 15)),
+        ],
+    )
+    def test_cli_delay_flags_override_experiment_config(
+        self, tmp_path, delay_flags, expected_bounds
+    ):
+        """Explicit delay flags override experiment-level delay fields."""
+        config_path = self._write_delay_config(tmp_path)
+        batch_args = runner.parse_batch_cli(
+            ["--config-file", config_path, *delay_flags]
+        )
+        delay_overrides = runner._resolve_batch_delay_overrides(
+            delay=batch_args.delay,
+            min_delay=batch_args.min_delay,
+            max_delay=batch_args.max_delay,
+        )
+
+        configs = runner._load_configs(config_path, common_kwargs=delay_overrides)
+
+        assert (configs[0].min_delay, configs[0].max_delay) == expected_bounds
+
+    def test_omitted_delay_flags_preserve_experiment_config(self, tmp_path):
+        """Absent CLI delay flags leave file-provided bounds unchanged."""
+        config_path = self._write_delay_config(tmp_path)
+        batch_args = runner.parse_batch_cli(["--config-file", config_path])
+        delay_overrides = runner._resolve_batch_delay_overrides(
+            delay=batch_args.delay,
+            min_delay=batch_args.min_delay,
+            max_delay=batch_args.max_delay,
+        )
+
+        configs = runner._load_configs(config_path, common_kwargs=delay_overrides)
+
+        assert (configs[0].min_delay, configs[0].max_delay) == (5, 9)
+
+    def test_cli_delay_override_with_invalid_merged_range_raises(self, tmp_path):
+        """A CLI lower bound above the configured upper bound fails during loading."""
+        config_path = self._write_delay_config(tmp_path)
+        batch_args = runner.parse_batch_cli(
+            ["--config-file", config_path, "--min-delay", "10"]
+        )
+        delay_overrides = runner._resolve_batch_delay_overrides(
+            delay=batch_args.delay,
+            min_delay=batch_args.min_delay,
+            max_delay=batch_args.max_delay,
+        )
+
+        with pytest.raises(ValueError, match="max_delay"):
+            runner._load_configs(config_path, common_kwargs=delay_overrides)
+
+    def test_main_applies_batch_delay_flags(self, tmp_path):
+        """Batch CLI delay flags reach the configs passed to run_batch()."""
+        config_path = self._write_delay_config(tmp_path)
+        argv = [
+            "runner.py",
+            "--config-file",
+            config_path,
+            "--delay",
+            "12",
+            "--max-delay",
+            "15",
+        ]
+        with (
+            unittest.mock.patch("sys.argv", argv),
+            unittest.mock.patch.object(runner, "run_batch") as mock_run_batch,
+        ):
+            runner.main()
+
+        configs = mock_run_batch.call_args.args[0]
+        assert (configs[0].min_delay, configs[0].max_delay) == (12, 15)
+
+    def _write_delay_config(self, tmp_path):
+        config = _make_single_env_config(
+            extra_env_fields={"min_delay": 4, "max_delay": 8},
+            extra_exp_fields={"min_delay": 5, "max_delay": 9},
+            output_dir=str(tmp_path),
+        )
+        return _write_config(tmp_path, config)
+
+
 class TestRunBatch:
     def test_debug_mode_calls_run_for_each_config(self, tmp_path):
         """In debug mode, run() is called once for each config, sequentially."""

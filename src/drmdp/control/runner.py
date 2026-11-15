@@ -797,10 +797,14 @@ def _load_configs(
         [filtered_exec, filtered_common],
         [shared_fields],
     )
-    return _expand_environments(
-        raw["environments"],
-        global_chain,
-    )
+    configs = _expand_environments(raw["environments"], global_chain)
+    for config in configs:
+        _resolve_delay_bounds(
+            delay=None,
+            min_delay=config.min_delay,
+            max_delay=config.max_delay,
+        )
+    return configs
 
 
 def _expand_environments(
@@ -971,10 +975,15 @@ def main() -> None:
     batch_cli = parse_batch_cli()
     if batch_cli.config_file is not None:
         logging.info("Parsed args: %s", batch_cli)
+        delay_overrides = _resolve_batch_delay_overrides(
+            delay=batch_cli.delay,
+            min_delay=batch_cli.min_delay,
+            max_delay=batch_cli.max_delay,
+        )
         configs = _load_configs(
             batch_cli.config_file,
             exec_kwargs=vars(exec_args),
-            common_kwargs=common_dict,
+            common_kwargs={**common_dict, **delay_overrides},
         )
     else:
         single_cli = parse_single_cli()
@@ -1226,11 +1235,42 @@ def parse_reward_model_kwargs(
     return kwargs
 
 
-def parse_batch_cli() -> argparse.Namespace:
-    """Parse only batch-mode flags; single-run flags are ignored here."""
+def _resolve_batch_delay_overrides(
+    delay: Optional[int],
+    min_delay: Optional[int],
+    max_delay: Optional[int],
+) -> Dict[str, int]:
+    """Return only explicitly supplied delay bounds for batch CLI precedence."""
+    overrides: Dict[str, int] = {}
+    if delay is not None:
+        overrides.update(min_delay=delay, max_delay=delay)
+    if min_delay is not None:
+        overrides["min_delay"] = min_delay
+    if max_delay is not None:
+        overrides["max_delay"] = max_delay
+
+    for name, value in overrides.items():
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative, got {value}")
+    if "min_delay" in overrides and "max_delay" in overrides:
+        _resolve_delay_bounds(
+            delay=None,
+            min_delay=overrides["min_delay"],
+            max_delay=overrides["max_delay"],
+        )
+    return overrides
+
+
+def parse_batch_cli(
+    argv: Optional[Sequence[str]] = None,
+) -> argparse.Namespace:
+    """Parse batch flags; other single-run flags are ignored here."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config-file", type=str, default=None)
-    args, _ = parser.parse_known_args()
+    parser.add_argument("--delay", type=int, default=None)
+    parser.add_argument("--min-delay", type=int, default=None)
+    parser.add_argument("--max-delay", type=int, default=None)
+    args, _ = parser.parse_known_args(argv)
     return args
 
 
