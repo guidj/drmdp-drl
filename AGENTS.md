@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents when working with code in this repository.
 
 ## Project Overview
 
@@ -10,15 +10,15 @@ Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous
 
 ### Post-Change Verification
 
-After **any** code change, run `/verify-change` (see Skills). Do not skip it for small changes.
+After **any** code change, run the `verify-change` skill (`agents/skills/verify-change/SKILL.md`). Do not skip it for small changes.
 
 ### Planning Mode
 
-Whenever you create an implementation plan — whether via `/plan`, `EnterPlanMode`, or in response to any non-trivial task request — **always write the plan to `agents/plans/yyyy-mm-dd-{plan-name}.md` before starting implementation**. This is required unconditionally. Use the Write tool to create the file.
+Whenever you create an implementation plan — whether requested explicitly or in response to any non-trivial task request — **always write the plan to `agents/plans/yyyy-mm-dd-{plan-name}.md` before starting implementation**. This is required unconditionally.
 
 ### Code Review After Implementation
 
-After completing any non-trivial implementation, run `/post-impl-review` on the touched files (see Skills). Do not rely on self-review of code you just wrote.
+After completing any non-trivial implementation, run the `post-impl-review` skill (`agents/skills/post-impl-review/SKILL.md`) on the touched files. Do not rely on self-review of code you just wrote.
 
 ## Development Commands
 
@@ -59,6 +59,10 @@ make tox       # Run all CI checks
 - `ImputeMissingRewardWrapper`: Replaces `None` rewards with imputed values
 - `DataBuffer`: Replay buffer with capacity limits and accumulation modes (first/latest)
 
+**Environment construction** (`envs.py`):
+- `make_env(env_id, non_stationary=False, **kwargs)`: single factory; dispatches to the plain `gym.make` path, `make_non_stationary_classic_env`, or `make_non_stationary_mujoco_env`
+- Non-stationary wrappers draw per-episode mass and friction and apply a per-step gravity drift; `_CLASSIC_CONTROL_CONFIGS` covers `CartPole`, `Pendulum`, `MountainCar`, `_MUJOCO_CONFIGS` covers `HalfCheetah`, `Hopper`, `Walker2d`, `Ant`, `Humanoid`, `Swimmer`, `Pusher`, `Reacher`
+
 **Core Types** (`core.py`):
 - `EnvSpec`, `ProblemSpec`, `RunConfig`, `Experiment`, `ExperimentInstance`: Configuration dataclasses
 - `EnvMonitorWrapper`/`EnvMonitor`: Track episode returns and steps
@@ -78,7 +82,7 @@ Each model has a paired `eval_est_oN.py` for evaluation.
 
 ### Control: Off-Policy RL with Reward Model Interleaving (`src/drmdp/control/`)
 
-Online policy learning via SB3 SAC with pluggable reward estimation. The policy trains on *estimated* per-step rewards rather than the delayed aggregate rewards emitted by the environment.
+Online policy learning via SAC with pluggable reward estimation. `agent_type="sac"` (default) and `agent_type="dsa"` build `sbx.SAC` (JAX); `agent_type="hc"` builds `hc.HCSAC`, a `stable_baselines3.SAC` subclass (PyTorch). The policy trains on *estimated* per-step rewards rather than the delayed aggregate rewards emitted by the environment.
 
 **Core abstractions** (`base.py`):
 - `Trajectory`: Frozen dataclass — `(observations, actions, env_rewards, terminals, episode_return)`
@@ -90,22 +94,28 @@ Online policy learning via SB3 SAC with pluggable reward estimation. The policy 
 - `dgra.py` — `DGRARewardModel`: window-based neural reward model; trains on consecutive windows of trajectory data
 - `grd.py` — `GRDRewardModel`: graph-based with a causal structure network (`CausalStructure`) and dynamics network; learns which state dimensions causally influence reward
 
-**HC agent** (`hc.py`):
-- `HCSAC`: History-Corrected SAC (Han et al., ICML 2022) — learns a decomposed Q-function Q^H(h_t) + Q^C(s_t, a_t) directly from delayed rewards; no separate reward model
+**HC agent** (`hc.py`) — `--agent-type hc`:
+- `HCSAC`: History-Corrected SAC (Han et al., ICML 2022) — learns a decomposed Q-function $Q^H(h_t) + Q^C(s_t, a_t)$ directly from delayed rewards; no separate reward model
+
+**DSA agent** (`dsa.py`) — `--agent-type dsa`:
+- `HistoryEncoder`: transformer over the recent $(s, a)$ history, trained by next-state prediction $f(z, s_t, a_t) \to \hat{s}_{t+1}$; emits latent $z$
+- `LatentAugmentedObsWrapper` and `DSAReplayBuffer`: append $z$ to observations and run the encoder at sample time, so the policy can train through `sbx.SAC` with $z$ detached from the RL graph
+- Relabeling uses `DGRARewardModel` (`--reward-model-type dgra`); `none` trains on delayed rewards directly
+- History modes: `per_interval` (reset at each delayed signal) and `sliding_window` (last K steps)
 
 **Control loop** (`runner.py`):
 - `TrainingArgs`: Frozen configuration dataclass. Required fields include `exp_name: str` (e.g. `"exp-000"`, shared across runs) and `run_id: int` (0-indexed, unique within an experiment) — both are serialised to `experiment-params.json` via `ExperimentLogger`
-- `run(args)`: Wraps env → runs SAC or HC to completion → saves model
+- `run(args)`: Wraps env with `DelayedRewardWrapper` and `ImputeMissingRewardWrapper`, then dispatches on `agent_type` to `_run_sac`, `_run_hc`, or `_run_dsa` and saves the model
 - `run_batch(configs, mode)`: Unified entry point for all execution. `mode="debug"` runs sequentially; `mode="local"` uses `ProcessPoolExecutor`; `mode="ray"` submits Ray remote tasks
 - `RewardModelUpdateCallback`: Tracks episode trajectories, calls `reward_model.update()` at a fixed step interval
 
 **CLI parser design**: `runner.py` uses four independent parsers, each calling `parse_known_args(sys.argv[1:])`:
-- `parse_batch_cli` — `--config-file` only
+- `parse_batch_cli` — `--config-file` plus optional batch delay overrides (`--delay`, `--min-delay`, `--max-delay`)
 - `parse_exec_args` — `--mode`, `--num-runs`, `--max-workers`, `--ray-address`
 - `parse_common_args` — training scalars overrideable from CLI: `--num-steps`, `--sac-*`, `--log-step-frequency`, `--output-dir`
-- `parse_single_cli` — all remaining single-run flags (`--env`, `--delay`, `--reward-model-type`, `--update-every-n-steps`, etc.)
+- `parse_single_cli` — all remaining single-run flags (`--env`, `--delay`, `--reward-model-type`, `--agent-type {sac,hc,dsa}`, `--non-stationary`, `--update-every-n-steps`, etc.)
 
-**Intended CLI precedence**: `code defaults < config file (any level) < CLI args`. **Known bug**: env-level config file fields for training scalars (e.g. `num_steps`, `sac_learning_rate`) silently override CLI args because `env_defaults = {**global_defaults, **env_fields}` in `_expand_environments` applies env file fields *after* the CLI overrides that were merged into `global_defaults`. The `--num-runs` flag is handled separately via `cli_num_runs` and is not affected.
+**CLI precedence**: `code defaults < shared (top-level) file fields < environment-level < experiment-level < CLI args`, implemented by `core.ArgChain` in `_load_configs` and `_expand_environments`. CLI overrides are pinned in the top chain layers and `prepend()` inserts file layers beneath them, so a CLI flag always beats the file. `--num-runs` is resolved from `exec_kwargs` and is not part of the chain.
 
 **Batch config format** (`specs/control-local-batch.json`):
 ```json
@@ -114,9 +124,10 @@ Online policy learning via SB3 SAC with pluggable reward estimation. The policy 
     {
       "env": "MountainCarContinuous-v0",
       "env_kwargs": {"max_episode_steps": 2500},
-      "delay": 3,
+      "min_delay": 15,
+      "max_delay": 20,
       "num_steps": 50000,
-      "sac_learning_rate": 3e-4,
+      "sac_kwargs": {"learning_rate": 3e-4},
       "experiments": [
         { "reward_model_type": "ircr", "reward_model_kwargs": {"max_buffer_size": 200, "k_neighbors": 5} },
         { "reward_model_type": "dgra", "reward_model_kwargs": {"train_epochs": 100} }
@@ -125,47 +136,27 @@ Online policy learning via SB3 SAC with pluggable reward estimation. The policy 
   ]
 }
 ```
-File-internal precedence: top-level fields → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`. `num_runs` and `output_dir` are reserved keys excluded from the training-arg merge.
+File-internal precedence: top-level fields → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`. `num_runs` and `output_dir` are reserved keys excluded from the training-arg merge. Keys that are not `TrainingArgs` fields (for example `delay`) are dropped silently; delay is configured with `min_delay` and `max_delay`.
+
+### Non-Stationary Environments
+
+`--non-stationary` (and the `non_stationary` config field) routes `envs.make_env` to the non-stationary wrappers. Mass and friction are redrawn per episode; gravity drifts within an episode. Classic-control environments (`CartPole`, `Pendulum`, `MountainCar`) use parameter-variance wrappers with recomputation hooks; MuJoCo environments use `UniversalNonStationaryMuJoCoWrapper`. The evaluation environment receives the same wrapper, so returns are measured under the same dynamics distribution as training.
 
 ## Skills
 
-Four project-specific skills are available. Use them by name — the skill list in the system prompt shows when they are loaded.
+Seven project-specific skills live in [`agents/skills/`](agents/skills/), each a folder in the open [Agent Skills](https://agentskills.io) format: a `SKILL.md` with `name` and `description` frontmatter plus supporting files (templates, examples). Any agent can run them: open `agents/skills/<name>/SKILL.md` and follow it, passing arguments after the skill name. Paths inside a skill resolve relative to the skill directory. Harnesses that discover skills in `.claude/skills/` find symlinks there pointing at the canonical copies in `agents/skills/`.
 
-### `/verify-change` — post-change quality gate
+| Skill | Purpose |
+|---|---|
+| `verify-change [files]` | Post-change quality gate: `make format`, `make check`, `make test`; triages failures as minor or moderate; chains to `post-impl-review` |
+| `post-impl-review [files]` | drmdp style and correctness review of touched files (newspaper order, typing imports, test-class structure, episode boundaries); makes corrections directly |
+| `add-reward-model <name>` | Scaffolds `src/drmdp/control/{name}.py` implementing the `RewardModel` ABC, wires it into `runner.py` (import + `--reward-model-type` choices + `_make_reward_model` branch), creates the mirrored test file |
+| `research-to-impl <paper>` | Paper to reviewed toy implementation: chains `summarize-ml-paper` → `implement-ml-paper-toy` → `post-impl-review` → verification |
+| `summarize-ml-paper <paper> [focus]` | Ten-section structured summary of an ML paper (PDF or URL), written to `papers/summary/` |
+| `implement-ml-paper-toy <summary> [framework] [name]` | Toy implementation with synthetic data and tests from a paper summary, written to `model_specs/` |
+| `profile <command>` | Line-level profiling loop with `line_profiler`; report written to `agents/analyses/` |
 
-Runs `make format && make check && make test`, triages failures, and chains to `/post-impl-review` on success. The single command that replaces the manual post-change workflow.
-
-```
-/verify-change                          # auto-detects touched files from git diff
-/verify-change src/drmdp/control/grd.py tests/drmdp/control/test_grd.py
-```
-
-### `/post-impl-review` — drmdp style and correctness review
-
-Reads every touched file and applies the project's four-area checklist, making corrections directly. Triggered automatically by `/verify-change`; also useful after targeted edits.
-
-```
-/post-impl-review src/drmdp/rewdelay.py tests/drmdp/test_rewdelay.py
-/post-impl-review src/drmdp/dfdrl/est_o1.py   # episode-boundary check auto-activates
-```
-
-### `/add-reward-model <name>` — reward model scaffold
-
-Creates `src/drmdp/control/{name}.py` (implementing `RewardModel` ABC), wires it into `runner.py` (import + `--reward-model-type` choices + `_make_reward_model` branch), and creates `tests/drmdp/control/test_{name}.py` with the minimum three tests. Asks for a plan confirmation before writing any files.
-
-```
-/add-reward-model contrastive   # → ContrastiveRewardModel, --reward-model-type contrastive
-/add-reward-model oracle
-```
-
-### `/research-to-impl <paper-path-or-url>` — paper to reviewed toy implementation
-
-Chains `/summarize-ml-paper` → `/implement-ml-paper-toy` → `/post-impl-review` → `make format && make check && make test`. Asks framework (torch / sklearn) and module name before generating code.
-
-```
-/research-to-impl papers/han2022hc.pdf
-/research-to-impl https://arxiv.org/abs/2206.15474
-```
+The stages of `research-to-impl` also run on their own.
 
 ## Running Experiments
 
@@ -185,6 +176,8 @@ python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
     --delay 3 --num-runs 5 --mode local --output-dir /tmp/out
 ```
 
+`--delay N` sets both bounds (a fixed delay). `--min-delay` and `--max-delay` set a uniform range and take precedence over `--delay` on the bound each names. Any bound no flag sets falls back to the code default `(3, 5)`; an inverted range fails at parse time. Batch runs accept `--delay`, `--min-delay`, and `--max-delay`; explicit CLI bounds override shared, environment-level, and experiment-level delay fields. With no delay flags, the spec-file values are preserved.
+
 ### Batch via JSON Config
 ```sh
 python src/drmdp/control/runner.py --config-file specs/control-local-batch.json \
@@ -193,12 +186,14 @@ python src/drmdp/control/runner.py --config-file specs/control-local-batch.json 
 
 ### Shell Scripts
 ```sh
-sbin/local/control-ircr.sh    # IRCR + SAC
-sbin/local/control-dgra.sh    # DGRA + SAC
-sbin/local/control-hc.sh      # HC-decomposition SAC
-sbin/local/control-delayed.sh # Delayed-rewards baseline (no reward model)
-sbin/local/control-batch.sh   # All reward models, both envs
+bin/sh/local/control-ircr.sh    # IRCR + SAC
+bin/sh/local/control-dgra.sh    # DGRA + SAC
+bin/sh/local/control-hc.sh      # HC-decomposition SAC
+bin/sh/local/control-delayed.sh # Delayed-rewards baseline (no reward model)
+bin/sh/local/control-batch.sh   # All reward models, both envs
 ```
+
+Ray job submission and cluster-management scripts live in `bin/sh/rjobs/` and `bin/sh/rconfig/`.
 
 ## Critical Architectural Patterns
 
