@@ -862,13 +862,57 @@ class TestMakeRewardModel:
         assert result.shape == (4,)
 
 
+class TestResolveDelayBounds:
+    def test_no_flags_uses_code_defaults(self):
+        """Omitting every delay flag falls back to the code default range."""
+        bounds = runner._resolve_delay_bounds(
+            delay=None, min_delay=None, max_delay=None
+        )
+        assert bounds == (3, 5)
+
+    def test_delay_sets_both_bounds(self):
+        """--delay alone produces a fixed delay."""
+        bounds = runner._resolve_delay_bounds(delay=7, min_delay=None, max_delay=None)
+        assert bounds == (7, 7)
+
+    def test_min_and_max_delay_set_range(self):
+        """A uniform range comes from the two bound flags."""
+        bounds = runner._resolve_delay_bounds(delay=None, min_delay=15, max_delay=20)
+        assert bounds == (15, 20)
+
+    def test_explicit_bounds_override_delay(self):
+        """--min-delay and --max-delay win over --delay on both bounds."""
+        bounds = runner._resolve_delay_bounds(delay=7, min_delay=10, max_delay=20)
+        assert bounds == (10, 20)
+
+    def test_max_delay_combined_with_delay(self):
+        """--max-delay widens the upper bound set by --delay."""
+        bounds = runner._resolve_delay_bounds(delay=5, min_delay=None, max_delay=20)
+        assert bounds == (5, 20)
+
+    def test_unset_bound_falls_back_to_code_default(self):
+        """A bound no flag names keeps its code default."""
+        bounds = runner._resolve_delay_bounds(delay=None, min_delay=2, max_delay=None)
+        assert bounds == (2, 5)
+
+    def test_inverted_range_raises(self):
+        """min_delay above the default max_delay is rejected at parse time."""
+        with pytest.raises(ValueError, match="max_delay"):
+            runner._resolve_delay_bounds(delay=None, min_delay=15, max_delay=None)
+
+    def test_negative_delay_raises(self):
+        """A negative bound is rejected at parse time."""
+        with pytest.raises(ValueError, match="non-negative"):
+            runner._resolve_delay_bounds(delay=-1, min_delay=None, max_delay=None)
+
+
 class TestParseArgs:
     def test_defaults_are_valid_mapping(self, tmp_path):
         with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
             args = runner.parse_single_cli()
         assert isinstance(args, dict)
         assert args["env"] == "MountainCarContinuous-v0"
-        assert args["delay"] == 3
+        assert (args["min_delay"], args["max_delay"]) == (3, 5)
 
     def test_custom_env_and_delay(self, tmp_path):
         with unittest.mock.patch(
@@ -885,7 +929,8 @@ class TestParseArgs:
         ):
             args = runner.parse_single_cli()
         assert args["env"] == "Pendulum-v1"
-        assert args["delay"] == 5
+        assert (args["min_delay"], args["max_delay"]) == (5, 5)
+        assert "delay" not in args
 
     def test_reward_model_kwarg_parsed(self, tmp_path):
         with unittest.mock.patch(
@@ -948,6 +993,77 @@ class TestParseArgs:
         assert args["sac_kwargs"] == {}
 
 
+class TestDelayFlags:
+    def test_delay_flag_reaches_training_args(self, tmp_path):
+        """--delay 7 produces a fixed delay of 7 steps in the generated config."""
+        with unittest.mock.patch(
+            "sys.argv", ["prog", "--delay", "7", "--output-dir", str(tmp_path)]
+        ):
+            single_cli = runner.parse_single_cli()
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert (configs[0].min_delay, configs[0].max_delay) == (7, 7)
+
+    def test_min_and_max_delay_flags_reach_training_args(self, tmp_path):
+        """--min-delay and --max-delay reach the generated config as a range."""
+        with unittest.mock.patch(
+            "sys.argv",
+            [
+                "prog",
+                "--min-delay",
+                "15",
+                "--max-delay",
+                "20",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            single_cli = runner.parse_single_cli()
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert (configs[0].min_delay, configs[0].max_delay) == (15, 20)
+
+    def test_bound_flags_override_delay_flag(self, tmp_path):
+        """--max-delay overrides the upper bound implied by --delay."""
+        with unittest.mock.patch(
+            "sys.argv",
+            [
+                "prog",
+                "--delay",
+                "5",
+                "--max-delay",
+                "20",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            single_cli = runner.parse_single_cli()
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert (configs[0].min_delay, configs[0].max_delay) == (5, 20)
+
+    def test_absent_delay_flags_keep_code_defaults(self, tmp_path):
+        """Without delay flags the generated config keeps the (3, 5) default."""
+        with unittest.mock.patch("sys.argv", ["prog", "--output-dir", str(tmp_path)]):
+            single_cli = runner.parse_single_cli()
+        configs = runner._generate_configs(single_cli, exec_kwargs={"num_runs": 1})
+        assert (configs[0].min_delay, configs[0].max_delay) == (3, 5)
+
+    def test_inverted_delay_flags_raise(self, tmp_path):
+        """min-delay above max-delay fails at parse time, not at sampling time."""
+        with unittest.mock.patch(
+            "sys.argv",
+            [
+                "prog",
+                "--min-delay",
+                "20",
+                "--max-delay",
+                "15",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        ):
+            with pytest.raises(ValueError, match="max_delay"):
+                runner.parse_single_cli()
+
+
 class TestGenerateConfigs:
     def test_single_run_produces_one_config(self, tmp_path):
         """num_runs=1 produces exactly one TrainingArgs."""
@@ -1008,7 +1124,7 @@ class TestGenerateConfigs:
         return {
             "env": "MountainCarContinuous-v0",
             "min_delay": 3,
-            "min_delay": 5,
+            "max_delay": 5,
             "env_kwargs": {"max_episode_steps": 2500},
             "reward_model_type": "ircr",
             "update_every_n_steps": 1000,

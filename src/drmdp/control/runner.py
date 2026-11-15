@@ -37,7 +37,7 @@ import logging
 import os
 import tempfile
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import ray
@@ -990,6 +990,37 @@ def main() -> None:
     )
 
 
+def _resolve_delay_bounds(
+    delay: Optional[int],
+    min_delay: Optional[int],
+    max_delay: Optional[int],
+) -> Tuple[int, int]:
+    """Combine the delay flags into an explicit ``(min_delay, max_delay)`` pair.
+
+    ``--delay`` sets both bounds; ``--min-delay`` and ``--max-delay`` take
+    precedence on the bound each names. Bounds no flag sets fall back to the
+    code defaults, so an inverted range is rejected here rather than at the
+    first call to the delay sampler.
+
+    Raises:
+        ValueError: If a bound is negative or ``max_delay < min_delay``.
+    """
+    defaults = _default_training_args()
+    resolved_min = min_delay if min_delay is not None else delay
+    resolved_max = max_delay if max_delay is not None else delay
+    resolved_min = defaults["min_delay"] if resolved_min is None else resolved_min
+    resolved_max = defaults["max_delay"] if resolved_max is None else resolved_max
+
+    if resolved_min < 0:
+        raise ValueError(f"min_delay must be non-negative, got {resolved_min}")
+    if resolved_max < resolved_min:
+        raise ValueError(
+            f"max_delay ({resolved_max}) must be greater than or equal to "
+            f"min_delay ({resolved_min})"
+        )
+    return int(resolved_min), int(resolved_max)
+
+
 def parse_single_cli() -> Mapping[str, Any]:
     """Parse command-line arguments into a TrainingArgs instance."""
     parser = argparse.ArgumentParser(
@@ -1004,8 +1035,23 @@ def parse_single_cli() -> Mapping[str, Any]:
     parser.add_argument(
         "--delay",
         type=int,
-        default=3,
-        help="Reward delay (number of steps)",
+        default=None,
+        help="Reward delay (number of steps); sets both the minimum and the "
+        "maximum. Defaults to the code default range when omitted.",
+    )
+    parser.add_argument(
+        "--min-delay",
+        type=int,
+        default=None,
+        help="Minimum reward delay (number of steps); overrides --delay for "
+        "the lower bound.",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=int,
+        default=None,
+        help="Maximum reward delay (number of steps); overrides --delay for "
+        "the upper bound.",
     )
     parser.add_argument(
         "--max-episode-steps",
@@ -1066,6 +1112,11 @@ def parse_single_cli() -> Mapping[str, Any]:
         args_dict.get("sac_kwargs") or []
     )
     args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
+    args_dict["min_delay"], args_dict["max_delay"] = _resolve_delay_bounds(
+        delay=args_dict.pop("delay", None),
+        min_delay=args_dict.pop("min_delay", None),
+        max_delay=args_dict.pop("max_delay", None),
+    )
     return args_dict
 
 
