@@ -27,3 +27,7 @@ include uv.lock
 # notebooks
 recursive-include notebooks *.ipynb
 recursive-include notebooks *.pdf
+
+# research materials
+recursive-include papers *.md
+recursive-include tutorials *.ipynb
