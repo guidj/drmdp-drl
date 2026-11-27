@@ -2,7 +2,7 @@
 set -xe
 
 DIR=$(dirname $0)
-PARENT_DIR=$DIR/../..
+PARENT_DIR=$DIR/../../..
 BASE=drmdp
 
 TIMESTAMP=`date +%s`
@@ -12,7 +12,8 @@ ray job submit \
     --runtime-env-json='{"py_modules":["src/drmdp"], "excludes": [".git"]}' \
     -- \
     python $PARENT_DIR/src/$BASE/dfdrl/est_o1.py \
-        --delay=3 \
+        --min-delay 3 \
+        --max-delay 5 \
         --buffer-num-steps=100 \
         --train-epochs=100 \
         --output-dir=$HOME/fs/$BASE/dfdrl-rest/o1/$TIMESTAMP \

@@ -1457,7 +1457,8 @@ class TestCommandLine:
             assert args.model_type == "mlp"
             assert args.env == "MountainCarContinuous-v0"
             assert args.max_episode_steps == 2500
-            assert args.delay == 3
+            assert args.min_delay == 3
+            assert args.max_delay == 5
             assert args.train_epochs == 100
             assert args.buffer_num_steps == 100
             assert args.batch_size == 64
@@ -1486,7 +1487,9 @@ class TestCommandLine:
                 "CartPole-v1",
                 "--max-episode-steps",
                 "1000",
-                "--delay",
+                "--min-delay",
+                "3",
+                "--max-delay",
                 "5",
                 "--train-epochs",
                 "50",
@@ -1512,7 +1515,8 @@ class TestCommandLine:
             assert args.model_type == "mlp"
             assert args.env == "CartPole-v1"
             assert args.max_episode_steps == 1000
-            assert args.delay == 5
+            assert args.min_delay == 3
+            assert args.max_delay == 5
             assert args.train_epochs == 50
             assert args.buffer_num_steps == 200
             assert args.batch_size == 32

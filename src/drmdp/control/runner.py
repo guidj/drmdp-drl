@@ -37,16 +37,15 @@ import logging
 import os
 import tempfile
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import gymnasium as gym
 import numpy as np
 import ray
-from stable_baselines3.common import callbacks
+from stable_baselines3.common import base_class, callbacks
 from stable_baselines3.common import evaluation as sb3_evaluation
 
-from drmdp import core, logger, ray_utils, rewdelay
-from drmdp.control import base, dgra, grd, hc, ircr
+from drmdp import core, envs, logger, ray_utils, rewdelay
+from drmdp.control import base, dgra, dsa, grd, hc, ircr
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +54,8 @@ class TrainingArgs:
 
     Attributes:
         env: Gymnasium environment name.
-        delay: Reward delay (number of steps).
+        min_delay: Minimum number of reward delay steps.
+        max_delay: Maximum number of reward delay steps.
         env_kwargs: Keyword arguments forwarded to ``gym.make()`` (e.g.
             ``{"max_episode_steps": 2500}``).
         reward_model_type: Reward model identifier. Supports "ircr", "dgra", "grd",
@@ -83,12 +83,15 @@ class TrainingArgs:
             model; "hc" uses HC-decomposition SAC without a reward model.
         agent_kwargs: Keyword arguments forwarded to the agent constructor.
             Used when ``agent_type="hc"`` (e.g. ``history_hidden_size``,
-            ``reg_lambda``). ``max_delay`` is derived from the delay
-            distribution and cannot be overridden here.
+            ``reg_lambda``). ``max_delay`` is ignored in favour of the
+            value set in this class.
+        non_stationary: Wrap the environment with non-stationary dynamics
+            (episodic mass/friction randomisation, per-step gravity drift).
     """
 
     env: str
-    delay: int
+    min_delay: int
+    max_delay: int
     reward_model_type: str
     update_every_n_steps: int
     clear_buffer_on_update: bool
@@ -105,6 +108,7 @@ class TrainingArgs:
     sac_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     agent_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     env_kwargs: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    non_stationary: bool = False
 
 
 class RewardModelUpdateCallback(callbacks.BaseCallback):
@@ -420,8 +424,8 @@ def run(args: TrainingArgs) -> None:
     )
     logging.info("Training args: %s", args)
 
-    delay = rewdelay.ClippedPoissonDelay(args.delay)
-    env = gym.make(args.env, **args.env_kwargs)
+    delay = rewdelay.UniformDelay(min_delay=args.min_delay, max_delay=args.max_delay)
+    env = envs.make_env(args.env, non_stationary=args.non_stationary, **args.env_kwargs)
     env = core.EnvMonitorWrapper(env)
     env = rewdelay.DelayedRewardWrapper(env, delay)
     env = rewdelay.ImputeMissingRewardWrapper(env, impute_value=0.0)
@@ -433,7 +437,11 @@ def run(args: TrainingArgs) -> None:
         eval_env: Optional[Any] = None
         eval_logger: Optional[logger.ExperimentLogger] = None
         if args.eval_step_freq > 0:
-            eval_env = core.EnvMonitorWrapper(gym.make(args.env, **args.env_kwargs))
+            eval_env = core.EnvMonitorWrapper(
+                envs.make_env(
+                    args.env, non_stationary=args.non_stationary, **args.env_kwargs
+                )
+            )
             eval_logger = stack.enter_context(
                 logger.ExperimentLogger(
                     args.output_dir,
@@ -441,8 +449,10 @@ def run(args: TrainingArgs) -> None:
                     filename="eval-logs.jsonl",
                 )
             )
-        if args.agent_type == "hc":
-            _run_hc(args, env, train_logger, delay, eval_env, eval_logger)
+        if args.agent_type == "dsa":
+            _run_dsa(args, env, train_logger, eval_env, eval_logger)
+        elif args.agent_type == "hc":
+            _run_hc(args, env, train_logger, eval_env, eval_logger)
         else:
             _run_sac(args, env, train_logger, eval_env, eval_logger)
 
@@ -504,7 +514,7 @@ def _run_sac(
         callback=callback,
         progress_bar=True,
     )
-    sac.save(os.path.join(args.output_dir, "sac_model"))
+    save_model(sac, path=os.path.join(args.output_dir, "sac_model.zip"))
     logging.info("Model saved to %s/sac_model", args.output_dir)
 
 
@@ -512,17 +522,15 @@ def _run_hc(
     args: TrainingArgs,
     env: Any,
     train_logger: logger.ExperimentLogger,
-    delay: rewdelay.RewardDelay,
     eval_env: Optional[Any] = None,
     eval_logger: Optional[logger.ExperimentLogger] = None,
 ) -> None:
     """Train HC-decomposition SAC."""
     # IntervalPositionWrapper depends on info["interval_end"] from ImputeMissingRewardWrapper,
     # so it must be applied after that wrapper.
-    _, max_delay = delay.range()
-    env = hc.IntervalPositionWrapper(env, max_delay=max_delay)
+    env = hc.IntervalPositionWrapper(env, max_delay=args.max_delay)
     if eval_env is not None:
-        eval_env = hc.IntervalPositionWrapper(eval_env, max_delay=max_delay)
+        eval_env = hc.IntervalPositionWrapper(eval_env, max_delay=args.max_delay)
     # Runner owns max_delay; strip from agent_kwargs so both IntervalPositionWrapper
     # and HCSAC (and its replay buffer) use the same value from the delay distribution.
     remaining_kwargs = {
@@ -530,7 +538,7 @@ def _run_hc(
     }
     agent = hc.HCSAC(
         env,
-        max_delay=max_delay,
+        max_delay=args.max_delay,
         seed=args.seed,
         **{**args.sac_kwargs, **remaining_kwargs},
     )
@@ -558,8 +566,132 @@ def _run_hc(
         callback=callback,
         progress_bar=True,
     )
-    agent.save(os.path.join(args.output_dir, "hc_model"))
+    save_model(agent, path=os.path.join(args.output_dir, "hc_model.zip"))
     logging.info("Model saved to %s/hc_model", args.output_dir)
+
+
+def _run_dsa(
+    args: TrainingArgs,
+    env: Any,
+    train_logger: logger.ExperimentLogger,
+    eval_env: Optional[Any] = None,
+    eval_logger: Optional[logger.ExperimentLogger] = None,
+) -> None:
+    """Train DSA: transformer history encoder + DGRA + SAC."""
+    import sbx
+
+    agent_kw = dict(args.agent_kwargs)
+    latent_dim = int(agent_kw.pop("latent_dim", 32))
+    history_mode = str(agent_kw.pop("history_mode", "per_interval"))
+    d_model = int(agent_kw.pop("d_model", 64))
+    nhead = int(agent_kw.pop("nhead", 4))
+    num_encoder_layers = int(agent_kw.pop("num_encoder_layers", 2))
+    predictor_hidden_dim = int(agent_kw.pop("predictor_hidden_dim", 256))
+    encoder_update_every_n_steps = int(
+        agent_kw.pop("encoder_update_every_n_steps", 2000)
+    )
+    encoder_train_epochs = int(agent_kw.pop("encoder_train_epochs", 5))
+    encoder_batch_size = int(agent_kw.pop("encoder_batch_size", 64))
+    encoder_learning_rate = float(agent_kw.pop("encoder_learning_rate", 1e-3))
+    max_history_buffer_size = int(agent_kw.pop("max_history_buffer_size", 10000))
+
+    action_dim = int(np.prod(env.action_space.shape))
+
+    env = hc.IntervalPositionWrapper(env, max_delay=args.max_delay)
+    if eval_env is not None:
+        eval_env = hc.IntervalPositionWrapper(eval_env, max_delay=args.max_delay)
+
+    obs_dim_with_pos = int(np.prod(env.observation_space.shape))
+    sa_dim = obs_dim_with_pos + action_dim
+
+    env = dsa.LatentAugmentedObsWrapper(env, latent_dim=latent_dim)
+
+    history_encoder = dsa.HistoryEncoder(
+        sa_dim=sa_dim,
+        obs_dim=obs_dim_with_pos,
+        action_dim=action_dim,
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=num_encoder_layers,
+        latent_dim=latent_dim,
+        max_len=args.max_delay,
+        predictor_hidden_dim=predictor_hidden_dim,
+    )
+
+    reward_model: Optional[base.RewardModel] = None
+    if args.reward_model_type != "none":
+        reward_model = dgra.DGRARewardModel(
+            obs_dim=obs_dim_with_pos,
+            action_dim=action_dim,
+            **args.reward_model_kwargs,
+        )
+
+    sac = sbx.SAC(
+        "MlpPolicy",
+        env,
+        replay_buffer_class=dsa.DSAReplayBuffer,
+        replay_buffer_kwargs={
+            "max_delay": args.max_delay,
+            "history_encoder": history_encoder,
+            "reward_model": reward_model,
+            "raw_obs_dim": obs_dim_with_pos,
+            "history_mode": history_mode,
+        },
+        seed=args.seed,
+        **args.sac_kwargs,
+    )
+
+    training_callback = dsa.DSACallback(
+        history_encoder=history_encoder,
+        reward_model=reward_model,
+        max_delay=args.max_delay,
+        raw_obs_dim=obs_dim_with_pos,
+        history_mode=history_mode,
+        encoder_update_every_n_steps=encoder_update_every_n_steps,
+        encoder_train_epochs=encoder_train_epochs,
+        encoder_batch_size=encoder_batch_size,
+        encoder_learning_rate=encoder_learning_rate,
+        reward_model_update_every_n_steps=args.update_every_n_steps,
+        clear_buffer_on_update=args.clear_buffer_on_update,
+        log_episode_frequency=args.log_episode_frequency,
+        train_logger=train_logger,
+        max_history_buffer_size=max_history_buffer_size,
+    )
+
+    if eval_env is not None:
+        eval_env = dsa.LatentAugmentedObsWrapper(eval_env, latent_dim=latent_dim)
+        eval_env = dsa.DSAEvalWrapper(
+            eval_env,
+            history_encoder=history_encoder,
+            max_delay=args.max_delay,
+            latent_dim=latent_dim,
+            obs_dim_before_augmentation=obs_dim_with_pos,
+            action_dim=action_dim,
+            history_mode=history_mode,
+        )
+
+    eval_callback = (
+        StepEvalCallback(
+            eval_env,
+            args.eval_step_freq,
+            args.n_eval_episodes,
+            eval_logger,
+            algo_name=f"dsa/{args.reward_model_type}",
+        )
+        if eval_env is not None and eval_logger is not None
+        else None
+    )
+    callback = callbacks.CallbackList(
+        [cb for cb in (training_callback, eval_callback) if cb is not None]
+    )
+    sac.learn(
+        total_timesteps=args.num_steps,
+        log_interval=4,
+        callback=callback,
+        progress_bar=True,
+    )
+    save_model(sac, path=os.path.join(args.output_dir, "dsa_model.zip"))
+    logging.info("Model saved to %s/dsa_model", args.output_dir)
 
 
 def _make_reward_model(args: TrainingArgs, env: Any) -> Optional[base.RewardModel]:
@@ -665,10 +797,14 @@ def _load_configs(
         [filtered_exec, filtered_common],
         [shared_fields],
     )
-    return _expand_environments(
-        raw["environments"],
-        global_chain,
-    )
+    configs = _expand_environments(raw["environments"], global_chain)
+    for config in configs:
+        _resolve_delay_bounds(
+            delay=None,
+            min_delay=config.min_delay,
+            max_delay=config.max_delay,
+        )
+    return configs
 
 
 def _expand_environments(
@@ -757,7 +893,8 @@ def _resolve_output_dir(
 def _default_training_args() -> Mapping[str, Any]:
     return {
         "env": "MountainCarContinuous-v0",
-        "delay": 3,
+        "min_delay": 3,
+        "max_delay": 5,
         "env_kwargs": {"max_episode_steps": 2500},
         "reward_model_type": "ircr",
         "update_every_n_steps": 1000,
@@ -774,6 +911,7 @@ def _default_training_args() -> Mapping[str, Any]:
         "seed": None,
         "agent_type": "sac",
         "agent_kwargs": {},
+        "non_stationary": False,
     }
 
 
@@ -810,6 +948,18 @@ def _generate_configs(
     return configs
 
 
+def save_model(model: base_class.BaseAlgorithm, path: str) -> None:
+    import io
+
+    import tensorflow as tf
+
+    model_bytes = io.BytesIO()
+    model.save(model_bytes)
+
+    with tf.io.gfile.GFile(path, "wb") as writable:
+        writable.write(model_bytes.getvalue())
+
+
 def main() -> None:
     """Parse command-line arguments and launch single or batch control loop."""
     logging.basicConfig(
@@ -825,10 +975,15 @@ def main() -> None:
     batch_cli = parse_batch_cli()
     if batch_cli.config_file is not None:
         logging.info("Parsed args: %s", batch_cli)
+        delay_overrides = _resolve_batch_delay_overrides(
+            delay=batch_cli.delay,
+            min_delay=batch_cli.min_delay,
+            max_delay=batch_cli.max_delay,
+        )
         configs = _load_configs(
             batch_cli.config_file,
             exec_kwargs=vars(exec_args),
-            common_kwargs=common_dict,
+            common_kwargs={**common_dict, **delay_overrides},
         )
     else:
         single_cli = parse_single_cli()
@@ -842,6 +997,37 @@ def main() -> None:
         max_workers=exec_args.max_workers,
         ray_address=exec_args.ray_address,
     )
+
+
+def _resolve_delay_bounds(
+    delay: Optional[int],
+    min_delay: Optional[int],
+    max_delay: Optional[int],
+) -> Tuple[int, int]:
+    """Combine the delay flags into an explicit ``(min_delay, max_delay)`` pair.
+
+    ``--delay`` sets both bounds; ``--min-delay`` and ``--max-delay`` take
+    precedence on the bound each names. Bounds no flag sets fall back to the
+    code defaults, so an inverted range is rejected here rather than at the
+    first call to the delay sampler.
+
+    Raises:
+        ValueError: If a bound is negative or ``max_delay < min_delay``.
+    """
+    defaults = _default_training_args()
+    resolved_min = min_delay if min_delay is not None else delay
+    resolved_max = max_delay if max_delay is not None else delay
+    resolved_min = defaults["min_delay"] if resolved_min is None else resolved_min
+    resolved_max = defaults["max_delay"] if resolved_max is None else resolved_max
+
+    if resolved_min < 0:
+        raise ValueError(f"min_delay must be non-negative, got {resolved_min}")
+    if resolved_max < resolved_min:
+        raise ValueError(
+            f"max_delay ({resolved_max}) must be greater than or equal to "
+            f"min_delay ({resolved_min})"
+        )
+    return int(resolved_min), int(resolved_max)
 
 
 def parse_single_cli() -> Mapping[str, Any]:
@@ -858,8 +1044,23 @@ def parse_single_cli() -> Mapping[str, Any]:
     parser.add_argument(
         "--delay",
         type=int,
-        default=3,
-        help="Reward delay (number of steps)",
+        default=None,
+        help="Reward delay (number of steps); sets both the minimum and the "
+        "maximum. Defaults to the code default range when omitted.",
+    )
+    parser.add_argument(
+        "--min-delay",
+        type=int,
+        default=None,
+        help="Minimum reward delay (number of steps); overrides --delay for "
+        "the lower bound.",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=int,
+        default=None,
+        help="Maximum reward delay (number of steps); overrides --delay for "
+        "the upper bound.",
     )
     parser.add_argument(
         "--max-episode-steps",
@@ -894,8 +1095,9 @@ def parse_single_cli() -> Mapping[str, Any]:
         "--agent-type",
         type=str,
         default="sac",
-        choices=["sac", "hc"],
-        help="Agent algorithm: 'sac' (default) or 'hc' (HC-decomposition SAC)",
+        choices=["sac", "hc", "dsa"],
+        help="Agent algorithm: 'sac' (default), 'hc' (HC-decomposition SAC), "
+        "or 'dsa' (transformer history encoder + DGRA)",
     )
     parser.add_argument(
         "--agent-kwarg",
@@ -919,6 +1121,11 @@ def parse_single_cli() -> Mapping[str, Any]:
         args_dict.get("sac_kwargs") or []
     )
     args_dict["env_kwargs"] = {"max_episode_steps": args_dict.pop("max_episode_steps")}
+    args_dict["min_delay"], args_dict["max_delay"] = _resolve_delay_bounds(
+        delay=args_dict.pop("delay", None),
+        min_delay=args_dict.pop("min_delay", None),
+        max_delay=args_dict.pop("max_delay", None),
+    )
     return args_dict
 
 
@@ -979,6 +1186,12 @@ def parse_common_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         default=None,
         help="Directory for logs and saved model",
     )
+    parser.add_argument(
+        "--non-stationary",
+        action="store_true",
+        default=None,
+        help="Wrap environment with non-stationary dynamics (episodic mass/friction/gravity perturbation)",
+    )
     args, _ = parser.parse_known_args(argv)
     return args
 
@@ -1022,11 +1235,42 @@ def parse_reward_model_kwargs(
     return kwargs
 
 
-def parse_batch_cli() -> argparse.Namespace:
-    """Parse only batch-mode flags; single-run flags are ignored here."""
+def _resolve_batch_delay_overrides(
+    delay: Optional[int],
+    min_delay: Optional[int],
+    max_delay: Optional[int],
+) -> Dict[str, int]:
+    """Return only explicitly supplied delay bounds for batch CLI precedence."""
+    overrides: Dict[str, int] = {}
+    if delay is not None:
+        overrides.update(min_delay=delay, max_delay=delay)
+    if min_delay is not None:
+        overrides["min_delay"] = min_delay
+    if max_delay is not None:
+        overrides["max_delay"] = max_delay
+
+    for name, value in overrides.items():
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative, got {value}")
+    if "min_delay" in overrides and "max_delay" in overrides:
+        _resolve_delay_bounds(
+            delay=None,
+            min_delay=overrides["min_delay"],
+            max_delay=overrides["max_delay"],
+        )
+    return overrides
+
+
+def parse_batch_cli(
+    argv: Optional[Sequence[str]] = None,
+) -> argparse.Namespace:
+    """Parse batch flags; other single-run flags are ignored here."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config-file", type=str, default=None)
-    args, _ = parser.parse_known_args()
+    parser.add_argument("--delay", type=int, default=None)
+    parser.add_argument("--min-delay", type=int, default=None)
+    parser.add_argument("--max-delay", type=int, default=None)
+    args, _ = parser.parse_known_args(argv)
     return args
 
 

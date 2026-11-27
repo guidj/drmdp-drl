@@ -1,0 +1,308 @@
+# AGENTS.md
+
+This file provides guidance to coding agents when working with code in this repository.
+
+## Project Overview
+
+Reinforcement learning research codebase for **Delayed, Aggregate, and Anonymous Feedback (DAAF)** in MDPs. Implements DFDRL: Deep RL for Delayed Feedback, with reward estimation for policy control in off-policy deep reinforcement learning.
+
+## Research Context
+
+This section frames the codebase as a research program: goal, method landscape, campaign, open questions, evaluation conventions. Code-level structure is in "High-Level Architecture". The claim structure, paper notes, and baseline rationale live in `~/Vaults/C&W/Research Articles/DAAF and DeepRL.md` (Obsidian vault, outside the repo).
+
+### Research Goal
+
+DAAF has been studied for finite state and action spaces, where reward estimation can rely on exploring the whole MDP. This project studies DAAF under deep RL: continuous state and action spaces, function approximation under the deadly triad, and two coupled estimation tasks (reward and value) whose feature-encoding needs may differ. Research questions:
+
+1. **RQ1** — How can rewards be estimated in DAAF MDPs in a deep RL setting?
+2. **RQ2** — How effective are different feature encoding schemes for reward estimation and for policy control?
+3. **RQ3** — How can biases from sample collection and one-time reward estimation be overcome?
+
+The proposal is a three-stage pipeline: collect aggregate trajectories, estimate per-step rewards with learned functions and feature encodings, run policy control on the estimated rewards. The vault note names the proposed method LEAST; in this codebase it appears as the O-series offline estimators (`src/drmdp/dfdrl/`) and the DGRA control-loop reward model. The intended comparison set: Han et al.'s DRMDP/HC, return-decomposition methods (RUDDER, RRD, Diaster), IRCR, and zero-imputation TD.
+
+### Method Landscape
+
+| Method | Role | Mechanism | Lineage | Status |
+|---|---|---|---|---|
+| O0-O4 (`est_oN.py`) | offline reward estimators | window supervision (O1), return grounding (O2), EM (O3), learned input masks (O4) | this project | implemented; RMSE eval via `eval_est_oN.py` |
+| SAC + `none` | control baseline | zero-imputed delayed rewards | standard TD | implemented; in campaign |
+| IRCR (Iterative Relative Credit Refinement) | reward model | flat credit (trajectory mean per-step return) from a dual buffer (FIFO transitions + best-trajectory heap), min-max normalised | Gangwani & Peng, 2020 | implemented; in campaign |
+| DGRA (Deep return-Grounded Reward Approximation) | reward model | window MLP, regularised so predictions match the observed return progression | this project (O2 lineage) | implemented; in campaign |
+| GRD (Generative Return Decomposition) | reward model | causal masks + dynamics NLL; the policy trains on masked observations | Zhang et al., 2023 | implemented; in campaign |
+| HC (history/current decomposition) | control agent | $Q^H(h_t) + Q^C(s_t, a_t)$ learned directly from delayed rewards | Han et al., 2022 | implemented; in campaign |
+| DSA (Delayed State Attention) | control agent | history latent $z$ with $Q([s_t, z_t], a_t)$; reward model relabels at sample time (DGRA, or `none`) | this project | implemented; in campaign |
+| RUDDER, RRD, Diaster | reward models | return redistribution | 2019 / 2022 / 2024 | planned, unimplemented |
+
+All rows except O0-O4 are wired into the control loop via `--reward-model-type` and `--agent-type`.
+
+### Experiment Campaign
+
+- **Spec**: `specs/control-batch.json` — 4 environments (Pendulum-v1, InvertedPendulum-v5, Reacher-v5, HalfCheetah-v5) × 8 arms = 32 configs; delay uniform in $[15, 20]$; 60k steps (Pendulum), 300k (Reacher), 1M (InvertedPendulum, HalfCheetah); 5 runs per config.
+- **Arms**: `none` (zero-impute), `ircr`, `dgra`, `grd`, `hc`, `dsa`+`dgra` with `per_interval`, `dsa`+`dgra` with `sliding_window`, `dsa`+`none`.
+- **Launch**: cluster via `bin/sh/rjobs/control-batch.sh` (`--mode ray`); local via `--mode local`; see "Running Experiments".
+- **Outputs**: `<output_dir>/<env>/<exp-NNN>/<run-NNN>`, with `experiment-params.json` per run.
+- **Non-stationary variants**: `--non-stationary`; MuJoCo wrappers vary mass and friction per episode and oscillate gravity per step, classic-control wrappers vary environment parameters per episode; report: `agents/analyses/2026-05-25-non-stationary-envs-report.md`.
+- **Current state**: `agents/experiment-status.md`.
+
+### Open Questions
+
+Ranked by claim dependency: questions that block the paper's claims (RQ1, RQ3) precede robustness and scale extensions. Re-rank or flatten as priorities change.
+
+1. **Does grounded estimation improve control?** (RQ1) `dgra` vs `ircr` vs `none` arms at matched budgets; O-series window-aggregate RMSE via `eval_est_oN.py`.
+2. **Does interleaved estimation overcome one-shot estimation bias?** (RQ3) reward models updated during control (relabeling at sample time) versus estimators trained once on a fixed dataset.
+3. **Do estimation and control need different encodings?** (RQ2) `dsa`+`none` vs `none` isolates the history encoder's effect on the policy; `per_interval` vs `sliding_window`; GRD's masked observations.
+4. **How do decomposition baselines compare?** RUDDER, RRD, Diaster are unimplemented (`agents/plans/2026-05-11-rudder-rrd-diaster.md`); their absence blocks the paper's comparison table.
+5. **Optimality analysis.** Show LEAST yields a return-equivalent MDP by adapting the RUDDER and Diaster proofs.
+6. **Robustness and scale.** Non-stationary dynamics; transfer beyond HalfCheetah.
+
+### Evaluation Conventions
+
+- **Control**: mean episode return over 5+ runs with 95% CIs at matched step budgets. A comparative claim requires the compared arms in one spec at the same budget.
+- **Estimation**: `eval_est_oN.py` computes window-aggregate RMSE (predicted window sum vs observed aggregate); O0 computes immediate per-step error. Per-step RMSE against true rewards is not implemented. Semantic checks where state-actions carry meaning (high-risk state-actions should receive low rewards).
+- **Measurement regime**: returns are computed from true rewards, so evaluation measures policy quality on the underlying MDP rather than under the delayed feedback regime. Evaluation (`eval_step_freq`) runs the deterministic policy on a clean, undelayed environment; with `--non-stationary` the eval env shares the training dynamics distribution. Training-log episode returns also come from true rewards (`EnvMonitorWrapper` sits between the raw environment and the delay wrapper). Agent-specific observation shaping (interval position for HC and DSA, the history latent for DSA) is replicated on the eval env.
+- **Records**: analyses go to `agents/analyses/`; campaign state to `agents/experiment-status.md`.
+
+## Workflows
+
+### Post-Change Verification
+
+After **any** code change, run the `verify-change` skill (`agents/skills/verify-change/SKILL.md`). Do not skip it for small changes.
+
+### Planning Mode
+
+Whenever you create an implementation plan — whether requested explicitly or in response to any non-trivial task request — **always write the plan to `agents/plans/yyyy-mm-dd-{plan-name}.md` before starting implementation**. This is required unconditionally.
+
+### Code Review After Implementation
+
+After completing any non-trivial implementation, run the `post-impl-review` skill (`agents/skills/post-impl-review/SKILL.md`) on the touched files. Do not rely on self-review of code you just wrote.
+
+## Development Commands
+
+### Environment Setup
+```sh
+uv venv --python 3.12
+make pip-sync  # or: uv sync
+```
+
+### Testing
+```sh
+make test      # Run all tests (tox -e test / pytest)
+
+# Specific test file/class/method
+pytest tests/drmdp/control/test_runner.py
+pytest tests/drmdp/control/test_runner.py::TestLoadConfigs
+pytest tests/drmdp/control/test_runner.py::TestLoadConfigs::test_num_runs_expands_entries
+
+# Pattern matching and coverage
+pytest -k "boundary"
+pytest --cov=drmdp --cov-report=html  # View: htmlcov/index.html
+```
+
+### Linting and Formatting
+```sh
+make format    # Auto-format (ruff format + ruff check --fix)
+make check     # Check formatting/linting/types (ruff + mypy)
+make tox       # Run all CI checks
+```
+
+## High-Level Architecture
+
+### Core Abstractions (`src/drmdp/`)
+
+**Reward Delay Mechanisms** (`rewdelay.py`):
+- `FixedDelay`, `UniformDelay`, `ClippedPoissonDelay`: Delay sampling strategies
+- `DelayedRewardWrapper`: Gym wrapper that emits delayed aggregate rewards at window end, `None` otherwise
+- `ImputeMissingRewardWrapper`: Replaces `None` rewards with imputed values
+- `DataBuffer`: Replay buffer with capacity limits and accumulation modes (first/latest)
+
+**Environment construction** (`envs.py`):
+- `make_env(env_id, non_stationary=False, **kwargs)`: single factory; dispatches to the plain `gym.make` path, `make_non_stationary_classic_env`, or `make_non_stationary_mujoco_env`
+- Non-stationary wrappers draw per-episode mass and friction and apply a per-step gravity drift; `_CLASSIC_CONTROL_CONFIGS` covers `CartPole`, `Pendulum`, `MountainCar`, `_MUJOCO_CONFIGS` covers `HalfCheetah`, `Hopper`, `Walker2d`, `Ant`, `Humanoid`, `Swimmer`, `Pusher`, `Reacher`
+
+**Core Types** (`core.py`):
+- `EnvSpec`, `ProblemSpec`, `RunConfig`, `Experiment`, `ExperimentInstance`: Configuration dataclasses
+- `EnvMonitorWrapper`/`EnvMonitor`: Track episode returns and steps
+- `Seeder`: Deterministic seed generation via Cantor pairing function
+
+### DFDRL: Deep RL for Delayed Feedback (`src/drmdp/dfdrl/`)
+
+Offline reward estimation models (`est_oN.py`) trained on trajectory data:
+
+- **O0**: Baseline — predicts immediate rewards from (state, action) without delay
+- **O1**: Window-based — MLP predicts per-step rewards; sum of predictions = observed aggregate reward
+- **O2**: Return-grounded — adds regularization loss `MSE(start_return + sum of predicted per-step rewards, end_return)` to anchor predictions to episodic return progression
+- **O3**: EM-based — expectation-maximisation with variable-length padded sequences
+- **O4**: Mask-based — learned causal mask (sigmoid / STE / Gumbel) over observations
+
+Each model has a paired `eval_est_oN.py` for evaluation.
+
+### Control: Off-Policy RL with Reward Model Interleaving (`src/drmdp/control/`)
+
+Online policy learning via SAC with pluggable reward estimation. `agent_type="sac"` (default) and `agent_type="dsa"` build `sbx.SAC` (JAX); `agent_type="hc"` builds `hc.HCSAC`, a `stable_baselines3.SAC` subclass (PyTorch). The policy trains on *estimated* per-step rewards rather than the delayed aggregate rewards emitted by the environment.
+
+**Core abstractions** (`base.py`):
+- `Trajectory`: Frozen dataclass — `(observations, actions, env_rewards, terminals, episode_return)`
+- `RewardModel`: ABC with `predict(obs, actions, terminals) -> rewards` and `update(trajectories) -> metrics`
+- `RelabelingReplayBuffer(ReplayBuffer)`: Calls `reward_model.predict()` inside `sample()` — relabeling is transparent to SAC; stored rewards are never modified
+
+**Reward models**:
+- `ircr.py` — `IRCRRewardModel`: guidance rewards via dual-buffer credit assignment; each transition's credit is its trajectory's mean per-step return, min-max normalised and drawn 50/50 from a FIFO transition buffer and a min-heap of best trajectories (`IRCRReplayBuffer.sample()`; `predict()` returns the flat normalised credit for logging)
+- `dgra.py` — `DGRARewardModel`: window-based neural reward model; trains on consecutive windows of trajectory data
+- `grd.py` — `GRDRewardModel`: graph-based with a causal structure network (`CausalStructure`) and dynamics network; learns which state dimensions causally influence reward
+
+**HC agent** (`hc.py`) — `--agent-type hc`:
+- `HCSAC`: History-Corrected SAC (Han et al., ICML 2022) — learns a decomposed Q-function $Q^H(h_t) + Q^C(s_t, a_t)$ directly from delayed rewards; no separate reward model
+
+**DSA agent** (`dsa.py`) — `--agent-type dsa`:
+- `HistoryEncoder`: transformer over the recent $(s, a)$ history, trained by next-state prediction $f(z, s_t, a_t) \to \hat{s}_{t+1}$; emits latent $z$
+- `LatentAugmentedObsWrapper` and `DSAReplayBuffer`: append $z$ to observations and run the encoder at sample time, so the policy can train through `sbx.SAC` with $z$ detached from the RL graph
+- Relabeling uses `DGRARewardModel` (`--reward-model-type dgra`); `none` trains on delayed rewards directly
+- History modes: `per_interval` (reset at each delayed signal) and `sliding_window` (last K steps)
+
+**Control loop** (`runner.py`):
+- `TrainingArgs`: Frozen configuration dataclass. Required fields include `exp_name: str` (e.g. `"exp-000"`, shared across runs) and `run_id: int` (0-indexed, unique within an experiment) — both are serialised to `experiment-params.json` via `ExperimentLogger`
+- `run(args)`: Wraps env with `DelayedRewardWrapper` and `ImputeMissingRewardWrapper`, then dispatches on `agent_type` to `_run_sac`, `_run_hc`, or `_run_dsa` and saves the model
+- `run_batch(configs, mode)`: Unified entry point for all execution. `mode="debug"` runs sequentially; `mode="local"` uses `ProcessPoolExecutor`; `mode="ray"` submits Ray remote tasks
+- `RewardModelUpdateCallback`: Tracks episode trajectories, calls `reward_model.update()` at a fixed step interval
+
+**CLI parser design**: `runner.py` uses four independent parsers, each calling `parse_known_args(sys.argv[1:])`:
+- `parse_batch_cli` — `--config-file` plus optional batch delay overrides (`--delay`, `--min-delay`, `--max-delay`)
+- `parse_exec_args` — `--mode`, `--num-runs`, `--max-workers`, `--ray-address`
+- `parse_common_args` — training scalars overrideable from CLI: `--num-steps`, `--sac-*`, `--log-step-frequency`, `--output-dir`
+- `parse_single_cli` — all remaining single-run flags (`--env`, `--delay`, `--reward-model-type`, `--agent-type {sac,hc,dsa}`, `--non-stationary`, `--update-every-n-steps`, etc.)
+
+**CLI precedence**: `code defaults < shared (top-level) file fields < environment-level < experiment-level < CLI args`, implemented by `core.ArgChain` in `_load_configs` and `_expand_environments`. CLI overrides are pinned in the top chain layers and `prepend()` inserts file layers beneath them, so a CLI flag always beats the file. `--num-runs` is resolved from `exec_kwargs` and is not part of the chain.
+
+**Batch config format** (`specs/control-local-batch.json`):
+```json
+{
+  "environments": [
+    {
+      "env": "MountainCarContinuous-v0",
+      "env_kwargs": {"max_episode_steps": 2500},
+      "min_delay": 15,
+      "max_delay": 20,
+      "num_steps": 50000,
+      "sac_kwargs": {"learning_rate": 3e-4},
+      "experiments": [
+        { "reward_model_type": "ircr", "reward_model_kwargs": {"fifo_capacity": 300000, "heap_capacity": 10} },
+        { "reward_model_type": "dgra", "reward_model_kwargs": {"train_epochs": 100} }
+      ]
+    }
+  ]
+}
+```
+File-internal precedence: top-level fields → environment-level → experiment-level. `env` is required on every environment entry. `output_dir` is auto-constructed as `<base>/<env>/<exp-NNN>/<run-NNN>`. `num_runs` and `output_dir` are reserved keys excluded from the training-arg merge. Keys that are not `TrainingArgs` fields (for example `delay`) are dropped silently; delay is configured with `min_delay` and `max_delay`.
+
+### Non-Stationary Environments
+
+`--non-stationary` (and the `non_stationary` config field) routes `envs.make_env` to the non-stationary wrappers. MuJoCo environments use `UniversalNonStationaryMuJoCoWrapper`: mass and friction are redrawn per episode and gravity oscillates within an episode (`_MUJOCO_CONFIGS`: `HalfCheetah`, `Hopper`, `Walker2d`, `Ant`, `Humanoid`, `HumanoidStandup`, `Swimmer`, `Pusher`, `Reacher`, `InvertedPendulum`, `InvertedDoublePendulum`). Classic-control environments (`CartPole`, `Pendulum`, `MountainCar`, `MountainCarContinuous`, `Acrobot`) use parameter-variance wrappers with recomputation hooks, redrawn per episode. The evaluation environment receives the same wrapper, so returns are measured under the same dynamics distribution as training.
+
+## Skills
+
+Eight project-specific skills live in [`agents/skills/`](agents/skills/), each a folder in the open [Agent Skills](https://agentskills.io) format: a `SKILL.md` with `name` and `description` frontmatter plus supporting files (templates, examples). Any agent can run them: open `agents/skills/<name>/SKILL.md` and follow it, passing arguments after the skill name. Paths inside a skill resolve relative to the skill directory. Harnesses that discover skills in `.claude/skills/` find symlinks there pointing at the canonical copies in `agents/skills/`.
+
+| Skill | Purpose |
+|---|---|
+| `verify-change [files]` | Post-change quality gate: `make format`, `make check`, `make test`; triages failures as minor or moderate; chains to `post-impl-review` |
+| `post-impl-review [files]` | drmdp style and correctness review of touched files (newspaper order, typing imports, test-class structure, episode boundaries); makes corrections directly |
+| `add-reward-model <name>` | Scaffolds `src/drmdp/control/{name}.py` implementing the `RewardModel` ABC, wires it into `runner.py` (import + `--reward-model-type` choices + `_make_reward_model` branch), creates the mirrored test file |
+| `research-to-impl <paper>` | Paper to reviewed toy implementation: chains `summarize-ml-paper` → `implement-ml-paper-toy` → `post-impl-review` → verification |
+| `summarize-ml-paper <paper> [focus]` | Ten-section structured summary of an ML paper (PDF or URL), written to `papers/summary/` |
+| `implement-ml-paper-toy <summary> [framework] [name]` | Toy implementation with synthetic data and tests from a paper summary, written to `model_specs/` |
+| `research-context [goal-source]` | Generates a Research Context section (goal, method landscape, campaign, open questions, evaluation conventions) in the auto-loaded context file, with every claim verified against code; portable to other repos |
+| `profile <command>` | Line-level profiling loop with `line_profiler`; report written to `agents/analyses/` |
+
+The stages of `research-to-impl` also run on their own.
+
+## Running Experiments
+
+### Single-Run CLI
+```sh
+# SAC + IRCR
+python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
+    --delay 3 --num-steps 50000 --reward-model-type ircr \
+    --output-dir /tmp/control-ircr
+
+# HC (no reward model)
+python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
+    --delay 3 --agent-type hc --output-dir /tmp/control-hc
+
+# Multiple runs in local parallel mode
+python src/drmdp/control/runner.py --env MountainCarContinuous-v0 \
+    --delay 3 --num-runs 5 --mode local --output-dir /tmp/out
+```
+
+`--delay N` sets both bounds (a fixed delay). `--min-delay` and `--max-delay` set a uniform range and take precedence over `--delay` on the bound each names. Any bound no flag sets falls back to the code default `(3, 5)`; an inverted range fails at parse time. Batch runs accept `--delay`, `--min-delay`, and `--max-delay`; explicit CLI bounds override shared, environment-level, and experiment-level delay fields. With no delay flags, the spec-file values are preserved.
+
+### Batch via JSON Config
+```sh
+python src/drmdp/control/runner.py --config-file specs/control-local-batch.json \
+    --mode local --num-runs 3 --num-steps 50000 --output-dir /tmp/batch-out
+```
+
+### Shell Scripts
+```sh
+bin/sh/local/control-ircr.sh    # IRCR + SAC
+bin/sh/local/control-dgra.sh    # DGRA + SAC
+bin/sh/local/control-hc.sh      # HC-decomposition SAC
+bin/sh/local/control-delayed.sh # Delayed-rewards baseline (no reward model)
+bin/sh/local/control-batch.sh   # All reward models, both envs
+```
+
+Ray job submission and cluster-management scripts live in `bin/sh/rjobs/` and `bin/sh/rconfig/`.
+
+## Critical Architectural Patterns
+
+### Episode Boundary Handling
+
+Delayed reward windows MUST NEVER span episode boundaries.
+
+When processing windows:
+- Cumulative returns reset at episode starts (no carryover)
+- Window generation stops at episode termination
+- No data leakage across episodes
+
+**Validation**: `tests/drmdp/dfdrl/test_est_o2.py::TestEpisodeBoundary::test_episode_boundary_no_span`
+
+### Reward Relabeling at Sample Time
+
+`RelabelingReplayBuffer.sample()` calls `reward_model.predict()` on each drawn batch — not at collection time. This means:
+- The policy always trains on up-to-date estimates as the model improves
+- Stored buffer data is never modified
+- Buffer can be reset via `replay_buffer.reset()` after model updates (controlled by `clear_buffer_on_update`)
+
+## Coding Style
+
+Follow **Google's Python Style Guide** with these specific conventions:
+
+**Code Organization (Newspaper Style)**: Classes before module-level functions; within classes, `__init__` first, public methods next, `_`-prefixed helpers last.
+
+**Imports**: Only import modules and types, never bare functions or variables:
+```python
+# Good
+import numpy as np
+from typing import List, Dict
+
+# Avoid
+from module import function_name
+```
+
+**Variable Naming**: Descriptive names, never single letters (`idx`/`jdx` not `i`/`j`).
+
+**Type Annotations**: Always use `typing` module types with full parameterization; prefer immutable (`Mapping`, `Sequence`, `Tuple`) unless mutation is required (`List`, `Dict`).
+
+**Comments**: Explain *why*, not *what*. No meta-commentary (`# CRITICAL:`, `# IMPORTANT:`).
+
+## Testing Guidelines
+
+**Philosophy**: pytest, 80% coverage target. Tests grouped into classes by component; `class TestFoo` per function/class under test.
+
+**Structure**: Tests mirror source — `src/drmdp/control/runner.py` → `tests/drmdp/control/test_runner.py`. Helper functions and fixtures placed *after* all test classes.
+
+**Numerical precision**: `np.testing.assert_allclose(result, expected, atol=1e-6)`
+
+**Stochastic/PyTorch**: Set seeds (`torch.manual_seed(42)`), use `model.eval()` + `torch.no_grad()` for determinism.
+
+**Parameterized tests**: `@pytest.mark.parametrize()` for multiple inputs; `@pytest.fixture` for shared setup.
+
